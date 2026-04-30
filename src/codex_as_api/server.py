@@ -86,6 +86,9 @@ try:
         frequency_penalty: float | None = None
         presence_penalty: float | None = None
         user: str | None = None
+        subagent: str | None = None
+        memgen_request: bool | None = None
+        previous_response_id: str | None = None
 
     class ImageGenerationRequest(BaseModel):
         model: str
@@ -205,13 +208,20 @@ try:
             "model": MODEL,
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: ChatCompletionRequest) -> JSONResponse | StreamingResponse:
+    @app.post("/v1/chat/completions", response_model=None)
+    async def chat_completions(request: ChatCompletionRequest, http_request: Request) -> JSONResponse | StreamingResponse:
         provider = _get_provider()
         messages = _request_messages_to_internal(request.messages)
         tools = _parse_tools(request.tools)
         stop = _normalize_stop(request.stop)
         max_tokens = _max_tokens_from_request(request)
+
+        subagent = request.subagent or http_request.headers.get("x-openai-subagent")
+        memgen_request_header = http_request.headers.get("x-openai-memgen-request")
+        memgen_request: bool | None = request.memgen_request
+        if memgen_request is None and memgen_request_header is not None:
+            memgen_request = memgen_request_header.lower() not in ("false", "0", "")
+        previous_response_id = request.previous_response_id
 
         if request.stream:
             async def _stream() -> AsyncIterator[str]:
@@ -246,6 +256,9 @@ try:
                     max_tokens=max_tokens,
                     stop=stop,
                     prompt_cache_key=request.prompt_cache_key,
+                    subagent=subagent,
+                    memgen_request=memgen_request,
+                    previous_response_id=previous_response_id,
                 ):
                     typ = event.get("type")
                     if typ == "content":
@@ -363,6 +376,9 @@ try:
             max_tokens=max_tokens,
             stop=stop,
             prompt_cache_key=request.prompt_cache_key,
+            subagent=subagent,
+            memgen_request=memgen_request,
+            previous_response_id=previous_response_id,
         )
 
         choices: list[dict[str, Any]] = [{

@@ -7,7 +7,7 @@ name = "codex-as-api"
 version = "0.1.0"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
     { name = "Eunho-J", email = "" },

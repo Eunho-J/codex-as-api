@@ -69,6 +69,9 @@ class ChatGPTOAuthProvider:
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
+        subagent: str | None = None,
+        memgen_request: bool | None = None,
+        previous_response_id: str | None = None,
     ) -> AssistantResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -84,6 +87,9 @@ class ChatGPTOAuthProvider:
             max_tokens=max_tokens,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
+            subagent=subagent,
+            memgen_request=memgen_request,
+            previous_response_id=previous_response_id,
         ):
             raw_events.append(dict(event))
             if event.get("type") == "content":
@@ -116,6 +122,9 @@ class ChatGPTOAuthProvider:
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
+        subagent: str | None = None,
+        memgen_request: bool | None = None,
+        previous_response_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         payload = self._responses_payload(
@@ -125,8 +134,14 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
+            previous_response_id=previous_response_id,
         )
-        stream = self._post_sse("/responses", payload)
+        extra_headers: dict[str, str] = {}
+        if subagent is not None:
+            extra_headers["x-openai-subagent"] = subagent
+        if memgen_request is not None:
+            extra_headers["x-openai-memgen-request"] = "true" if memgen_request else "false"
+        stream = self._post_sse("/responses", payload, extra_headers=extra_headers)
         final_output: list[dict[str, Any]] = []
         reasoning_parts: list[str] = []
         saw_text_delta = False
@@ -336,6 +351,7 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None,
         stop: Sequence[str] | None,
         prompt_cache_key: str | None,
+        previous_response_id: str | None = None,
     ) -> dict[str, Any]:
         del temperature  # ChatGPT Codex backend rejects explicit temperature for this endpoint.
         instructions, input_items = _split_instructions_and_input(messages)
@@ -356,6 +372,8 @@ class ChatGPTOAuthProvider:
             payload["prompt_cache_key"] = prompt_cache_key
         if stop is not None:
             payload["stop"] = list(stop)
+        if previous_response_id is not None:
+            payload["previous_response_id"] = previous_response_id
         _set_reasoning_payload(payload, reasoning_effort)
         return payload
 
@@ -378,14 +396,16 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthError("ChatGPT OAuth response must be a JSON object")
         return data
 
-    def _post_sse(self, path: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
-        yield from self._request_sse(path, payload)
+    def _post_sse(self, path: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
+        yield from self._request_sse(path, payload, extra_headers=extra_headers)
 
-    def _request_sse(self, path: str, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    def _request_sse(self, path: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> Iterator[dict[str, Any]]:
         token_values: tuple[str | None, ...] = (None,)
         for attempt in range(2):
             headers = self._headers()
             headers["Accept"] = "text/event-stream"
+            if extra_headers:
+                headers.update(extra_headers)
             token = load_token_data(self.auth_json_path)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             req = urllib.request.Request(
