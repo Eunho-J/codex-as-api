@@ -46,18 +46,26 @@ cargo build --release
 
 ### TypeScript (npm)
 
+Install from npm and run:
+
+```bash
+npm install -g codex-as-api
+codex-as-api
+```
+
+Or use `npx` without installing:
+
+```bash
+npx codex-as-api
+```
+
+Or from source:
+
 ```bash
 cd ts
 npm install
 npm run build
 node dist/cli.js
-```
-
-Or run directly with `npx`:
-
-```bash
-cd ts
-npx tsx src/cli.ts
 ```
 
 Can also be used as a library:
@@ -84,7 +92,7 @@ All versions bind to `0.0.0.0:18080` by default.
 
 ## Configuration
 
-Environment variables (both Python and Rust):
+Environment variables (Python, Rust, and TypeScript):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
