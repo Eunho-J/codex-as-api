@@ -399,9 +399,9 @@ export function createApp(opts?: {
           thinking: body.thinking,
         });
 
-      const clientModel = body.model || MODEL;
+      const requestModel = body.model || MODEL;
       const chatOpts = {
-        model: MODEL,
+        model: requestModel,
         tools: tools ?? undefined,
         toolChoice: toolChoice ?? undefined,
         reasoningEffort: reasoningEffort ?? undefined,
@@ -418,7 +418,7 @@ export function createApp(opts?: {
 
         for await (const chunk of anthropicStreamAdapter(
           provider.chatStream(messages, chatOpts),
-          clientModel,
+          requestModel,
           requestId,
         )) {
           res.write(chunk);
@@ -426,7 +426,7 @@ export function createApp(opts?: {
         res.end();
       } else {
         const response = await provider.chat(messages, chatOpts);
-        res.json(internalResponseToAnthropic(response, clientModel, requestId));
+        res.json(internalResponseToAnthropic(response, requestModel, requestId));
       }
     } catch (err) {
       const status =

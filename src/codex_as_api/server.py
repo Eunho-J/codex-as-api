@@ -486,7 +486,7 @@ try:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
 
         stream = body.get("stream", False)
-        client_model = body.get("model") or MODEL
+        request_model = body.get("model") or MODEL
 
         if stream:
             async def _stream() -> AsyncIterator[str]:
@@ -494,13 +494,13 @@ try:
                 for sse_chunk in anthropic_stream_adapter(
                     provider.chat_stream(
                         messages,
-                        model=MODEL,
+                        model=request_model,
                         tools=tools,
                         tool_choice=tool_choice,
                         reasoning_effort=reasoning_effort,
                         stop=stop,
                     ),
-                    model=client_model,
+                    model=request_model,
                     request_id=request_id,
                 ):
                     yield sse_chunk
@@ -515,7 +515,7 @@ try:
         try:
             response = provider.chat(
                 messages,
-                model=MODEL,
+                model=request_model,
                 tools=tools,
                 tool_choice=tool_choice,
                 reasoning_effort=reasoning_effort,
@@ -526,7 +526,7 @@ try:
             return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
 
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
-        result = internal_response_to_anthropic(response, client_model, request_id)
+        result = internal_response_to_anthropic(response, request_model, request_id)
         return JSONResponse(content=result)
 
     # ------------------------------------------------------------------

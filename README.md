@@ -423,18 +423,10 @@ curl -N http://localhost:18080/v1/chat/completions \
 
 ## Using with Claude Code
 
-The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Point it at your local server:
+The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Claude Code sends the model name from its environment variables directly to the server, and the server passes it through to the Codex backend. You must set `ANTHROPIC_MODEL` (and per-role overrides) to a model the Codex backend supports (e.g., `gpt-5.5`).
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:18080 \
-ANTHROPIC_API_KEY=unused \
-claude
-```
-
-The server automatically maps any model name to the configured `CODEX_AS_API_MODEL` for the backend call. You can also override which models Claude Code uses for different roles:
-
-```bash
-# Use a specific model for all Claude Code roles
+# Minimal setup
 ANTHROPIC_BASE_URL=http://localhost:18080 \
 ANTHROPIC_API_KEY=unused \
 ANTHROPIC_MODEL=gpt-5.5 \
@@ -442,7 +434,7 @@ claude
 ```
 
 ```bash
-# Override per-role models (opus for complex tasks, smaller model for quick tasks)
+# Full setup — override all roles so Claude Code never sends claude-* model names
 ANTHROPIC_BASE_URL=http://localhost:18080 \
 ANTHROPIC_API_KEY=unused \
 ANTHROPIC_MODEL=gpt-5.5 \
@@ -453,7 +445,7 @@ CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.5 \
 claude
 ```
 
-All model names sent by Claude Code are mapped to the server's `CODEX_AS_API_MODEL` on the backend side, so the `ANTHROPIC_*_MODEL` variables mainly control which model name Claude Code displays and how it routes internally.
+These are all Claude Code environment variables — they control what model name Claude Code sends in requests. The server passes the model name through to the Codex backend as-is.
 
 ## Architecture
 

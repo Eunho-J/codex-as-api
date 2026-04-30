@@ -742,11 +742,11 @@ async fn anthropic_messages(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let backend_model = state.model.clone();
-    let model_for_response = body
+    let default_model = state.model.clone();
+    let request_model = body
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or(&backend_model)
+        .unwrap_or(&default_model)
         .to_string();
 
     let max_tokens = body
@@ -757,7 +757,7 @@ async fn anthropic_messages(
 
     if stream {
         let provider = state.provider.clone();
-        let backend_model_clone = backend_model.clone();
+        let request_model_clone = request_model.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -775,7 +775,7 @@ async fn anthropic_messages(
                 subagent.as_deref(),
                 memgen_request,
                 None,
-                Some(backend_model_clone.as_str()),
+                Some(request_model_clone.as_str()),
                 tc_ref,
                 None,
                 None,
@@ -802,7 +802,7 @@ async fn anthropic_messages(
             }
         };
 
-        let sse_strings = anthropic_stream_adapter(&events, &model_for_response, &request_id);
+        let sse_strings = anthropic_stream_adapter(&events, &request_model, &request_id);
 
         let sse_events: Vec<Result<Event, std::convert::Infallible>> = sse_strings
             .into_iter()
@@ -826,7 +826,7 @@ async fn anthropic_messages(
         Ok(sse.into_response())
     } else {
         let provider = state.provider.clone();
-        let backend_model_clone = backend_model.clone();
+        let request_model_clone = request_model.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -844,7 +844,7 @@ async fn anthropic_messages(
                 subagent.as_deref(),
                 memgen_request,
                 None,
-                Some(backend_model_clone.as_str()),
+                Some(request_model_clone.as_str()),
                 tc_ref,
                 None,
                 None,
@@ -871,7 +871,7 @@ async fn anthropic_messages(
             }
         };
 
-        let out = internal_response_to_anthropic(&response, &model_for_response, &request_id);
+        let out = internal_response_to_anthropic(&response, &request_model, &request_id);
         Ok(Json(out).into_response())
     }
 }
