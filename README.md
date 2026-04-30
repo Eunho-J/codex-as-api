@@ -10,9 +10,10 @@ Python, Rust, and TypeScript (npm) implementations are provided — identical fu
 
 ## Prerequisites
 
-You must be logged in via the official Codex CLI so that `~/.codex/auth.json` exists:
+Install the official Codex CLI and log in so that `~/.codex/auth.json` exists:
 
 ```bash
+npm install -g @openai/codex
 codex login
 ```
 
