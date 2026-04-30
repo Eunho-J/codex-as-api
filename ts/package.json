@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Eunho-J/codex-as-api.git",
+    "url": "git+https://github.com/Eunho-J/codex-as-api.git",
     "directory": "ts"
   },
   "keywords": [
@@ -22,7 +22,7 @@
     "dist"
   ],
   "bin": {
-    "codex-as-api": "./dist/cli.js"
+    "codex-as-api": "dist/cli.js"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
