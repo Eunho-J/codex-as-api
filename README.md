@@ -23,17 +23,26 @@ The server reads that file to obtain and refresh ChatGPT OAuth tokens automatica
 
 ### Python
 
+Install from PyPI:
+
 ```bash
-git clone https://github.com/Eunho-J/codex-as-api.git
-cd codex-as-api
-pip install -e ".[server]"
+pip install codex-as-api
 codex-as-api
 ```
 
 Or with `uv`:
 
 ```bash
-uv pip install -e ".[server]"
+uv pip install codex-as-api
+codex-as-api
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/Eunho-J/codex-as-api.git
+cd codex-as-api
+pip install -e ".[server]"
 codex-as-api
 ```
 
