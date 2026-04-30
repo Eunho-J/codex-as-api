@@ -15,7 +15,7 @@ import {
   formatAnthropicError,
 } from "./anthropic-adapter.js";
 
-const HOST = process.env.CODEX_AS_API_HOST || "0.0.0.0";
+const HOST = process.env.CODEX_AS_API_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
 const MODEL = process.env.CODEX_AS_API_MODEL || "gpt-5.5";
 const AUTH_PATH = process.env.CODEX_AS_API_AUTH_PATH;

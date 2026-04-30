@@ -136,8 +136,8 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             .filter(|s| !s.is_empty())
                             .unwrap_or("tool-call")
                             .to_string();
-                        let result_content =
-                            extract_tool_result_content(block.get("content").unwrap_or(&Value::Null));
+                        let raw_content = block.get("content").unwrap_or(&Value::Null);
+                        let (result_content, tool_result_images) = extract_tool_result_content_with_images(raw_content);
                         out.push(Message {
                             role: MessageRole::Tool,
                             content: result_content,
@@ -147,6 +147,17 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             reasoning_content: None,
                             images: vec![],
                         });
+                        if !tool_result_images.is_empty() {
+                            out.push(Message {
+                                role: MessageRole::User,
+                                content: String::new(),
+                                tool_calls: vec![],
+                                tool_call_id: None,
+                                name: None,
+                                reasoning_content: None,
+                                images: tool_result_images,
+                            });
+                        }
                     }
                     "image" => {
                         if let Some(source) = block.get("source").and_then(|v| v.as_object()) {
@@ -185,22 +196,38 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
     }
 }
 
-fn extract_tool_result_content(content: &Value) -> String {
+fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<String>) {
     match content {
-        Value::String(s) => s.clone(),
-        Value::Array(arr) => arr
-            .iter()
-            .filter_map(|p| {
-                if p.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    p.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
-                } else {
-                    None
+        Value::String(s) => (s.clone(), vec![]),
+        Value::Array(arr) => {
+            let mut text_pieces: Vec<String> = Vec::new();
+            let mut images: Vec<String> = Vec::new();
+            for p in arr {
+                let typ = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if typ == "text" {
+                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                        text_pieces.push(t.to_string());
+                    }
+                } else if typ == "image" {
+                    if let Some(source) = p.get("source").and_then(|v| v.as_object()) {
+                        if source.get("type").and_then(|v| v.as_str()) == Some("base64") {
+                            let media_type = source
+                                .get("media_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("image/png");
+                            let data = source
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            images.push(format!("data:{};base64,{}", media_type, data));
+                        }
+                    }
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        Value::Null => String::new(),
-        other => other.to_string(),
+            }
+            (text_pieces.join(""), images)
+        }
+        Value::Null => (String::new(), vec![]),
+        other => (other.to_string(), vec![]),
     }
 }
 
@@ -750,6 +777,43 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].content, "part A part B");
+    }
+
+    #[test]
+    fn test_user_tool_result_with_image() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-img", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},
+                ]},
+            ]}],
+        });
+        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, MessageRole::Tool);
+        assert_eq!(msgs[0].tool_call_id, Some("call-img".to_string()));
+        assert_eq!(msgs[0].content, "");
+        assert_eq!(msgs[1].role, MessageRole::User);
+        assert_eq!(msgs[1].images.len(), 1);
+        assert_eq!(msgs[1].images[0], "data:image/png;base64,iVBORw0KGgo");
+    }
+
+    #[test]
+    fn test_user_tool_result_with_text_and_image() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-mix", "content": [
+                    {"type": "text", "text": "file contents"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}},
+                ]},
+            ]}],
+        });
+        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, MessageRole::Tool);
+        assert_eq!(msgs[0].content, "file contents");
+        assert_eq!(msgs[1].role, MessageRole::User);
+        assert_eq!(msgs[1].images[0], "data:image/jpeg;base64,/9j/4AAQ");
     }
 
     #[test]

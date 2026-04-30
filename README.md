@@ -4,7 +4,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
 ## What it does
 
-Runs a lightweight HTTP server on `localhost` (or `0.0.0.0`) that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials. Supports streaming, tool calling, reasoning, image generation, and Codex-specific features like `prompt_cache_key` and subagent headers.
+Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials. Supports streaming, tool calling, reasoning, image generation, and Codex-specific features like `prompt_cache_key` and subagent headers.
 
 Python, Rust, and TypeScript (npm) implementations are provided — identical functionality, same endpoints, same behavior.
 
@@ -89,7 +89,7 @@ const app = createApp();
 app.listen(18080);
 ```
 
-All versions bind to `0.0.0.0:18080` by default.
+All versions bind to `127.0.0.1:18080` (localhost only) by default.
 
 ## Configuration
 
@@ -97,7 +97,7 @@ Environment variables (Python, Rust, and TypeScript):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CODEX_AS_API_HOST` | `0.0.0.0` | Bind address |
+| `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
@@ -119,10 +119,10 @@ To use a different port:
 CODEX_AS_API_PORT=9000 codex-as-api
 ```
 
-To bind to localhost only:
+To expose on all interfaces (e.g. for remote access):
 
 ```bash
-CODEX_AS_API_HOST=127.0.0.1 codex-as-api
+CODEX_AS_API_HOST=0.0.0.0 codex-as-api
 ```
 
 ## API Endpoints

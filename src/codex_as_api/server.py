@@ -24,7 +24,7 @@ def _env_str(name: str, default: str) -> str:
     return os.getenv(name) or default
 
 
-HOST = _env_str("CODEX_AS_API_HOST", "0.0.0.0")
+HOST = _env_str("CODEX_AS_API_HOST", "127.0.0.1")
 PORT = _env_int("CODEX_AS_API_PORT", 18080)
 MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")

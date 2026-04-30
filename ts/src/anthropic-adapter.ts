@@ -102,11 +102,23 @@ function convertUserMessage(
       }
       const toolUseId = typeof b.tool_use_id === "string" ? b.tool_use_id : "tool-call";
       let resultContent = b.content ?? "";
+      const toolResultImages: string[] = [];
       if (Array.isArray(resultContent)) {
-        resultContent = (resultContent as Record<string, unknown>[])
-          .filter((p) => typeof p === "object" && p !== null && p.type === "text")
-          .map((p) => (p as Record<string, unknown>).text ?? "")
-          .join("");
+        const textPieces: string[] = [];
+        for (const p of resultContent as Record<string, unknown>[]) {
+          if (typeof p !== "object" || p === null) continue;
+          if (p.type === "text") {
+            textPieces.push((p.text ?? "") as string);
+          } else if (p.type === "image") {
+            const source = p.source as Record<string, unknown> | undefined;
+            if (source && source.type === "base64") {
+              const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
+              const data = typeof source.data === "string" ? source.data : "";
+              toolResultImages.push(`data:${mediaType};base64,${data}`);
+            }
+          }
+        }
+        resultContent = textPieces.join("");
       } else if (typeof resultContent !== "string") {
         resultContent = resultContent ? String(resultContent) : "";
       }
@@ -116,6 +128,9 @@ function convertUserMessage(
         tool_call_id: toolUseId,
         name: toolUseId,
       });
+      if (toolResultImages.length) {
+        out.push({ role: MessageRole.USER, content: "", images: toolResultImages });
+      }
     } else if (blockType === "image") {
       const source = b.source as Record<string, unknown> | undefined;
       if (source && source.type === "base64") {

@@ -246,6 +246,45 @@ class TestAnthropicRequestToInternal:
         assert messages[0].role is MessageRole.TOOL
         assert messages[0].content == "result line 1result line 2"
 
+    def test_tool_result_with_image(self):
+        messages, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call-img", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},
+                    ]},
+                ],
+            }],
+        )
+        assert len(messages) == 2
+        assert messages[0].role is MessageRole.TOOL
+        assert messages[0].tool_call_id == "call-img"
+        assert messages[0].content == ""
+        assert messages[1].role is MessageRole.USER
+        assert len(messages[1].images) == 1
+        assert messages[1].images[0] == "data:image/png;base64,iVBORw0KGgo"
+
+    def test_tool_result_with_text_and_image(self):
+        messages, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call-mix", "content": [
+                        {"type": "text", "text": "file contents"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}},
+                    ]},
+                ],
+            }],
+        )
+        assert len(messages) == 2
+        assert messages[0].role is MessageRole.TOOL
+        assert messages[0].content == "file contents"
+        assert messages[1].role is MessageRole.USER
+        assert messages[1].images[0] == "data:image/jpeg;base64,/9j/4AAQ"
+
 
 # ---------------------------------------------------------------------------
 # Non-streaming response conversion

@@ -92,11 +92,21 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 image_urls = []
             tool_use_id = block.get("tool_use_id") or "tool-call"
             result_content = block.get("content", "")
+            tool_result_images: list[str] = []
             if isinstance(result_content, list):
-                result_content = "".join(
-                    p.get("text", "") for p in result_content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
+                text_pieces: list[str] = []
+                for p in result_content:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") == "text":
+                        text_pieces.append(p.get("text", ""))
+                    elif p.get("type") == "image":
+                        source = p.get("source", {})
+                        if isinstance(source, dict) and source.get("type") == "base64":
+                            media_type = source.get("media_type", "image/png")
+                            data = source.get("data", "")
+                            tool_result_images.append(f"data:{media_type};base64,{data}")
+                result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
                 result_content = str(result_content) if result_content else ""
             out.append(Message(
@@ -105,6 +115,12 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 tool_call_id=tool_use_id,
                 name=tool_use_id,
             ))
+            if tool_result_images:
+                out.append(Message(
+                    role=MessageRole.USER,
+                    content="",
+                    images=tuple(tool_result_images),
+                ))
         elif block_type == "image":
             source = block.get("source", {})
             if isinstance(source, dict) and source.get("type") == "base64":
