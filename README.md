@@ -174,6 +174,43 @@ curl http://localhost:18080/v1/chat/completions \
   }'
 ```
 
+### `POST /v1/messages`
+
+Anthropic Messages API compatible endpoint. Supports streaming (`stream: true`) and non-streaming. The client's model name is reflected in responses, but the server always uses the configured `CODEX_AS_API_MODEL` for the backend call.
+
+```bash
+curl http://localhost:18080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: unused" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 200,
+    "system": "You are a helpful assistant.",
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
+```
+
+Streaming:
+
+```bash
+curl -N http://localhost:18080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: unused" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 200,
+    "stream": true,
+    "system": "You are a helpful assistant.",
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
+```
+
 ### `POST /v1/images/generations`
 
 Generate images via the Codex image generation tool.
@@ -383,6 +420,16 @@ curl -N http://localhost:18080/v1/chat/completions \
     "prompt_cache_key": "joke-session"
   }'
 ```
+
+## Using with Claude Code
+
+The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Point it at your local server:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=unused claude
+```
+
+The server automatically maps any model name (e.g., `claude-sonnet-4-6`) to the configured `CODEX_AS_API_MODEL` for the backend call, so no additional model override environment variables are needed.
 
 ## Architecture
 

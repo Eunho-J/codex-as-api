@@ -742,11 +742,11 @@ async fn anthropic_messages(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let model = state.model.clone();
+    let backend_model = state.model.clone();
     let model_for_response = body
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or(&model)
+        .unwrap_or(&backend_model)
         .to_string();
 
     let max_tokens = body
@@ -757,7 +757,7 @@ async fn anthropic_messages(
 
     if stream {
         let provider = state.provider.clone();
-        let model_for_closure = model_for_response.clone();
+        let backend_model_clone = backend_model.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -775,7 +775,7 @@ async fn anthropic_messages(
                 subagent.as_deref(),
                 memgen_request,
                 None,
-                Some(model_for_closure.as_str()),
+                Some(backend_model_clone.as_str()),
                 tc_ref,
                 None,
                 None,
@@ -826,7 +826,7 @@ async fn anthropic_messages(
         Ok(sse.into_response())
     } else {
         let provider = state.provider.clone();
-        let model_for_closure = model_for_response.clone();
+        let backend_model_clone = backend_model.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -844,7 +844,7 @@ async fn anthropic_messages(
                 subagent.as_deref(),
                 memgen_request,
                 None,
-                Some(model_for_closure.as_str()),
+                Some(backend_model_clone.as_str()),
                 tc_ref,
                 None,
                 None,
