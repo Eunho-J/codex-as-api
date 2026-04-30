@@ -63,7 +63,9 @@ class ChatGPTOAuthProvider:
         self,
         messages: Sequence[Message],
         *,
+        model: str | None = None,
         tools: Sequence[ToolSchema] | None = None,
+        tool_choice: str | dict | None = None,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         max_tokens: int | None = None,
@@ -81,7 +83,9 @@ class ChatGPTOAuthProvider:
         usage: Usage | None = None
         for event in self.chat_stream(
             messages,
+            model=model,
             tools=tools,
+            tool_choice=tool_choice,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
@@ -116,7 +120,9 @@ class ChatGPTOAuthProvider:
         self,
         messages: Sequence[Message],
         *,
+        model: str | None = None,
         tools: Sequence[ToolSchema] | None = None,
+        tool_choice: str | dict | None = None,
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         max_tokens: int | None = None,
@@ -129,7 +135,9 @@ class ChatGPTOAuthProvider:
         del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         payload = self._responses_payload(
             messages,
+            model=model,
             tools=tools,
+            tool_choice=tool_choice,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             stop=stop,
@@ -218,6 +226,7 @@ class ChatGPTOAuthProvider:
         self,
         prompt: str,
         *,
+        model: str | None = None,
         reference_images: Sequence[dict[str, str]] = (),
         size: str | None = None,
         reasoning_effort: str | None = None,
@@ -229,7 +238,7 @@ class ChatGPTOAuthProvider:
         if size and size != "auto":
             content[0]["text"] = f"{prompt}\n\nRequested output size/aspect: {size}"
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "instructions": (
                 "Use the image_generation tool to create the requested image. "
                 "Return the generated image through an image_generation_call result."
@@ -255,6 +264,7 @@ class ChatGPTOAuthProvider:
         self,
         prompt: str,
         *,
+        model: str | None = None,
         images: Sequence[dict[str, str]],
         reasoning_effort: str | None = None,
     ) -> str:
@@ -263,7 +273,7 @@ class ChatGPTOAuthProvider:
         content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
         content.extend(_validate_image_content_items(images))
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "instructions": "Inspect the attached image(s) and answer the user's review prompt directly.",
             "input": [{"type": "message", "role": "user", "content": content}],
             "tools": [],
@@ -324,10 +334,11 @@ class ChatGPTOAuthProvider:
         self,
         messages: Sequence[Message],
         *,
+        model: str | None = None,
         reasoning_effort: str | None = None,
     ) -> str:
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "input": _messages_to_response_items(messages),
             "instructions": "Create a compact checkpoint of this conversation for continuation.",
             "tools": [],
@@ -346,7 +357,9 @@ class ChatGPTOAuthProvider:
         self,
         messages: Sequence[Message],
         *,
+        model: str | None = None,
         tools: Sequence[ToolSchema] | None,
+        tool_choice: str | dict | None = None,
         temperature: float | None,
         reasoning_effort: str | None,
         stop: Sequence[str] | None,
@@ -358,11 +371,11 @@ class ChatGPTOAuthProvider:
         if instructions == "":
             raise ChatGPTOAuthError("ChatGPT OAuth Responses request requires system instructions")
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "instructions": instructions,
             "input": input_items,
             "tools": [] if tools is None else [_tool_schema_to_response_dict(tool) for tool in tools],
-            "tool_choice": "auto",
+            "tool_choice": tool_choice or "auto",
             "parallel_tool_calls": False,
             "stream": True,
             "store": False,

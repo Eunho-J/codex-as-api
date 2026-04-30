@@ -25,7 +25,7 @@ def _env_str(name: str, default: str) -> str:
 
 
 HOST = _env_str("CODEX_AS_API_HOST", "0.0.0.0")
-PORT = _env_int("CODEX_AS_API_PORT", 8000)
+PORT = _env_int("CODEX_AS_API_PORT", 18080)
 MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 
@@ -100,8 +100,8 @@ try:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _openai_model_id() -> str:
-        return f"codex-oauth:{MODEL}"
+    def _openai_model_id(request_model: str | None = None) -> str:
+        return f"codex-oauth:{request_model or MODEL}"
 
     def _request_messages_to_internal(messages: list[ChatMessage]) -> list[Message]:
         result: list[Message] = []
@@ -227,7 +227,7 @@ try:
             async def _stream() -> AsyncIterator[str]:
                 request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 created = int(time.time())
-                model = _openai_model_id()
+                model = _openai_model_id(request.model)
 
                 # SSE preamble
                 preamble = {
@@ -250,7 +250,9 @@ try:
 
                 for event in provider.chat_stream(
                     messages,
+                    model=request.model,
                     tools=tools,
+                    tool_choice=request.tool_choice,
                     temperature=request.temperature,
                     reasoning_effort=request.reasoning_effort,
                     max_tokens=max_tokens,
@@ -370,7 +372,9 @@ try:
         # Non-streaming
         response = provider.chat(
             messages,
+            model=request.model,
             tools=tools,
+            tool_choice=request.tool_choice,
             temperature=request.temperature,
             reasoning_effort=request.reasoning_effort,
             max_tokens=max_tokens,
@@ -410,7 +414,7 @@ try:
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": _openai_model_id(),
+            "model": _openai_model_id(request.model),
             "choices": choices,
         }
 
@@ -428,6 +432,7 @@ try:
         provider = _get_provider()
         images = provider.generate_image(
             request.prompt,
+            model=request.model,
             size=request.size,
             reasoning_effort=request.reasoning_effort,
         )

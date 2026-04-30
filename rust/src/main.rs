@@ -22,7 +22,7 @@ fn env_int(name: &str, default: u16) -> u16 {
 #[tokio::main]
 async fn main() {
     let host = env_str("CODEX_AS_API_HOST", "0.0.0.0");
-    let port = env_int("CODEX_AS_API_PORT", 8000);
+    let port = env_int("CODEX_AS_API_PORT", 18080);
     let model = env_str("CODEX_AS_API_MODEL", "gpt-5.5");
     let auth_path = std::env::var("CODEX_AS_API_AUTH_PATH").ok();
 

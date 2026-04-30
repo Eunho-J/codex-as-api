@@ -52,6 +52,8 @@ impl ChatGPTOAuthProvider {
         subagent: Option<&str>,
         memgen_request: Option<bool>,
         previous_response_id: Option<&str>,
+        model: Option<&str>,
+        tool_choice: Option<&Value>,
     ) -> Result<AssistantResponse, ProviderError> {
         let mut content_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
@@ -71,6 +73,8 @@ impl ChatGPTOAuthProvider {
             subagent,
             memgen_request,
             previous_response_id,
+            model,
+            tool_choice,
         )?;
 
         for event in events {
@@ -162,6 +166,8 @@ impl ChatGPTOAuthProvider {
         subagent: Option<&str>,
         memgen_request: Option<bool>,
         previous_response_id: Option<&str>,
+        model: Option<&str>,
+        tool_choice: Option<&Value>,
     ) -> Result<Vec<Value>, ProviderError> {
         let _ = temperature;
         let payload = self.responses_payload(
@@ -171,6 +177,8 @@ impl ChatGPTOAuthProvider {
             stop,
             prompt_cache_key,
             previous_response_id,
+            model,
+            tool_choice,
         )?;
 
         let mut extra_headers: HashMap<String, String> = HashMap::new();
@@ -322,6 +330,7 @@ impl ChatGPTOAuthProvider {
         reference_images: &[HashMap<String, String>],
         size: Option<&str>,
         reasoning_effort: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Vec<Value>, ProviderError> {
         if prompt.trim().is_empty() {
             return Err(ProviderError::Request(
@@ -341,7 +350,7 @@ impl ChatGPTOAuthProvider {
         }
 
         let mut payload = json!({
-            "model": self.model,
+            "model": model.unwrap_or(&self.model),
             "instructions": "Use the image_generation tool to create the requested image. Return the generated image through an image_generation_call result.",
             "input": [{"type": "message", "role": "user", "content": content}],
             "tools": [{"type": "image_generation", "output_format": "png"}],
@@ -377,6 +386,7 @@ impl ChatGPTOAuthProvider {
         prompt: &str,
         images: &[HashMap<String, String>],
         reasoning_effort: Option<&str>,
+        model: Option<&str>,
     ) -> Result<String, ProviderError> {
         if prompt.trim().is_empty() {
             return Err(ProviderError::Request(
@@ -389,7 +399,7 @@ impl ChatGPTOAuthProvider {
         content.extend(validated);
 
         let mut payload = json!({
-            "model": self.model,
+            "model": model.unwrap_or(&self.model),
             "instructions": "Inspect the attached image(s) and answer the user's review prompt directly.",
             "input": [{"type": "message", "role": "user", "content": content}],
             "tools": [],
@@ -417,9 +427,10 @@ impl ChatGPTOAuthProvider {
         &self,
         messages: &[Message],
         reasoning_effort: Option<&str>,
+        model: Option<&str>,
     ) -> Result<String, ProviderError> {
         let mut payload = json!({
-            "model": self.model,
+            "model": model.unwrap_or(&self.model),
             "input": messages_to_response_items(messages),
             "instructions": "Create a compact checkpoint of this conversation for continuation.",
             "tools": [],
@@ -534,6 +545,8 @@ impl ChatGPTOAuthProvider {
         stop: Option<&[String]>,
         prompt_cache_key: Option<&str>,
         previous_response_id: Option<&str>,
+        model: Option<&str>,
+        tool_choice: Option<&Value>,
     ) -> Result<Value, ProviderError> {
         let (instructions, input_items) = split_instructions_and_input(messages);
 
@@ -549,11 +562,11 @@ impl ChatGPTOAuthProvider {
         };
 
         let mut payload = json!({
-            "model": self.model,
+            "model": model.unwrap_or(&self.model),
             "instructions": instructions,
             "input": input_items,
             "tools": tools_array,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice.cloned().unwrap_or(json!("auto")),
             "parallel_tool_calls": false,
             "stream": true,
             "store": false,

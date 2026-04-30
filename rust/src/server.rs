@@ -322,6 +322,8 @@ async fn chat_completions(
         let temperature = request.temperature;
         let reasoning_effort = request.reasoning_effort.clone();
         let prompt_cache_key = request.prompt_cache_key.clone();
+        let request_model = request.model.clone();
+        let tool_choice = request.tool_choice.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -339,6 +341,8 @@ async fn chat_completions(
                 subagent.as_deref(),
                 memgen_request,
                 previous_response_id.as_deref(),
+                Some(request_model.as_str()),
+                tool_choice.as_ref(),
             )
         })
         .await
@@ -494,6 +498,8 @@ async fn chat_completions(
         let temperature = request.temperature;
         let reasoning_effort = request.reasoning_effort.clone();
         let prompt_cache_key = request.prompt_cache_key.clone();
+        let request_model = request.model.clone();
+        let tool_choice = request.tool_choice.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -511,6 +517,8 @@ async fn chat_completions(
                 subagent.as_deref(),
                 memgen_request,
                 previous_response_id.as_deref(),
+                Some(request_model.as_str()),
+                tool_choice.as_ref(),
             )
         })
         .await
@@ -592,6 +600,7 @@ async fn images_generations(
     let prompt = request.prompt.clone();
     let size = request.size.clone();
     let reasoning_effort = request.reasoning_effort.clone();
+    let request_model = request.model.clone();
 
     let result = task::spawn_blocking(move || {
         provider.generate_image(
@@ -599,6 +608,7 @@ async fn images_generations(
             &[],
             size.as_deref(),
             reasoning_effort.as_deref(),
+            Some(request_model.as_str()),
         )
     })
     .await
@@ -636,7 +646,7 @@ async fn inspect(
     let reasoning_effort = request.reasoning_effort.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.inspect_images(&prompt, &images, reasoning_effort.as_deref())
+        provider.inspect_images(&prompt, &images, reasoning_effort.as_deref(), None)
     })
     .await
     .unwrap();
@@ -659,7 +669,7 @@ async fn compact(
     let reasoning_effort = request.reasoning_effort.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.compact_messages(&messages, reasoning_effort.as_deref())
+        provider.compact_messages(&messages, reasoning_effort.as_deref(), None)
     })
     .await
     .unwrap();

@@ -44,7 +44,7 @@ cargo build --release
 ./target/release/codex-as-api
 ```
 
-Both versions bind to `0.0.0.0:8000` by default.
+Both versions bind to `0.0.0.0:18080` by default.
 
 ## Configuration
 
@@ -53,9 +53,15 @@ Environment variables (both Python and Rust):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CODEX_AS_API_HOST` | `0.0.0.0` | Bind address |
-| `CODEX_AS_API_PORT` | `8000` | Listen port |
+| `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
+
+To use a different port:
+
+```bash
+CODEX_AS_API_PORT=9000 codex-as-api
+```
 
 To bind to localhost only:
 
@@ -70,7 +76,7 @@ CODEX_AS_API_HOST=127.0.0.1 codex-as-api
 Standard OpenAI chat completions. Supports streaming (`stream: true`) and non-streaming.
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -84,7 +90,7 @@ curl http://localhost:8000/v1/chat/completions \
 Streaming:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -99,7 +105,7 @@ curl http://localhost:8000/v1/chat/completions \
 With tools:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -129,7 +135,7 @@ curl http://localhost:8000/v1/chat/completions \
 Generate images via the Codex image generation tool.
 
 ```bash
-curl http://localhost:8000/v1/images/generations \
+curl http://localhost:18080/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -143,7 +149,7 @@ curl http://localhost:8000/v1/images/generations \
 Inspect images with a text prompt (custom endpoint).
 
 ```bash
-curl http://localhost:8000/v1/inspect \
+curl http://localhost:18080/v1/inspect \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Describe what you see",
@@ -156,7 +162,7 @@ curl http://localhost:8000/v1/inspect \
 Compact a conversation into a checkpoint for continuation (custom endpoint).
 
 ```bash
-curl http://localhost:8000/v1/compact \
+curl http://localhost:18080/v1/compact \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -172,7 +178,7 @@ curl http://localhost:8000/v1/compact \
 Health check. Returns auth availability and configured model.
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:18080/health
 # {"status":"ok","auth_available":true,"model":"gpt-5.5"}
 ```
 
@@ -187,7 +193,7 @@ Enables prefix-cache stickiness on the Codex backend. When multiple requests sha
 **When to use:** Set a stable key per conversation or session. All turns within the same session should share one key.
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -204,7 +210,7 @@ curl http://localhost:8000/v1/chat/completions \
 Controls how much compute the model spends on reasoning. Valid values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -221,7 +227,7 @@ curl http://localhost:8000/v1/chat/completions \
 Chains responses together on the backend. Pass the response ID from a previous turn to maintain server-side conversation state.
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -241,7 +247,7 @@ Can be passed as a body field or HTTP header:
 
 ```bash
 # As body field
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
@@ -250,7 +256,7 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 
 # As HTTP header
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-openai-subagent: review" \
   -d '{
@@ -264,7 +270,7 @@ curl http://localhost:8000/v1/chat/completions \
 Flags the request as a memory generation/consolidation request. Can be passed as a body field (`bool`) or HTTP header (`"true"/"false"`):
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-openai-memgen-request: true" \
   -d '{
@@ -283,7 +289,7 @@ Point the base URL to your local server:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:18080/v1",
     api_key="unused",
 )
 
@@ -304,7 +310,7 @@ print(response.choices[0].message.content)
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: "http://localhost:8000/v1",
+  baseURL: "http://localhost:18080/v1",
   apiKey: "unused",
 });
 
@@ -321,7 +327,7 @@ console.log(response.choices[0].message.content);
 ### curl (streaming)
 
 ```bash
-curl -N http://localhost:8000/v1/chat/completions \
+curl -N http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.5",
