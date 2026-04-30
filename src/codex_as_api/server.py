@@ -456,6 +456,80 @@ try:
         return JSONResponse(content={"created": int(time.time()), "data": data})
 
     # ------------------------------------------------------------------
+    # Anthropic Messages API compatible endpoint
+    # ------------------------------------------------------------------
+
+    from .anthropic_adapter import (
+        anthropic_request_to_internal,
+        internal_response_to_anthropic,
+        anthropic_stream_adapter,
+        format_anthropic_error,
+    )
+
+    @app.post("/v1/messages", response_model=None)
+    async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingResponse:
+        provider = _get_provider()
+        body = await http_request.json()
+
+        try:
+            messages, tools, tool_choice, stop, reasoning_effort = anthropic_request_to_internal(
+                model=body.get("model", MODEL),
+                messages=body.get("messages", []),
+                system=body.get("system"),
+                max_tokens=body.get("max_tokens", 4096),
+                tools=body.get("tools"),
+                tool_choice=body.get("tool_choice"),
+                stop_sequences=body.get("stop_sequences"),
+                thinking=body.get("thinking"),
+            )
+        except Exception as exc:
+            return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
+
+        stream = body.get("stream", False)
+        request_model = body.get("model") or MODEL
+
+        if stream:
+            async def _stream() -> AsyncIterator[str]:
+                request_id = f"msg_{uuid.uuid4().hex[:24]}"
+                for sse_chunk in anthropic_stream_adapter(
+                    provider.chat_stream(
+                        messages,
+                        model=request_model,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        reasoning_effort=reasoning_effort,
+                        stop=stop,
+                    ),
+                    model=_openai_model_id(request_model),
+                    request_id=request_id,
+                ):
+                    yield sse_chunk
+
+            try:
+                return StreamingResponse(_stream(), media_type="text/event-stream")
+            except ChatGPTOAuthError as exc:
+                status = 401 if isinstance(exc, ChatGPTOAuthMissingError) else 500
+                return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
+
+        # Non-streaming
+        try:
+            response = provider.chat(
+                messages,
+                model=request_model,
+                tools=tools,
+                tool_choice=tool_choice,
+                reasoning_effort=reasoning_effort,
+                stop=stop,
+            )
+        except ChatGPTOAuthError as exc:
+            status = 401 if isinstance(exc, ChatGPTOAuthMissingError) else 500
+            return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
+
+        request_id = f"msg_{uuid.uuid4().hex[:24]}"
+        result = internal_response_to_anthropic(response, _openai_model_id(request_model), request_id)
+        return JSONResponse(content=result)
+
+    # ------------------------------------------------------------------
     # Custom endpoints (not in standard OpenAI API, but exposed for full feature routing)
     # ------------------------------------------------------------------
 

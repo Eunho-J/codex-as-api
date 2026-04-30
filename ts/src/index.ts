@@ -31,3 +31,9 @@ export {
   responseFailureMessage,
   reasoningFromResponseItems,
 } from "./protocol.js";
+export {
+  anthropicRequestToInternal,
+  internalResponseToAnthropic,
+  anthropicStreamAdapter,
+  formatAnthropicError,
+} from "./anthropic-adapter.js";

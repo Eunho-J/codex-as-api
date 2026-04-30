@@ -8,6 +8,12 @@ import {
 import type { Message, ToolCall, ToolSchema } from "./messages.js";
 import { MessageRole } from "./messages.js";
 import { ChatGPTOAuthProvider } from "./provider.js";
+import {
+  anthropicRequestToInternal,
+  internalResponseToAnthropic,
+  anthropicStreamAdapter,
+  formatAnthropicError,
+} from "./anthropic-adapter.js";
 
 const HOST = process.env.CODEX_AS_API_HOST || "0.0.0.0";
 const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
@@ -360,6 +366,74 @@ export function createApp(opts?: {
       res.json({ checkpoint });
     } catch (err) {
       handleError(err, res);
+    }
+  });
+
+  app.post("/v1/messages", async (req: Request, res: Response) => {
+    try {
+      const body = req.body;
+      const requestId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+
+      const subagent =
+        body.subagent ||
+        (req.headers["x-openai-subagent"] as string | undefined);
+      const memgenHeader = req.headers[
+        "x-openai-memgen-request"
+      ] as string | undefined;
+      let memgenRequest: boolean | undefined = body.memgen_request;
+      if (memgenRequest == null && memgenHeader != null) {
+        memgenRequest = !["false", "0", ""].includes(
+          memgenHeader.toLowerCase(),
+        );
+      }
+
+      const { messages, tools, toolChoice, stop, reasoningEffort } =
+        anthropicRequestToInternal({
+          model: body.model,
+          messages: body.messages || [],
+          system: body.system,
+          maxTokens: body.max_tokens,
+          tools: body.tools,
+          toolChoice: body.tool_choice,
+          stopSequences: body.stop_sequences,
+          thinking: body.thinking,
+        });
+
+      const chatOpts = {
+        model: body.model,
+        tools: tools ?? undefined,
+        toolChoice: toolChoice ?? undefined,
+        reasoningEffort: reasoningEffort ?? undefined,
+        maxTokens: body.max_tokens,
+        stop: stop ?? undefined,
+        subagent,
+        memgenRequest,
+      };
+
+      if (body.stream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+
+        for await (const chunk of anthropicStreamAdapter(
+          provider.chatStream(messages, chatOpts),
+          body.model || MODEL,
+          requestId,
+        )) {
+          res.write(chunk);
+        }
+        res.end();
+      } else {
+        const response = await provider.chat(messages, chatOpts);
+        res.json(internalResponseToAnthropic(response, body.model || MODEL, requestId));
+      }
+    } catch (err) {
+      const status =
+        err instanceof ChatGPTOAuthMissingError ? 401 :
+        err instanceof ChatGPTOAuthError ? 500 : 500;
+      res
+        .status(status)
+        .json(formatAnthropicError(status, String(err)));
     }
   });
 

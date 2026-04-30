@@ -1,3 +1,4 @@
+mod anthropic_adapter;
 mod auth;
 mod messages;
 mod protocol;

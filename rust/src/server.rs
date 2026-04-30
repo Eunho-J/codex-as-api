@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
 
+use crate::anthropic_adapter::{
+    anthropic_request_to_internal, anthropic_stream_adapter, format_anthropic_error,
+    internal_response_to_anthropic,
+};
 use crate::auth::{self, AuthError};
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::provider::{ChatGPTOAuthProvider, ProviderError};
@@ -131,6 +135,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/inspect", post(inspect))
         .route("/v1/compact", post(compact))
+        .route("/v1/messages", post(anthropic_messages))
         .with_state(state)
 }
 
@@ -696,4 +701,177 @@ async fn compact(
     })?;
 
     Ok(Json(json!({"checkpoint": checkpoint})))
+}
+
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let request_id = format!(
+        "msg_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..24]
+    );
+
+    let subagent = body
+        .get("subagent")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
+                .get("x-anthropic-subagent")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+
+    let memgen_request = body
+        .get("memgen_request")
+        .and_then(|v| v.as_bool())
+        .or_else(|| {
+            headers
+                .get("x-anthropic-memgen-request")
+                .and_then(|v| v.to_str().ok())
+                .map(|h| !matches!(h.to_lowercase().as_str(), "false" | "0" | ""))
+        });
+
+    let (messages, tools, tool_choice, stop, reasoning_effort) =
+        anthropic_request_to_internal(&body);
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let model = state.model.clone();
+    let model_for_response = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&model)
+        .to_string();
+
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(|v| v.as_i64());
+
+    let tool_choice_val: Option<Value> = tool_choice;
+
+    if stream {
+        let provider = state.provider.clone();
+        let model_for_closure = model_for_response.clone();
+
+        let result = task::spawn_blocking(move || {
+            let tools_ref = tools.as_deref();
+            let stop_ref = stop.as_deref();
+            let tc_ref = tool_choice_val.as_ref();
+
+            provider.chat_stream(
+                &messages,
+                tools_ref,
+                None,
+                reasoning_effort.as_deref(),
+                max_tokens,
+                stop_ref,
+                None,
+                subagent.as_deref(),
+                memgen_request,
+                None,
+                Some(model_for_closure.as_str()),
+                tc_ref,
+                None,
+                None,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+
+        let events = match result {
+            Ok(evts) => evts,
+            Err(e) => {
+                let status_code = match map_error_status(&e) {
+                    StatusCode::UNAUTHORIZED => 401u16,
+                    StatusCode::INTERNAL_SERVER_ERROR => 500u16,
+                    s => s.as_u16(),
+                };
+                let body = format_anthropic_error(status_code, &e.to_string());
+                return Err((
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(body),
+                )
+                    .into_response());
+            }
+        };
+
+        let sse_strings = anthropic_stream_adapter(&events, &model_for_response, &request_id);
+
+        let sse_events: Vec<Result<Event, std::convert::Infallible>> = sse_strings
+            .into_iter()
+            .map(|chunk| {
+                let mut lines = chunk.trim_end_matches('\n').splitn(2, '\n');
+                let event_type = lines
+                    .next()
+                    .and_then(|l| l.strip_prefix("event: "))
+                    .unwrap_or("message")
+                    .to_string();
+                let data = lines
+                    .next()
+                    .and_then(|l| l.strip_prefix("data: "))
+                    .unwrap_or("")
+                    .to_string();
+                Ok(Event::default().event(event_type).data(data))
+            })
+            .collect();
+
+        let sse = Sse::new(stream::iter(sse_events));
+        Ok(sse.into_response())
+    } else {
+        let provider = state.provider.clone();
+        let model_for_closure = model_for_response.clone();
+
+        let result = task::spawn_blocking(move || {
+            let tools_ref = tools.as_deref();
+            let stop_ref = stop.as_deref();
+            let tc_ref = tool_choice_val.as_ref();
+
+            provider.chat(
+                &messages,
+                tools_ref,
+                None,
+                reasoning_effort.as_deref(),
+                max_tokens,
+                stop_ref,
+                None,
+                subagent.as_deref(),
+                memgen_request,
+                None,
+                Some(model_for_closure.as_str()),
+                tc_ref,
+                None,
+                None,
+                None,
+            )
+        })
+        .await
+        .unwrap();
+
+        let response = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                let status_code = match map_error_status(&e) {
+                    StatusCode::UNAUTHORIZED => 401u16,
+                    StatusCode::INTERNAL_SERVER_ERROR => 500u16,
+                    s => s.as_u16(),
+                };
+                let body = format_anthropic_error(status_code, &e.to_string());
+                return Err((
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    Json(body),
+                )
+                    .into_response());
+            }
+        };
+
+        let out = internal_response_to_anthropic(&response, &model_for_response, &request_id);
+        Ok(Json(out).into_response())
+    }
 }
