@@ -26,6 +26,7 @@ class Message:
     tool_call_id: str | None = None
     name: str | None = None
     reasoning_content: str | None = None
+    images: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_calls, tuple):

@@ -87,6 +87,7 @@ function convertUserMessage(
   }
   if (!Array.isArray(content)) return;
   const textParts: string[] = [];
+  const imageUrls: string[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const b = block as Record<string, unknown>;
@@ -94,9 +95,10 @@ function convertUserMessage(
     if (blockType === "text") {
       if (typeof b.text === "string") textParts.push(b.text);
     } else if (blockType === "tool_result") {
-      if (textParts.length) {
-        out.push({ role: MessageRole.USER, content: textParts.join("") });
+      if (textParts.length || imageUrls.length) {
+        out.push({ role: MessageRole.USER, content: textParts.join(""), images: [...imageUrls] });
         textParts.length = 0;
+        imageUrls.length = 0;
       }
       const toolUseId = typeof b.tool_use_id === "string" ? b.tool_use_id : "tool-call";
       let resultContent = b.content ?? "";
@@ -119,12 +121,12 @@ function convertUserMessage(
       if (source && source.type === "base64") {
         const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
         const data = typeof source.data === "string" ? source.data : "";
-        textParts.push(`[image: data:${mediaType};base64,${data.slice(0, 20)}...]`);
+        imageUrls.push(`data:${mediaType};base64,${data}`);
       }
     }
   }
-  if (textParts.length) {
-    out.push({ role: MessageRole.USER, content: textParts.join("") });
+  if (textParts.length || imageUrls.length) {
+    out.push({ role: MessageRole.USER, content: textParts.join(""), images: [...imageUrls] });
   }
 }
 

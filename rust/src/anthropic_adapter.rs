@@ -24,6 +24,7 @@ pub fn anthropic_request_to_internal(
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                images: vec![],
             });
         }
     }
@@ -102,10 +103,12 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                images: vec![],
             });
         }
         Value::Array(arr) => {
             let mut text_parts: Vec<String> = Vec::new();
+            let mut image_urls: Vec<String> = Vec::new();
             for block in arr {
                 let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match block_type {
@@ -115,7 +118,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                         }
                     }
                     "tool_result" => {
-                        if !text_parts.is_empty() {
+                        if !text_parts.is_empty() || !image_urls.is_empty() {
                             out.push(Message {
                                 role: MessageRole::User,
                                 content: text_parts.join(""),
@@ -123,6 +126,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                                 tool_call_id: None,
                                 name: None,
                                 reasoning_content: None,
+                                images: std::mem::take(&mut image_urls),
                             });
                             text_parts = Vec::new();
                         }
@@ -141,6 +145,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             tool_call_id: Some(tool_use_id.clone()),
                             name: Some(tool_use_id),
                             reasoning_content: None,
+                            images: vec![],
                         });
                     }
                     "image" => {
@@ -154,10 +159,9 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                                     .get("data")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                let prefix: String = data.chars().take(20).collect();
-                                text_parts.push(format!(
-                                    "[image: data:{};base64,{}...]",
-                                    media_type, prefix
+                                image_urls.push(format!(
+                                    "data:{};base64,{}",
+                                    media_type, data
                                 ));
                             }
                         }
@@ -165,7 +169,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                     _ => {}
                 }
             }
-            if !text_parts.is_empty() {
+            if !text_parts.is_empty() || !image_urls.is_empty() {
                 out.push(Message {
                     role: MessageRole::User,
                     content: text_parts.join(""),
@@ -173,6 +177,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
+                    images: image_urls,
                 });
             }
         }
@@ -209,6 +214,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                images: vec![],
             });
         }
         Value::Array(arr) => {
@@ -261,6 +267,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                 tool_call_id: None,
                 name: None,
                 reasoning_content,
+                images: vec![],
             });
         }
         _ => {}

@@ -156,6 +156,7 @@ fn request_messages_to_internal(messages: &[ChatMessage]) -> Vec<Message> {
             tool_call_id: msg.tool_call_id.clone(),
             name: msg.name.clone(),
             reasoning_content: None,
+            images: vec![],
         };
         result.push(m);
     }

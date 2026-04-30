@@ -72,6 +72,7 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
         out.append(Message(role=MessageRole.USER, content=content))
         return
     text_parts: list[str] = []
+    image_urls: list[str] = []
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -81,10 +82,14 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
             if isinstance(text, str):
                 text_parts.append(text)
         elif block_type == "tool_result":
-            # Flush accumulated text before tool result
-            if text_parts:
-                out.append(Message(role=MessageRole.USER, content="".join(text_parts)))
+            if text_parts or image_urls:
+                out.append(Message(
+                    role=MessageRole.USER,
+                    content="".join(text_parts),
+                    images=tuple(image_urls),
+                ))
                 text_parts = []
+                image_urls = []
             tool_use_id = block.get("tool_use_id") or "tool-call"
             result_content = block.get("content", "")
             if isinstance(result_content, list):
@@ -105,9 +110,13 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
             if isinstance(source, dict) and source.get("type") == "base64":
                 media_type = source.get("media_type", "image/png")
                 data = source.get("data", "")
-                text_parts.append(f"[image: data:{media_type};base64,{data[:20]}...]")
-    if text_parts:
-        out.append(Message(role=MessageRole.USER, content="".join(text_parts)))
+                image_urls.append(f"data:{media_type};base64,{data}")
+    if text_parts or image_urls:
+        out.append(Message(
+            role=MessageRole.USER,
+            content="".join(text_parts),
+            images=tuple(image_urls),
+        ))
 
 
 def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Message]) -> None:

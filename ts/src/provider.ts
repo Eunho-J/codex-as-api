@@ -718,7 +718,7 @@ export function messagesToResponseItems(
 
     const role =
       message.role === MessageRole.ASSISTANT ? "assistant" : "user";
-    items.push(messageItem(role, message.content));
+    items.push(messageItem(role, message.content, message.images));
   }
   return items;
 }
@@ -726,12 +726,21 @@ export function messagesToResponseItems(
 export function messageItem(
   role: string,
   content: string,
+  images?: string[],
 ): Record<string, unknown> {
   const typ = role === "assistant" ? "output_text" : "input_text";
+  const contentItems: Record<string, unknown>[] = [
+    { type: typ, text: content || "" },
+  ];
+  if (images) {
+    for (const imageUrl of images) {
+      contentItems.push({ type: "input_image", image_url: imageUrl });
+    }
+  }
   return {
     type: "message",
     role,
-    content: [{ type: typ, text: content || "" }],
+    content: contentItems,
   };
 }
 

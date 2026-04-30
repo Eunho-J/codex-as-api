@@ -598,13 +598,16 @@ def _messages_to_response_items(messages: Sequence[Message]) -> list[dict[str, A
                 })
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
-        items.append(_message_item(role, message.content))
+        items.append(_message_item(role, message.content, message.images))
     return items
 
 
-def _message_item(role: str, content: str) -> dict[str, Any]:
+def _message_item(role: str, content: str, images: tuple[str, ...] = ()) -> dict[str, Any]:
     typ = "output_text" if role == "assistant" else "input_text"
-    return {"type": "message", "role": role, "content": [{"type": typ, "text": content or ""}]}
+    content_items: list[dict[str, Any]] = [{"type": typ, "text": content or ""}]
+    for image_url in images:
+        content_items.append({"type": "input_image", "image_url": image_url})
+    return {"type": "message", "role": role, "content": content_items}
 
 
 def _tool_schema_to_response_dict(tool: ToolSchema) -> dict[str, Any]:

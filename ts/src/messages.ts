@@ -18,6 +18,7 @@ export interface Message {
   tool_call_id?: string;
   name?: string;
   reasoning_content?: string;
+  images?: string[];
 }
 
 export interface Usage {

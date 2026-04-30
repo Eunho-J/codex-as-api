@@ -209,6 +209,27 @@ class TestAnthropicRequestToInternal:
         )
         assert stop == ["STOP", "END"]
 
+    def test_user_image_block(self):
+        messages, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgoAAAANS",
+                    }},
+                ],
+            }],
+        )
+        assert len(messages) == 1
+        assert messages[0].role is MessageRole.USER
+        assert messages[0].content == "What is in this image?"
+        assert len(messages[0].images) == 1
+        assert messages[0].images[0] == "data:image/png;base64,iVBORw0KGgoAAAANS"
+
     def test_tool_result_with_content_blocks(self):
         messages, _, _, _, _ = anthropic_request_to_internal(
             model="test",

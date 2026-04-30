@@ -25,6 +25,7 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
     pub reasoning_content: Option<String>,
+    pub images: Vec<String>,
 }
 
 impl Message {
@@ -58,6 +59,7 @@ impl Message {
             tool_call_id,
             name,
             reasoning_content: None,
+            images: vec![],
         })
     }
 }

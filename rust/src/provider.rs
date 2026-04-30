@@ -969,7 +969,7 @@ fn messages_to_response_items_refs(messages: &[&Message]) -> Vec<Value> {
 
         if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
             if !message.content.is_empty() {
-                items.push(message_item("assistant", &message.content));
+                items.push(message_item("assistant", &message.content, &[]));
             }
             for tc in &message.tool_calls {
                 items.push(json!({
@@ -987,22 +987,27 @@ fn messages_to_response_items_refs(messages: &[&Message]) -> Vec<Value> {
         } else {
             "user"
         };
-        items.push(message_item(role, &message.content));
+        items.push(message_item(role, &message.content, &message.images));
     }
 
     items
 }
 
-fn message_item(role: &str, content: &str) -> Value {
+fn message_item(role: &str, content: &str, images: &[String]) -> Value {
     let typ = if role == "assistant" {
         "output_text"
     } else {
         "input_text"
     };
+    let mut content_items = vec![json!({"type": typ, "text": content})];
+    for image_url in images {
+        content_items.push(json!({"type": "input_image", "image_url": image_url}));
+    }
+    content_items[0] = json!({"type": typ, "text": if content.is_empty() { "" } else { content }});
     json!({
         "type": "message",
         "role": role,
-        "content": [{"type": typ, "text": if content.is_empty() { "" } else { content }}],
+        "content": content_items,
     })
 }
 
@@ -1177,6 +1182,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                images: vec![],
             },
             Message {
                 role: MessageRole::User,
@@ -1185,6 +1191,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                images: vec![],
             },
         ];
         let (instructions, input) = split_instructions_and_input(&messages);
@@ -1194,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_message_item_user() {
-        let item = message_item("user", "hello");
+        let item = message_item("user", "hello", &[]);
         assert_eq!(item["type"], "message");
         assert_eq!(item["role"], "user");
         let content = item["content"].as_array().unwrap();
@@ -1204,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_message_item_assistant() {
-        let item = message_item("assistant", "response");
+        let item = message_item("assistant", "response", &[]);
         let content = item["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "output_text");
     }
@@ -1341,6 +1348,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             name: Some("my_tool".to_string()),
             reasoning_content: None,
+                images: vec![],
         };
         let items = messages_to_response_items(&[msg]);
         assert_eq!(items.len(), 1);
