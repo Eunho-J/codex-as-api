@@ -1,10 +1,27 @@
 # codex-as-api
 
+[![GitHub Release](https://img.shields.io/github/v/release/Eunho-J/codex-as-api)](https://github.com/Eunho-J/codex-as-api/releases)
+[![PyPI](https://img.shields.io/pypi/v/codex-as-api)](https://pypi.org/project/codex-as-api/)
+[![npm](https://img.shields.io/npm/v/codex-as-api)](https://www.npmjs.com/package/codex-as-api)
+[![License](https://img.shields.io/github/license/Eunho-J/codex-as-api)](LICENSE)
+
 Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
+
+## Features
+
+- **OpenAI & Anthropic compatible** — `POST /v1/chat/completions` and `POST /v1/messages` endpoints
+- **Claude Code ready** — use Codex models directly from Claude Code CLI
+- **Streaming** — full SSE streaming for both OpenAI and Anthropic protocols
+- **Tool calling** — function calls, tool results, and parallel tool calls
+- **Image support** — generation, inspection, and base64 image passthrough (including tool result images)
+- **Reasoning** — configurable reasoning effort with streaming thinking content
+- **Codex features** — `prompt_cache_key`, `previous_response_id`, subagent headers, remote compaction
+- **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
+- **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
 
 ## What it does
 
-Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials. Supports streaming, tool calling, reasoning, image generation, and Codex-specific features like `prompt_cache_key` and subagent headers.
+Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials.
 
 Python, Rust, and TypeScript (npm) implementations are provided — identical functionality, same endpoints, same behavior.
 
