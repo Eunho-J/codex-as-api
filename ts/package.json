@@ -2,7 +2,25 @@
   "name": "codex-as-api",
   "version": "0.1.0",
   "description": "Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eunho-J/codex-as-api.git",
+    "directory": "ts"
+  },
+  "keywords": [
+    "codex",
+    "chatgpt",
+    "openai",
+    "oauth",
+    "api",
+    "proxy",
+    "openai-compatible"
+  ],
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "codex-as-api": "./dist/cli.js"
   },
@@ -21,7 +39,8 @@
   },
   "scripts": {
     "build": "tsup",
-    "test": "npx tsx --test src/__tests__/*.test.ts"
+    "test": "npx tsx --test src/__tests__/*.test.ts",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "express": "^5.1.0"
