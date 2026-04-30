@@ -52,6 +52,9 @@ pub struct ChatCompletionRequest {
     pub subagent: Option<String>,
     pub memgen_request: Option<bool>,
     pub previous_response_id: Option<String>,
+    pub service_tier: Option<String>,
+    pub text: Option<Value>,
+    pub client_metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +328,10 @@ async fn chat_completions(
         let request_model = request.model.clone();
         let tool_choice = request.tool_choice.clone();
 
+        let service_tier = request.service_tier.clone();
+        let text = request.text.clone();
+        let client_metadata = request.client_metadata.clone();
+
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
             let stop_ref: Option<Vec<String>> = stop;
@@ -343,6 +350,9 @@ async fn chat_completions(
                 previous_response_id.as_deref(),
                 Some(request_model.as_str()),
                 tool_choice.as_ref(),
+                service_tier.as_deref(),
+                text.as_ref(),
+                client_metadata.as_ref(),
             )
         })
         .await
@@ -500,6 +510,9 @@ async fn chat_completions(
         let prompt_cache_key = request.prompt_cache_key.clone();
         let request_model = request.model.clone();
         let tool_choice = request.tool_choice.clone();
+        let service_tier = request.service_tier.clone();
+        let text = request.text.clone();
+        let client_metadata = request.client_metadata.clone();
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -519,6 +532,9 @@ async fn chat_completions(
                 previous_response_id.as_deref(),
                 Some(request_model.as_str()),
                 tool_choice.as_ref(),
+                service_tier.as_deref(),
+                text.as_ref(),
+                client_metadata.as_ref(),
             )
         })
         .await

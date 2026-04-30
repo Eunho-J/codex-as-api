@@ -54,6 +54,9 @@ impl ChatGPTOAuthProvider {
         previous_response_id: Option<&str>,
         model: Option<&str>,
         tool_choice: Option<&Value>,
+        service_tier: Option<&str>,
+        text: Option<&Value>,
+        client_metadata: Option<&HashMap<String, String>>,
     ) -> Result<AssistantResponse, ProviderError> {
         let mut content_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
@@ -75,6 +78,9 @@ impl ChatGPTOAuthProvider {
             previous_response_id,
             model,
             tool_choice,
+            service_tier,
+            text,
+            client_metadata,
         )?;
 
         for event in events {
@@ -168,6 +174,9 @@ impl ChatGPTOAuthProvider {
         previous_response_id: Option<&str>,
         model: Option<&str>,
         tool_choice: Option<&Value>,
+        service_tier: Option<&str>,
+        text: Option<&Value>,
+        client_metadata: Option<&HashMap<String, String>>,
     ) -> Result<Vec<Value>, ProviderError> {
         let _ = temperature;
         let payload = self.responses_payload(
@@ -179,6 +188,9 @@ impl ChatGPTOAuthProvider {
             previous_response_id,
             model,
             tool_choice,
+            service_tier,
+            text,
+            client_metadata,
         )?;
 
         let mut extra_headers: HashMap<String, String> = HashMap::new();
@@ -547,6 +559,9 @@ impl ChatGPTOAuthProvider {
         previous_response_id: Option<&str>,
         model: Option<&str>,
         tool_choice: Option<&Value>,
+        service_tier: Option<&str>,
+        text: Option<&Value>,
+        client_metadata: Option<&HashMap<String, String>>,
     ) -> Result<Value, ProviderError> {
         let (instructions, input_items) = split_instructions_and_input(messages);
 
@@ -592,6 +607,25 @@ impl ChatGPTOAuthProvider {
                 "previous_response_id".to_string(),
                 Value::String(prid.to_string()),
             );
+        }
+        if let Some(st) = service_tier {
+            payload.as_object_mut().unwrap().insert(
+                "service_tier".to_string(),
+                Value::String(st.to_string()),
+            );
+        }
+        if let Some(t) = text {
+            payload.as_object_mut().unwrap().insert("text".to_string(), t.clone());
+        }
+        if let Some(cm) = client_metadata {
+            let map: serde_json::Map<String, Value> = cm
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("client_metadata".to_string(), Value::Object(map));
         }
 
         set_reasoning_payload(payload.as_object_mut().unwrap(), reasoning_effort)?;

@@ -89,6 +89,9 @@ try:
         subagent: str | None = None
         memgen_request: bool | None = None
         previous_response_id: str | None = None
+        service_tier: str | None = None
+        text: dict[str, Any] | None = None
+        client_metadata: dict[str, str] | None = None
 
     class ImageGenerationRequest(BaseModel):
         model: str
@@ -261,6 +264,9 @@ try:
                     subagent=subagent,
                     memgen_request=memgen_request,
                     previous_response_id=previous_response_id,
+                    service_tier=request.service_tier,
+                    text=request.text,
+                    client_metadata=request.client_metadata,
                 ):
                     typ = event.get("type")
                     if typ == "content":
@@ -383,6 +389,9 @@ try:
             subagent=subagent,
             memgen_request=memgen_request,
             previous_response_id=previous_response_id,
+            service_tier=request.service_tier,
+            text=request.text,
+            client_metadata=request.client_metadata,
         )
 
         choices: list[dict[str, Any]] = [{

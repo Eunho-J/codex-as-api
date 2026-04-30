@@ -74,6 +74,9 @@ class ChatGPTOAuthProvider:
         subagent: str | None = None,
         memgen_request: bool | None = None,
         previous_response_id: str | None = None,
+        service_tier: str | None = None,
+        text: dict | None = None,
+        client_metadata: dict[str, str] | None = None,
     ) -> AssistantResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -94,6 +97,9 @@ class ChatGPTOAuthProvider:
             subagent=subagent,
             memgen_request=memgen_request,
             previous_response_id=previous_response_id,
+            service_tier=service_tier,
+            text=text,
+            client_metadata=client_metadata,
         ):
             raw_events.append(dict(event))
             if event.get("type") == "content":
@@ -131,6 +137,9 @@ class ChatGPTOAuthProvider:
         subagent: str | None = None,
         memgen_request: bool | None = None,
         previous_response_id: str | None = None,
+        service_tier: str | None = None,
+        text: dict | None = None,
+        client_metadata: dict[str, str] | None = None,
     ) -> Iterator[dict[str, Any]]:
         del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         payload = self._responses_payload(
@@ -143,6 +152,9 @@ class ChatGPTOAuthProvider:
             stop=stop,
             prompt_cache_key=prompt_cache_key,
             previous_response_id=previous_response_id,
+            service_tier=service_tier,
+            text=text,
+            client_metadata=client_metadata,
         )
         extra_headers: dict[str, str] = {}
         if subagent is not None:
@@ -365,6 +377,9 @@ class ChatGPTOAuthProvider:
         stop: Sequence[str] | None,
         prompt_cache_key: str | None,
         previous_response_id: str | None = None,
+        service_tier: str | None = None,
+        text: dict | None = None,
+        client_metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         del temperature  # ChatGPT Codex backend rejects explicit temperature for this endpoint.
         instructions, input_items = _split_instructions_and_input(messages)
@@ -387,6 +402,12 @@ class ChatGPTOAuthProvider:
             payload["stop"] = list(stop)
         if previous_response_id is not None:
             payload["previous_response_id"] = previous_response_id
+        if service_tier is not None:
+            payload["service_tier"] = service_tier
+        if text is not None:
+            payload["text"] = text
+        if client_metadata is not None:
+            payload["client_metadata"] = client_metadata
         _set_reasoning_payload(payload, reasoning_effort)
         return payload
 
