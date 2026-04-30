@@ -1,0 +1,6 @@
+# Core dependencies (none — uses stdlib only)
+
+# Server dependencies (install with: pip install -r requirements-server.txt)
+# fastapi>=0.100
+# uvicorn>=0.23
+# pydantic>=2.0

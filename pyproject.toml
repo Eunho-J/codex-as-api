@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-as-api"
+version = "0.1.0"
+description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Eunho-J", email = "" },
+]
+keywords = ["openai", "codex", "chatgpt", "oauth", "api", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2.0"]
+dev = ["pytest", "ruff", "mypy"]
+
+[project.scripts]
+codex-as-api = "codex_as_api.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Eunho-J/codex-as-api"
+Repository = "https://github.com/Eunho-J/codex-as-api"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_as_api"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
