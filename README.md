@@ -6,7 +6,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
 Runs a lightweight HTTP server on `localhost` (or `0.0.0.0`) that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials. Supports streaming, tool calling, reasoning, image generation, and Codex-specific features like `prompt_cache_key` and subagent headers.
 
-Both Python and Rust implementations are provided — identical functionality, same endpoints, same behavior.
+Python, Rust, and TypeScript (npm) implementations are provided — identical functionality, same endpoints, same behavior.
 
 ## Prerequisites
 
@@ -44,7 +44,43 @@ cargo build --release
 ./target/release/codex-as-api
 ```
 
-Both versions bind to `0.0.0.0:18080` by default.
+### TypeScript (npm)
+
+```bash
+cd ts
+npm install
+npm run build
+node dist/cli.js
+```
+
+Or run directly with `npx`:
+
+```bash
+cd ts
+npx tsx src/cli.ts
+```
+
+Can also be used as a library:
+
+```typescript
+import { ChatGPTOAuthProvider, createApp } from "codex-as-api";
+
+// Use the provider directly
+const provider = new ChatGPTOAuthProvider({ model: "gpt-5.5" });
+const response = await provider.chat(
+  [
+    { role: "system", content: "You are helpful." },
+    { role: "user", content: "Hello!" },
+  ],
+);
+console.log(response.content);
+
+// Or create an Express app
+const app = createApp();
+app.listen(18080);
+```
+
+All versions bind to `0.0.0.0:18080` by default.
 
 ## Configuration
 
@@ -346,7 +382,7 @@ curl -N http://localhost:18080/v1/chat/completions \
 Client (OpenAI SDK / curl)
     |
     v
-HTTP Server (FastAPI or Axum)
+HTTP Server (FastAPI / Axum / Express)
     |
     +---> ChatGPTOAuthProvider
             |
@@ -380,6 +416,14 @@ pytest tests/ -v
 ```bash
 cd rust
 cargo test
+```
+
+### TypeScript
+
+```bash
+cd ts
+npm install
+npm test
 ```
 
 ## License

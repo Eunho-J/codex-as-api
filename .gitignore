@@ -7,3 +7,5 @@ rust/target/
 .pytest_cache/
 *.egg-info/
 uv.lock
+ts/node_modules/
+ts/dist/
