@@ -101,6 +101,17 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
 
+### Supported Models
+
+| Model | Description |
+|-------|-------------|
+| `gpt-5.5` | Frontier model for complex coding, research, and real-world work |
+| `gpt-5.4` | Strong model for everyday coding |
+| `gpt-5.4-mini` | Small, fast, and cost-efficient model for simpler coding tasks |
+| `gpt-5.3-codex` | Coding-optimized model |
+| `gpt-5.3-codex-spark` | Ultra-fast coding model |
+| `gpt-5.2` | Previous generation model |
+
 To use a different port:
 
 ```bash
@@ -439,9 +450,9 @@ ANTHROPIC_BASE_URL=http://localhost:18080 \
 ANTHROPIC_API_KEY=unused \
 ANTHROPIC_MODEL=gpt-5.5 \
 ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.5 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.5 \
-CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.4 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.4-mini \
+CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.4 \
 claude
 ```
 
