@@ -21,8 +21,3 @@
 - Python: `PYTHONPATH=src pytest -q`
 - Rust: `cargo test`
 - TypeScript: `npm test && npm run build`
-
-### Publishing
-- GitHub release: publishes the source release only: `gh release create v0.3.0 --title v0.3.0 --notes-file RELEASES.md`.
-- npmjs unscoped package: publishes `codex-as-api` to npmjs.com with `npm publish --access public` from `ts/` after tests and build.
-- GitHub Packages npm package: publishes a separate scoped package, `@eunho-j/codex-as-api`, to `https://npm.pkg.github.com` with a token that has `write:packages`.
