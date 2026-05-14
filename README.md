@@ -577,7 +577,17 @@ npm test
 
 ## Publishing
 
-### GitHub release
+Run validation first:
+
+```bash
+PYTHONPATH=src pytest -q
+(cd rust && cargo test)
+(cd ts && npm install && npm test && npm run build)
+```
+
+### 1. GitHub release
+
+This publishes the source release on GitHub Releases. It does **not** publish an npm package.
 
 ```bash
 git tag v0.3.0
@@ -585,7 +595,9 @@ git push origin v0.3.0
 gh release create v0.3.0 --title v0.3.0 --notes-file RELEASES.md
 ```
 
-### npm
+### 2. npmjs unscoped package
+
+This publishes the public unscoped npm package as `codex-as-api` to npmjs.com.
 
 ```bash
 cd ts
@@ -595,9 +607,9 @@ npm run build
 npm publish --access public
 ```
 
-### GitHub Packages (npm registry)
+### 3. GitHub Packages npm package
 
-GitHub Packages requires an npm scoped package name. The public npm package remains `codex-as-api`; publish to GitHub Packages by temporarily packing it under the GitHub scope:
+This publishes a separate npm package to GitHub Packages. GitHub Packages requires a scoped package name, so publish it as `@eunho-j/codex-as-api`. Keep npmjs as the unscoped `codex-as-api` package.
 
 ```bash
 cd ts
@@ -608,14 +620,14 @@ npm run build
 # Authenticate with a token that has write:packages.
 npm login --registry=https://npm.pkg.github.com --scope=@eunho-j
 
-# Publish the same build as @eunho-j/codex-as-api to GitHub Packages.
+# Publish to GitHub Packages under the GitHub scope.
 ORIGINAL_NAME=$(npm pkg get name | tr -d '"')
 npm pkg set name=@eunho-j/codex-as-api
 npm publish --registry=https://npm.pkg.github.com --access public
 npm pkg set name="$ORIGINAL_NAME"
 ```
 
-For CI, set `NODE_AUTH_TOKEN=${GITHUB_TOKEN}` or a PAT with `write:packages` and run the same scoped publish step after the GitHub release is created.
+For CI, set `NODE_AUTH_TOKEN=${GITHUB_TOKEN}` or a PAT with `write:packages` for the GitHub Packages step.
 
 ## License
 
