@@ -14,32 +14,70 @@ import {
   anthropicStreamAdapter,
   formatAnthropicError,
 } from "./anthropic-adapter.js";
+import { loadCodexConfig } from "./codex-config.js";
 
 const HOST = process.env.CODEX_AS_API_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
-const MODEL = process.env.CODEX_AS_API_MODEL || "gpt-5.5";
+const CODEX_CONFIG = loadCodexConfig();
+const MODEL = process.env.CODEX_AS_API_MODEL || CODEX_CONFIG.model || "gpt-5.5";
 const AUTH_PATH = process.env.CODEX_AS_API_AUTH_PATH;
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+
+function errorStatus(err: unknown): number {
+  if (err instanceof ChatGPTOAuthMissingError) return 401;
+  if (isContextWindowError(err)) return 400;
+  return 500;
+}
+
+function errorType(err: unknown): string {
+  if (err instanceof ChatGPTOAuthMissingError || err instanceof ChatGPTOAuthError) {
+    return "chatgpt_oauth_error";
+  }
+  return "server_error";
+}
+
+function isContextWindowError(err: unknown): boolean {
+  return /exceeds the context window|context window/i.test(String(err));
+}
 
 function handleError(err: unknown, res: Response): void {
-  if (err instanceof ChatGPTOAuthMissingError) {
-    res
-      .status(401)
-      .json({
-        error: { message: String(err), type: "chatgpt_oauth_error" },
-      });
-  } else if (err instanceof ChatGPTOAuthError) {
-    res
-      .status(500)
-      .json({
-        error: { message: String(err), type: "chatgpt_oauth_error" },
-      });
-  } else {
-    res
-      .status(500)
-      .json({
-        error: { message: String(err), type: "server_error" },
-      });
+  const status = errorStatus(err);
+  const body = {
+    error: { message: String(err), type: errorType(err) },
+  };
+
+  if (res.headersSent) {
+    if (!res.writableEnded) res.end();
+    return;
   }
+
+  res.status(status).json(body);
+}
+
+function writeOpenAIStreamError(err: unknown, res: Response): void {
+  if (res.writableEnded) return;
+  res.write(
+    `data: ${JSON.stringify({
+      error: { message: String(err), type: errorType(err) },
+    })}\n\n`,
+  );
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+function handleAnthropicError(err: unknown, res: Response): void {
+  const status = errorStatus(err);
+  const body = formatAnthropicError(status, String(err));
+
+  if (res.headersSent) {
+    if (!res.writableEnded) {
+      res.write(`event: error\ndata: ${JSON.stringify(body)}\n\n`);
+      res.end();
+    }
+    return;
+  }
+
+  res.status(status).json(body);
 }
 
 export function createApp(opts?: {
@@ -60,6 +98,9 @@ export function createApp(opts?: {
       status: "ok",
       auth_available: isAuthLocallyAvailable(AUTH_PATH),
       model: MODEL,
+      codex_config_path: CODEX_CONFIG.configPath,
+      context_window: getContextWindow(),
+      auto_compact_token_limit: getAutoCompactTokenLimit(),
     });
   });
 
@@ -311,7 +352,11 @@ export function createApp(opts?: {
           res.json(result);
         }
       } catch (err) {
-        handleError(err, res);
+        if (res.headersSent) {
+          writeOpenAIStreamError(err, res);
+        } else {
+          handleError(err, res);
+        }
       }
     },
   );
@@ -355,17 +400,44 @@ export function createApp(opts?: {
     }
   });
 
-  app.post("/v1/compact", async (req: Request, res: Response) => {
+  async function compact(req: Request, res: Response): Promise<void> {
     try {
       const body = req.body;
-      const rawMessages = body.messages || [];
-      const messages = requestMessagesToInternal(rawMessages);
+      const { messages, reasoningEffort } = messagesFromCompactBody(body);
       const checkpoint = await provider.compactMessages(messages, {
-        reasoningEffort: body.reasoning_effort,
+        model: MODEL,
+        reasoningEffort: body.reasoning_effort ?? reasoningEffort ?? undefined,
       });
       res.json({ checkpoint });
     } catch (err) {
       handleError(err, res);
+    }
+  }
+
+  app.post("/v1/compact", compact);
+  app.post("/v1/messages/compact", compact);
+
+  app.post("/v1/messages/count_tokens", (req: Request, res: Response) => {
+    try {
+      const body = req.body;
+      const { messages } = anthropicRequestToInternal({
+        model: body.model,
+        messages: body.messages || [],
+        system: body.system,
+        maxTokens: body.max_tokens,
+        tools: body.tools,
+        toolChoice: body.tool_choice,
+        stopSequences: body.stop_sequences,
+        thinking: body.thinking,
+      });
+      const inputTokens = estimateInputTokens(messages, body.tools);
+      res.json({
+        input_tokens: inputTokens,
+        context_window: getContextWindow(),
+        auto_compact_token_limit: getAutoCompactTokenLimit(),
+      });
+    } catch (err) {
+      handleAnthropicError(err, res);
     }
   });
 
@@ -399,7 +471,8 @@ export function createApp(opts?: {
           thinking: body.thinking,
         });
 
-      const requestModel = body.model || MODEL;
+      const clientModel = body.model || "claude-sonnet-4-5";
+      const requestModel = MODEL;
       const chatOpts = {
         model: requestModel,
         tools: tools ?? undefined,
@@ -418,7 +491,7 @@ export function createApp(opts?: {
 
         for await (const chunk of anthropicStreamAdapter(
           provider.chatStream(messages, chatOpts),
-          requestModel,
+          clientModel,
           requestId,
         )) {
           res.write(chunk);
@@ -426,15 +499,10 @@ export function createApp(opts?: {
         res.end();
       } else {
         const response = await provider.chat(messages, chatOpts);
-        res.json(internalResponseToAnthropic(response, requestModel, requestId));
+        res.json(internalResponseToAnthropic(response, clientModel, requestId));
       }
     } catch (err) {
-      const status =
-        err instanceof ChatGPTOAuthMissingError ? 401 :
-        err instanceof ChatGPTOAuthError ? 500 : 500;
-      res
-        .status(status)
-        .json(formatAnthropicError(status, String(err)));
+      handleAnthropicError(err, res);
     }
   });
 
@@ -442,6 +510,52 @@ export function createApp(opts?: {
 }
 
 // --- Helpers ---
+
+function getContextWindow(): number {
+  return CODEX_CONFIG.modelContextWindow || DEFAULT_CONTEXT_WINDOW;
+}
+
+function getAutoCompactTokenLimit(): number {
+  return CODEX_CONFIG.modelAutoCompactTokenLimit || Math.floor(getContextWindow() * 0.8);
+}
+
+function messagesFromCompactBody(body: Record<string, unknown>): {
+  messages: Message[];
+  reasoningEffort: string | null;
+} {
+  if (body.system != null || body.thinking != null || body.tool_choice != null || body.stop_sequences != null) {
+    const converted = anthropicRequestToInternal({
+      model: String(body.model || MODEL),
+      messages: Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [],
+      system: body.system as string | Record<string, unknown>[] | undefined,
+      maxTokens: typeof body.max_tokens === "number" ? body.max_tokens : undefined,
+      tools: Array.isArray(body.tools) ? body.tools as Record<string, unknown>[] : undefined,
+      toolChoice: typeof body.tool_choice === "object" && body.tool_choice !== null
+        ? body.tool_choice as Record<string, unknown>
+        : undefined,
+      stopSequences: Array.isArray(body.stop_sequences) ? body.stop_sequences.map(String) : undefined,
+      thinking: typeof body.thinking === "object" && body.thinking !== null
+        ? body.thinking as Record<string, unknown>
+        : undefined,
+    });
+    return { messages: converted.messages, reasoningEffort: converted.reasoningEffort };
+  }
+
+  const rawMessages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
+  return { messages: requestMessagesToInternal(rawMessages), reasoningEffort: null };
+}
+
+function estimateInputTokens(messages: Message[], tools?: unknown): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += message.role.length + message.content.length + 8;
+    chars += (message.images?.length || 0) * 4500;
+    if (message.tool_calls?.length) chars += JSON.stringify(message.tool_calls).length;
+    if (message.reasoning_content) chars += message.reasoning_content.length;
+  }
+  if (tools != null) chars += JSON.stringify(tools).length;
+  return Math.max(1, Math.ceil(chars / 3));
+}
 
 function requestMessagesToInternal(
   rawMessages: Record<string, unknown>[],
@@ -579,3 +693,4 @@ export function main(): void {
     console.log(`codex-as-api listening on ${HOST}:${PORT}`);
   });
 }
+

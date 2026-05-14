@@ -16,6 +16,8 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Image support** — generation, inspection, and base64 image passthrough (including tool result images)
 - **Reasoning** — configurable reasoning effort with streaming thinking content
 - **Codex features** — `prompt_cache_key`, `previous_response_id`, subagent headers, remote compaction
+- **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model and context-window settings
+- **Token counting & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
 - **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
 
@@ -125,8 +127,19 @@ Environment variables (Python, Rust, and TypeScript):
 |----------|---------|-------------|
 | `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
-| `CODEX_AS_API_MODEL` | `gpt-5.5` | Model identifier passed to Codex backend |
+| `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
+| `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
+
+The server also reads root-level Codex CLI settings from `~/.codex/config.toml`:
+
+```toml
+model = "gpt-5.5"
+model_context_window = 200000
+model_auto_compact_token_limit = 160000
+```
+
+`CODEX_AS_API_MODEL` overrides the Codex config model. The context settings are exposed from `/health` and returned by Anthropic token-count responses.
 
 ### Supported Models
 
@@ -249,6 +262,25 @@ curl -N http://localhost:18080/v1/messages \
   }'
 ```
 
+### `POST /v1/messages/count_tokens`
+
+Anthropic-compatible token counting helper. It returns an estimated `input_tokens` value plus the configured context-window metadata.
+
+```bash
+curl http://localhost:18080/v1/messages/count_tokens \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: unused" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+### `POST /v1/messages/compact`
+
+Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content.
+
 ### `POST /v1/images/generations`
 
 Generate images via the Codex image generation tool.
@@ -278,7 +310,7 @@ curl http://localhost:18080/v1/inspect \
 
 ### `POST /v1/compact`
 
-Compact a conversation into a checkpoint for continuation (custom endpoint).
+Compact a conversation into a checkpoint for continuation (custom endpoint). `/v1/messages/compact` provides the Anthropic-compatible alias.
 
 ```bash
 curl http://localhost:18080/v1/compact \
@@ -294,11 +326,11 @@ curl http://localhost:18080/v1/compact \
 
 ### `GET /health`
 
-Health check. Returns auth availability and configured model.
+Health check. Returns auth availability, configured model, Codex config path, and context-window settings.
 
 ```bash
 curl http://localhost:18080/health
-# {"status":"ok","auth_available":true,"model":"gpt-5.5"}
+# {"status":"ok","auth_available":true,"model":"gpt-5.5","codex_config_path":"/Users/me/.codex/config.toml","context_window":200000,"auto_compact_token_limit":160000}
 ```
 
 ## Codex-Specific Features
@@ -463,29 +495,24 @@ curl -N http://localhost:18080/v1/chat/completions \
 
 ## Using with Claude Code
 
-The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Claude Code sends the model name from its environment variables directly to the server, and the server passes it through to the Codex backend. You must set `ANTHROPIC_MODEL` (and per-role overrides) to a model the Codex backend supports (e.g., `gpt-5.5`).
+The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Claude Code can send its normal Anthropic model names; responses preserve the client-supplied model name, while backend Codex requests use `CODEX_AS_API_MODEL` or the `model` from `~/.codex/config.toml`.
 
 ```bash
 # Minimal setup
 ANTHROPIC_BASE_URL=http://localhost:18080 \
 ANTHROPIC_API_KEY=unused \
-ANTHROPIC_MODEL=gpt-5.5 \
 claude
 ```
 
 ```bash
-# Full setup — override all roles so Claude Code never sends claude-* model names
+# Optional: force the backend Codex model for all Claude Code requests
+CODEX_AS_API_MODEL=gpt-5.5 codex-as-api
+
+# In another shell
 ANTHROPIC_BASE_URL=http://localhost:18080 \
 ANTHROPIC_API_KEY=unused \
-ANTHROPIC_MODEL=gpt-5.5 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.4 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.4-mini \
-CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.4 \
 claude
 ```
-
-These are all Claude Code environment variables — they control what model name Claude Code sends in requests. The server passes the model name through to the Codex backend as-is.
 
 ## Architecture
 
@@ -535,6 +562,37 @@ cargo test
 cd ts
 npm install
 npm test
+```
+
+
+## Release Notes
+
+### v0.3.0
+
+- Read Codex CLI config from `CODEX_HOME` / `~/.codex/config.toml` across Python, TypeScript, and Rust.
+- Use the configured Codex backend model while preserving Anthropic client model names in `/v1/messages` responses.
+- Expose `context_window` and `auto_compact_token_limit` through `/health` and `/v1/messages/count_tokens`.
+- Add Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`.
+- Map context-window failures to Anthropic-style `400 invalid_request_error` responses and stream error events.
+
+## Publishing
+
+### GitHub release
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+gh release create v0.3.0 --title v0.3.0 --notes-file RELEASES.md
+```
+
+### npm
+
+```bash
+cd ts
+npm install
+npm test
+npm run build
+npm publish --access public
 ```
 
 ## License

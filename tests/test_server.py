@@ -26,6 +26,9 @@ def test_health_returns_ok(client):
     assert body["status"] == "ok"
     assert "auth_available" in body
     assert "model" in body
+    assert "codex_config_path" in body
+    assert "context_window" in body
+    assert "auto_compact_token_limit" in body
 
 
 # ---------------------------------------------------------------------------
@@ -141,4 +144,60 @@ def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch)
     body = resp.json()
     assert "error" in body
     assert body["error"]["type"] == "chatgpt_oauth_error"
+    server_mod._provider = None
+
+
+def test_messages_count_tokens_returns_estimate(client):
+    resp = client.post("/v1/messages/count_tokens", json={
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": "You are helpful.",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["input_tokens"] > 0
+    assert body["context_window"] >= body["auto_compact_token_limit"]
+
+
+def test_messages_compact_accepts_anthropic_body(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    class DummyProvider:
+        def compact_messages(self, messages, *, model=None, reasoning_effort=None):
+            assert model == server_mod.MODEL
+            assert reasoning_effort == "high"
+            assert [m.content for m in messages] == ["sys", "hello"]
+            return "checkpoint"
+
+    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
+    resp = client.post("/v1/messages/compact", json={
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": "sys",
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert resp.status_code == 200
+    assert resp.json() == {"checkpoint": "checkpoint"}
+    server_mod._provider = None
+
+
+def test_anthropic_messages_uses_codex_model_for_provider_and_client_model_in_response(client, monkeypatch):
+    import codex_as_api.server as server_mod
+    from codex_as_api.messages import AssistantResponse
+
+    class DummyProvider:
+        def chat(self, messages, **kwargs):
+            assert kwargs["model"] == server_mod.MODEL
+            return AssistantResponse(content="ok")
+
+    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
+    resp = client.post("/v1/messages", json={
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "claude-sonnet-4-5"
     server_mod._provider = None

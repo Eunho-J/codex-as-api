@@ -16,13 +16,17 @@ use crate::anthropic_adapter::{
     internal_response_to_anthropic,
 };
 use crate::auth::{self, AuthError};
+use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::provider::{ChatGPTOAuthProvider, ProviderError};
+
+const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
 
 #[derive(Clone)]
 pub struct AppState {
     pub model: String,
     pub auth_path: Option<String>,
+    pub codex_config: CodexConfig,
     pub provider: Arc<ChatGPTOAuthProvider>,
 }
 
@@ -92,12 +96,6 @@ pub struct InspectRequest {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CompactRequest {
-    pub messages: Option<Vec<ChatMessage>>,
-    pub reasoning_effort: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: ErrorDetail,
@@ -124,6 +122,7 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
 fn map_error_status(e: &ProviderError) -> StatusCode {
     match e {
         ProviderError::Auth(AuthError::Missing(_)) => StatusCode::UNAUTHORIZED,
+        _ if e.to_string().to_lowercase().contains("context window") => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -135,6 +134,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/inspect", post(inspect))
         .route("/v1/compact", post(compact))
+        .route("/v1/messages/compact", post(compact))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/messages", post(anthropic_messages))
         .with_state(state)
 }
@@ -254,7 +255,10 @@ fn parse_tools(raw: &Option<Vec<Value>>) -> Option<Vec<ToolSchema>> {
             Some(o) => o,
             None => continue,
         };
-        let func = obj.get("function").and_then(|v| v.as_object()).unwrap_or(obj);
+        let func = obj
+            .get("function")
+            .and_then(|v| v.as_object())
+            .unwrap_or(obj);
         let name = func.get("name").and_then(|v| v.as_str());
         let desc = func
             .get("description")
@@ -284,12 +288,74 @@ fn max_tokens_from_request(req: &ChatCompletionRequest) -> Option<i64> {
     req.max_completion_tokens.or(req.max_tokens)
 }
 
+fn context_window(state: &AppState) -> i64 {
+    state
+        .codex_config
+        .model_context_window
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
+fn auto_compact_token_limit(state: &AppState) -> i64 {
+    state
+        .codex_config
+        .model_auto_compact_token_limit
+        .unwrap_or_else(|| (context_window(state) as f64 * 0.8) as i64)
+}
+
+fn estimate_input_tokens(messages: &[Message], tools: Option<&Value>) -> i64 {
+    let mut chars: usize = 0;
+    for message in messages {
+        chars += format!("{:?}", message.role).len() + message.content.len() + 8;
+        chars += message.images.len() * 4500;
+        if !message.tool_calls.is_empty() {
+            chars += serde_json::to_string(&message.tool_calls)
+                .unwrap_or_default()
+                .len();
+        }
+        if let Some(reasoning) = &message.reasoning_content {
+            chars += reasoning.len();
+        }
+    }
+    if let Some(tools_value) = tools {
+        chars += tools_value.to_string().len();
+    }
+    std::cmp::max(1, ((chars + 2) / 3) as i64)
+}
+
+fn messages_from_compact_body(body: &Value) -> (Vec<Message>, Option<String>) {
+    if body.get("system").is_some()
+        || body.get("thinking").is_some()
+        || body.get("tool_choice").is_some()
+        || body.get("stop_sequences").is_some()
+    {
+        let (messages, _tools, _tool_choice, _stop, reasoning_effort) =
+            anthropic_request_to_internal(body);
+        return (messages, reasoning_effort);
+    }
+
+    let raw_messages: Vec<ChatMessage> = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    (request_messages_to_internal(&raw_messages), None)
+}
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
     let auth_available = auth::is_auth_locally_available(state.auth_path.as_deref());
     Json(json!({
         "status": "ok",
         "auth_available": auth_available,
         "model": state.model,
+        "codex_home": state.codex_config.codex_home,
+        "codex_config_path": state.codex_config.config_path,
+        "context_window": context_window(&state),
+        "auto_compact_token_limit": auto_compact_token_limit(&state),
     }))
 }
 
@@ -303,15 +369,12 @@ async fn chat_completions(
     let stop = request.stop.as_ref().map(|s| s.to_vec());
     let max_tokens = max_tokens_from_request(&request);
 
-    let subagent = request
-        .subagent
-        .clone()
-        .or_else(|| {
-            headers
-                .get("x-openai-subagent")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+    let subagent = request.subagent.clone().or_else(|| {
+        headers
+            .get("x-openai-subagent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
 
     let memgen_header = headers
         .get("x-openai-memgen-request")
@@ -326,7 +389,10 @@ async fn chat_completions(
     if request.stream {
         let provider = state.provider.clone();
         let model_id = openai_model_id(&state.model);
-        let request_id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+        let request_id = format!(
+            "chatcmpl-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..24]
+        );
         let created = chrono::Utc::now().timestamp();
         let temperature = request.temperature;
         let reasoning_effort = request.reasoning_effort.clone();
@@ -385,7 +451,9 @@ async fn chat_completions(
                 "finish_reason": null,
             }],
         });
-        sse_events.push(Ok(Event::default().data(serde_json::to_string(&preamble).unwrap())));
+        sse_events.push(Ok(
+            Event::default().data(serde_json::to_string(&preamble).unwrap())
+        ));
 
         let mut usage_dict: Option<Value> = None;
 
@@ -405,7 +473,9 @@ async fn chat_completions(
                             "finish_reason": null,
                         }],
                     });
-                    sse_events.push(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ));
                 }
                 "reasoning_delta" => {
                     let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -420,7 +490,9 @@ async fn chat_completions(
                             "finish_reason": null,
                         }],
                     });
-                    sse_events.push(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ));
                 }
                 "reasoning_raw_delta" => {
                     let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -435,7 +507,9 @@ async fn chat_completions(
                             "finish_reason": null,
                         }],
                     });
-                    sse_events.push(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ));
                 }
                 "tool_call" => {
                     let tc = json!({
@@ -459,7 +533,9 @@ async fn chat_completions(
                             "finish_reason": null,
                         }],
                     });
-                    sse_events.push(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ));
                 }
                 "finish" => {
                     if let Some(usage) = event.get("usage") {
@@ -482,7 +558,9 @@ async fn chat_completions(
                             "finish_reason": finish_reason,
                         }],
                     });
-                    sse_events.push(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                    sse_events.push(Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap())
+                    ));
                 }
                 _ => {}
             }
@@ -501,7 +579,9 @@ async fn chat_completions(
                     "total_tokens": u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
                 },
             });
-            sse_events.push(Ok(Event::default().data(serde_json::to_string(&finish_chunk).unwrap())));
+            sse_events.push(Ok(
+                Event::default().data(serde_json::to_string(&finish_chunk).unwrap())
+            ));
         }
 
         sse_events.push(Ok(Event::default().data("[DONE]")));
@@ -683,15 +763,23 @@ async fn inspect(
 
 async fn compact(
     State(state): State<AppState>,
-    Json(request): Json<CompactRequest>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
     let provider = state.provider.clone();
-    let raw_messages = request.messages.unwrap_or_default();
-    let messages = request_messages_to_internal(&raw_messages);
-    let reasoning_effort = request.reasoning_effort.clone();
+    let (messages, converted_reasoning_effort) = messages_from_compact_body(&body);
+    let reasoning_effort = body
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or(converted_reasoning_effort);
+    let request_model = state.model.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.compact_messages(&messages, reasoning_effort.as_deref(), None)
+        provider.compact_messages(
+            &messages,
+            reasoning_effort.as_deref(),
+            Some(request_model.as_str()),
+        )
     })
     .await
     .unwrap();
@@ -704,15 +792,25 @@ async fn compact(
     Ok(Json(json!({"checkpoint": checkpoint})))
 }
 
+async fn anthropic_count_tokens(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let (messages, _tools, _tool_choice, _stop, _reasoning_effort) =
+        anthropic_request_to_internal(&body);
+    Ok(Json(json!({
+        "input_tokens": estimate_input_tokens(&messages, body.get("tools")),
+        "context_window": context_window(&state),
+        "auto_compact_token_limit": auto_compact_token_limit(&state),
+    })))
+}
+
 async fn anthropic_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, axum::response::Response> {
-    let request_id = format!(
-        "msg_{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..24]
-    );
+    let request_id = format!("msg_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
 
     let subagent = body
         .get("subagent")
@@ -743,16 +841,15 @@ async fn anthropic_messages(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let default_model = state.model.clone();
-    let request_model = body
+    let default_client_model = "claude-sonnet-4-5".to_string();
+    let client_model = body
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or(&default_model)
+        .unwrap_or(&default_client_model)
         .to_string();
+    let request_model = state.model.clone();
 
-    let max_tokens = body
-        .get("max_tokens")
-        .and_then(|v| v.as_i64());
+    let max_tokens = body.get("max_tokens").and_then(|v| v.as_i64());
 
     let tool_choice_val: Option<Value> = tool_choice;
 
@@ -803,7 +900,7 @@ async fn anthropic_messages(
             }
         };
 
-        let sse_strings = anthropic_stream_adapter(&events, &request_model, &request_id);
+        let sse_strings = anthropic_stream_adapter(&events, &client_model, &request_id);
 
         let sse_events: Vec<Result<Event, std::convert::Infallible>> = sse_strings
             .into_iter()
@@ -872,7 +969,7 @@ async fn anthropic_messages(
             }
         };
 
-        let out = internal_response_to_anthropic(&response, &request_model, &request_id);
+        let out = internal_response_to_anthropic(&response, &client_model, &request_id);
         Ok(Json(out).into_response())
     }
 }

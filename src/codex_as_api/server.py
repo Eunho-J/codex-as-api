@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .auth import ChatGPTOAuthError, ChatGPTOAuthMissingError, is_auth_locally_available
+from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
 from .provider import ChatGPTOAuthProvider
 
@@ -26,8 +27,10 @@ def _env_str(name: str, default: str) -> str:
 
 HOST = _env_str("CODEX_AS_API_HOST", "127.0.0.1")
 PORT = _env_int("CODEX_AS_API_PORT", 18080)
-MODEL = _env_str("CODEX_AS_API_MODEL", "gpt-5.5")
+CODEX_CONFIG = load_codex_config()
+MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model or "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
+DEFAULT_CONTEXT_WINDOW = 200_000
 
 _provider: ChatGPTOAuthProvider | None = None
 
@@ -42,6 +45,24 @@ def _get_provider() -> ChatGPTOAuthProvider:
     return _provider
 
 
+def _is_context_window_error(exc: BaseException | str) -> bool:
+    return "context window" in str(exc).lower()
+
+
+def _error_status(exc: BaseException) -> int:
+    if isinstance(exc, ChatGPTOAuthMissingError):
+        return 401
+    if _is_context_window_error(exc):
+        return 400
+    return 500
+
+
+def _error_type(exc: BaseException) -> str:
+    if isinstance(exc, ChatGPTOAuthError):
+        return "chatgpt_oauth_error"
+    return "server_error"
+
+
 # FastAPI is an optional dependency; fail gracefully if missing.
 try:
     from fastapi import FastAPI, Request
@@ -51,7 +72,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.1.0",
+        version="0.3.0",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -199,6 +220,43 @@ try:
             return req.max_completion_tokens
         return req.max_tokens
 
+    def _context_window() -> int:
+        return CODEX_CONFIG.model_context_window or DEFAULT_CONTEXT_WINDOW
+
+    def _auto_compact_token_limit() -> int:
+        return CODEX_CONFIG.model_auto_compact_token_limit or int(_context_window() * 0.8)
+
+    def _messages_from_compact_body(body: dict[str, Any]) -> tuple[list[Message], str | None]:
+        if any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
+            messages, _tools, _tool_choice, _stop, reasoning_effort = anthropic_request_to_internal(
+                model=str(body.get("model") or MODEL),
+                messages=body.get("messages") if isinstance(body.get("messages"), list) else [],
+                system=body.get("system"),
+                max_tokens=body.get("max_tokens") if isinstance(body.get("max_tokens"), int) else 4096,
+                tools=body.get("tools") if isinstance(body.get("tools"), list) else None,
+                tool_choice=body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None,
+                stop_sequences=body.get("stop_sequences") if isinstance(body.get("stop_sequences"), list) else None,
+                thinking=body.get("thinking") if isinstance(body.get("thinking"), dict) else None,
+            )
+            return messages, reasoning_effort
+
+        raw_messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        messages = _request_messages_to_internal([ChatMessage.model_validate(m) for m in raw_messages])
+        return messages, None
+
+    def _estimate_input_tokens(messages: list[Message], tools: Any = None) -> int:
+        chars = 0
+        for message in messages:
+            chars += len(message.role.value) + len(message.content) + 8
+            chars += len(message.images) * 4500
+            if message.tool_calls:
+                chars += len(json.dumps([tc.__dict__ for tc in message.tool_calls], default=str))
+            if message.reasoning_content:
+                chars += len(message.reasoning_content)
+        if tools is not None:
+            chars += len(json.dumps(tools, default=str))
+        return max(1, (chars + 2) // 3)
+
     # ------------------------------------------------------------------
     # Endpoints
     # ------------------------------------------------------------------
@@ -209,6 +267,9 @@ try:
             "status": "ok",
             "auth_available": is_auth_locally_available(AUTH_PATH),
             "model": MODEL,
+            "codex_config_path": CODEX_CONFIG.config_path,
+            "context_window": _context_window(),
+            "auto_compact_token_limit": _auto_compact_token_limit(),
         }
 
     @app.post("/v1/chat/completions", response_model=None)
@@ -466,6 +527,28 @@ try:
         format_anthropic_error,
     )
 
+    @app.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
+        body = await http_request.json()
+        try:
+            messages, _tools, _tool_choice, _stop, _reasoning_effort = anthropic_request_to_internal(
+                model=body.get("model", MODEL),
+                messages=body.get("messages", []),
+                system=body.get("system"),
+                max_tokens=body.get("max_tokens", 4096),
+                tools=body.get("tools"),
+                tool_choice=body.get("tool_choice"),
+                stop_sequences=body.get("stop_sequences"),
+                thinking=body.get("thinking"),
+            )
+        except Exception as exc:
+            return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
+        return JSONResponse(content={
+            "input_tokens": _estimate_input_tokens(messages, body.get("tools")),
+            "context_window": _context_window(),
+            "auto_compact_token_limit": _auto_compact_token_limit(),
+        })
+
     @app.post("/v1/messages", response_model=None)
     async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingResponse:
         provider = _get_provider()
@@ -486,7 +569,8 @@ try:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
 
         stream = body.get("stream", False)
-        request_model = body.get("model") or MODEL
+        client_model = body.get("model") or "claude-sonnet-4-5"
+        request_model = MODEL
 
         if stream:
             async def _stream() -> AsyncIterator[str]:
@@ -500,7 +584,7 @@ try:
                         reasoning_effort=reasoning_effort,
                         stop=stop,
                     ),
-                    model=request_model,
+                    model=client_model,
                     request_id=request_id,
                 ):
                     yield sse_chunk
@@ -508,7 +592,7 @@ try:
             try:
                 return StreamingResponse(_stream(), media_type="text/event-stream")
             except ChatGPTOAuthError as exc:
-                status = 401 if isinstance(exc, ChatGPTOAuthMissingError) else 500
+                status = _error_status(exc)
                 return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
 
         # Non-streaming
@@ -522,11 +606,11 @@ try:
                 stop=stop,
             )
         except ChatGPTOAuthError as exc:
-            status = 401 if isinstance(exc, ChatGPTOAuthMissingError) else 500
+            status = _error_status(exc)
             return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
 
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
-        result = internal_response_to_anthropic(response, request_model, request_id)
+        result = internal_response_to_anthropic(response, client_model, request_id)
         return JSONResponse(content=result)
 
     # ------------------------------------------------------------------
@@ -548,17 +632,21 @@ try:
         return JSONResponse(content={"content": result})
 
     @app.post("/v1/compact")
+    @app.post("/v1/messages/compact")
     async def compact(request: Request) -> JSONResponse:
         """Compact a conversation into a checkpoint for continuation.
 
         Body: {"messages": [{"role": "system|user|assistant|tool", "content": str, ...}], "reasoning_effort": str?}
+        Also accepts Anthropic Messages fields at /v1/messages/compact.
         """
         provider = _get_provider()
         body = await request.json()
-        raw_messages = body.get("messages") or []
-        messages = _request_messages_to_internal([ChatMessage.model_validate(m) for m in raw_messages])
-        reasoning_effort = body.get("reasoning_effort")
-        checkpoint = provider.compact_messages(messages, reasoning_effort=reasoning_effort)
+        messages, reasoning_effort = _messages_from_compact_body(body)
+        checkpoint = provider.compact_messages(
+            messages,
+            model=MODEL,
+            reasoning_effort=body.get("reasoning_effort") or reasoning_effort,
+        )
         return JSONResponse(content={"checkpoint": checkpoint})
 
     # ------------------------------------------------------------------
