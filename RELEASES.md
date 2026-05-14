@@ -21,3 +21,8 @@
 - Python: `PYTHONPATH=src pytest -q`
 - Rust: `cargo test`
 - TypeScript: `npm test && npm run build`
+
+### Publishing
+- GitHub release: `gh release create v0.3.0 --title v0.3.0 --notes-file RELEASES.md`
+- npmjs: run `npm publish --access public` from `ts/` after tests and build.
+- GitHub Packages: publish the same TypeScript build under the scoped name `@eunho-j/codex-as-api` to `https://npm.pkg.github.com` with a token that has `write:packages`.

@@ -595,6 +595,28 @@ npm run build
 npm publish --access public
 ```
 
+### GitHub Packages (npm registry)
+
+GitHub Packages requires an npm scoped package name. The public npm package remains `codex-as-api`; publish to GitHub Packages by temporarily packing it under the GitHub scope:
+
+```bash
+cd ts
+npm install
+npm test
+npm run build
+
+# Authenticate with a token that has write:packages.
+npm login --registry=https://npm.pkg.github.com --scope=@eunho-j
+
+# Publish the same build as @eunho-j/codex-as-api to GitHub Packages.
+ORIGINAL_NAME=$(npm pkg get name | tr -d '"')
+npm pkg set name=@eunho-j/codex-as-api
+npm publish --registry=https://npm.pkg.github.com --access public
+npm pkg set name="$ORIGINAL_NAME"
+```
+
+For CI, set `NODE_AUTH_TOKEN=${GITHUB_TOKEN}` or a PAT with `write:packages` and run the same scoped publish step after the GitHub release is created.
+
 ## License
 
 Apache License 2.0 — derived from [OpenAI Codex CLI](https://github.com/openai/codex) (Apache-2.0, Copyright 2025 OpenAI).
