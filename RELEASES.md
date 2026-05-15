@@ -4,7 +4,8 @@
 
 ### Claude Code compatibility fix
 - Restored immediate Anthropic streaming so clients receive `message_start` before the backend response completes.
-- `/v1/messages/count_tokens` now falls back to a local estimate when the Codex backend rejects zero-token counting with `Unsupported parameter: max_output_tokens`.
+- `/v1/messages/count_tokens` now returns a conservative local estimate because Codex OAuth has no Anthropic-equivalent count-only endpoint.
+- Token estimates use UTF-8 byte length as a conservative upper bound for GPT/Codex BPE text tokens, plus overhead for roles, message boundaries, tools, raw request metadata, and images.
 - Keeps real final streaming usage in `message_delta` while avoiding stream buffering.
 
 ### Validation
@@ -15,8 +16,8 @@
 
 ## v0.3.1
 
-### Real Anthropic token accounting
-- `/v1/messages/count_tokens` now asks the Codex backend for real input-token usage with `max_output_tokens: 0` instead of returning a local estimate.
+### Anthropic token accounting attempt
+- `/v1/messages/count_tokens` asked the Codex backend for real input-token usage with `max_output_tokens: 0`; this is superseded by v0.3.2 because Codex OAuth rejects count-only requests.
 - Token counting forwards Anthropic-converted tools, tool choice, stop sequences, and thinking/reasoning settings across Python, TypeScript, and Rust.
 - Provider requests now pass `max_output_tokens` through to Codex where requested.
 

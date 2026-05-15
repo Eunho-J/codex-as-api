@@ -17,7 +17,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Reasoning** — configurable reasoning effort with streaming thinking content
 - **Codex features** — `prompt_cache_key`, `previous_response_id`, subagent headers, remote compaction
 - **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model and context-window settings
-- **Real token counting & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
+- **Token estimate & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
 - **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
 
@@ -264,7 +264,7 @@ curl -N http://localhost:18080/v1/messages \
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. It asks the Codex backend for real `input_tokens` usage when available, forwarding converted tools, tool choice, stop sequences, and thinking/reasoning settings. If the backend rejects zero-token counting, it falls back to a local estimate and still returns the configured context-window metadata.
+Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route returns a conservative local estimate plus the configured context-window metadata. The estimate uses UTF-8 byte length as an upper bound for GPT/Codex BPE text tokens, then adds protocol overhead for roles, message boundaries, tools, raw request metadata, and images.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -570,12 +570,12 @@ npm test
 ### v0.3.2
 
 - Restore immediate Anthropic streaming so Claude Code receives events without waiting for the backend response to finish.
-- Fall back to local token estimates when the backend rejects zero-token count requests.
+- Use conservative local token estimates for `/v1/messages/count_tokens`; Codex OAuth has no count-only backend endpoint.
 - Keep real final streaming usage metadata in `message_delta`.
 
 ### v0.3.1
 
-- Use real backend token counting for `/v1/messages/count_tokens` with `max_output_tokens: 0` instead of local estimates.
+- Attempted real backend token counting for `/v1/messages/count_tokens` with `max_output_tokens: 0`; this is superseded by v0.3.2 because Codex OAuth rejects count-only requests.
 - Forward converted Anthropic tools, tool choice, stop sequences, and thinking/reasoning settings during token-count requests.
 - Propagate cumulative Anthropic streaming usage, including cache accounting, server tool use, and service tier metadata when available.
 - Pass `max_output_tokens` through provider requests across Python, TypeScript, and Rust.

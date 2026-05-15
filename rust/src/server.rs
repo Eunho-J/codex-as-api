@@ -302,24 +302,32 @@ fn auto_compact_token_limit(state: &AppState) -> i64 {
         .unwrap_or_else(|| (context_window(state) as f64 * 0.8) as i64)
 }
 
-fn estimate_input_tokens(messages: &[Message], tools: Option<&Value>) -> i64 {
-    let mut chars: usize = 0;
+fn json_byte_len(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .as_bytes()
+        .len()
+}
+
+fn estimate_input_tokens(messages: &[Message], raw_payload: Option<&Value>) -> i64 {
+    let mut total: usize = 32;
     for message in messages {
-        chars += format!("{:?}", message.role).len() + message.content.len() + 8;
-        chars += message.images.len() * 4500;
+        total += format!("{:?}", message.role).len() + message.content.as_bytes().len() + 12;
+        total += message.images.len() * 8500;
         if !message.tool_calls.is_empty() {
-            chars += serde_json::to_string(&message.tool_calls)
+            total += serde_json::to_string(&message.tool_calls)
                 .unwrap_or_default()
+                .as_bytes()
                 .len();
         }
         if let Some(reasoning) = &message.reasoning_content {
-            chars += reasoning.len();
+            total += reasoning.as_bytes().len();
         }
     }
-    if let Some(tools_value) = tools {
-        chars += tools_value.to_string().len();
+    if let Some(payload) = raw_payload {
+        total += json_byte_len(payload);
     }
-    std::cmp::max(1, ((chars + 2) / 3) as i64)
+    std::cmp::max(1, total as i64)
 }
 
 fn messages_from_compact_body(body: &Value) -> (Vec<Message>, Option<String>) {
@@ -796,25 +804,9 @@ async fn anthropic_count_tokens(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let (messages, tools, tool_choice, stop, reasoning_effort) =
+    let (messages, _tools, _tool_choice, _stop, _reasoning_effort) =
         anthropic_request_to_internal(&body);
-    let provider = state.provider.clone();
-    let request_model = state.model.clone();
-    let messages_for_count = messages.clone();
-    let tools_for_count = tools.clone();
-    let input_tokens = task::spawn_blocking(move || {
-        provider.count_tokens(
-            &messages_for_count,
-            tools_for_count.as_deref(),
-            tool_choice.as_ref(),
-            stop.as_deref(),
-            reasoning_effort.as_deref(),
-            Some(request_model.as_str()),
-        )
-    })
-    .await
-    .unwrap()
-    .unwrap_or_else(|_| estimate_input_tokens(&messages, body.get("tools")));
+    let input_tokens = estimate_input_tokens(&messages, Some(&body));
     Ok(Json(json!({
         "input_tokens": input_tokens,
         "context_window": context_window(&state),
@@ -988,5 +980,35 @@ async fn anthropic_messages(
 
         let out = internal_response_to_anthropic(&response, &client_model, &request_id);
         Ok(Json(out).into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::{Message, MessageRole};
+    use serde_json::json;
+
+    #[test]
+    fn estimate_input_tokens_counts_utf8_bytes_conservatively() {
+        let msg = Message::new(
+            MessageRole::User,
+            "hello 안녕 👋".to_string(),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        let estimate = estimate_input_tokens(&[msg], None);
+        assert!(estimate >= "hello 안녕 👋".as_bytes().len() as i64);
+    }
+
+    #[test]
+    fn estimate_input_tokens_includes_raw_payload_tools() {
+        let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
+        let tools = json!([{"name":"lookup","description":"Search docs","input_schema":{"type":"object"}}]);
+        let payload = json!({"messages":[{"role":"user","content":"hello"}],"tools": tools});
+        let estimate = estimate_input_tokens(&[msg], Some(&payload));
+        assert!(estimate >= serde_json::to_string(&tools).unwrap().as_bytes().len() as i64);
     }
 }

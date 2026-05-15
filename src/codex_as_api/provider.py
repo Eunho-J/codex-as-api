@@ -342,34 +342,6 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthError("ChatGPT OAuth response returned no output items")
         return output_items
 
-    def count_tokens(
-        self,
-        messages: Sequence[Message],
-        *,
-        model: str | None = None,
-        tools: Sequence[ToolSchema] | None = None,
-        tool_choice: str | dict | None = None,
-        stop: Sequence[str] | None = None,
-        reasoning_effort: str | None = None,
-    ) -> int:
-        usage: dict[str, Any] | None = None
-        for event in self.chat_stream(
-            messages,
-            model=model,
-            tools=tools,
-            tool_choice=tool_choice,
-            reasoning_effort=reasoning_effort,
-            max_tokens=0,
-            stop=stop,
-        ):
-            if event.get("type") == "finish" and isinstance(event.get("usage"), dict):
-                usage = event["usage"]
-        if usage is None:
-            raise ChatGPTOAuthError("remote count_tokens response missing usage")
-        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-        if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
-            raise ChatGPTOAuthError("remote count_tokens response missing input token count")
-        return input_tokens
 
     def compact_messages(
         self,

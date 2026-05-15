@@ -147,46 +147,44 @@ def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch)
     server_mod._provider = None
 
 
-def test_messages_count_tokens_returns_real_provider_value(client, monkeypatch):
+def test_messages_count_tokens_returns_conservative_estimate_without_provider_call(client, monkeypatch):
     import codex_as_api.server as server_mod
 
     class DummyProvider:
-        def count_tokens(self, messages, *, model=None, tools=None, tool_choice=None, stop=None, reasoning_effort=None):
-            assert model == server_mod.MODEL
-            assert [m.content for m in messages] == ["You are helpful.", "hello"]
-            return 42
+        def count_tokens(self, *args, **kwargs):
+            raise AssertionError("count_tokens must not call the Codex backend")
 
     monkeypatch.setattr(server_mod, "_provider", DummyProvider())
+    tools = [{
+        "name": "lookup",
+        "description": "Search docs",
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }]
     resp = client.post("/v1/messages/count_tokens", json={
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
         "system": "You are helpful.",
+        "tools": tools,
         "messages": [{"role": "user", "content": "hello"}],
     })
     assert resp.status_code == 200
     body = resp.json()
-    assert body["input_tokens"] == 42
+    serialized_floor = len(json.dumps(tools).encode("utf-8")) + len("You are helpful.".encode("utf-8")) + len("hello".encode("utf-8"))
+    assert body["input_tokens"] >= serialized_floor
     assert body["context_window"] >= body["auto_compact_token_limit"]
     server_mod._provider = None
 
 
-def test_messages_count_tokens_falls_back_to_estimate_when_provider_rejects(client, monkeypatch):
-    import codex_as_api.server as server_mod
-
-    class DummyProvider:
-        def count_tokens(self, messages, **kwargs):
-            raise RuntimeError("Unsupported parameter: max_output_tokens")
-
-    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
-    resp = client.post("/v1/messages/count_tokens", json={
+def test_messages_count_tokens_counts_utf8_bytes_conservatively(client):
+    payload = {
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
-        "messages": [{"role": "user", "content": "hello"}],
-    })
+        "messages": [{"role": "user", "content": "hello 안녕 👋"}],
+    }
+    resp = client.post("/v1/messages/count_tokens", json=payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["input_tokens"] > 0
-    server_mod._provider = None
+    assert body["input_tokens"] >= len("hello 안녕 👋".encode("utf-8"))
 
 
 def test_messages_compact_accepts_anthropic_body(client, monkeypatch):

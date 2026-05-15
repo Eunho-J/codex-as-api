@@ -113,14 +113,17 @@ describe("server error handling", () => {
 });
 
 describe("Anthropic compatibility helper routes", () => {
-  it("returns real provider count_tokens with context metadata", async () => {
+  it("returns conservative count_tokens estimate without calling provider", async () => {
     const provider = {
-      async countTokens(messages: Array<{ content: string }>, opts: { model?: string }) {
-        assert.equal(opts.model, "gpt-5.5");
-        assert.deepEqual(messages.map((m) => m.content), ["You are helpful.", "hello"]);
-        return 42;
+      async countTokens() {
+        throw new Error("count_tokens must not call the Codex backend");
       },
     };
+    const tools = [{
+      name: "lookup",
+      description: "Search docs",
+      input_schema: { type: "object", properties: { query: { type: "string" } } },
+    }];
 
     await withServer(provider, async (baseUrl) => {
       const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
@@ -130,6 +133,7 @@ describe("Anthropic compatibility helper routes", () => {
           model: "claude-sonnet-4-5",
           max_tokens: 1024,
           system: "You are helpful.",
+          tools,
           messages: [{ role: "user", content: "hello" }],
         }),
       });
@@ -140,31 +144,26 @@ describe("Anthropic compatibility helper routes", () => {
         context_window: number;
         auto_compact_token_limit: number;
       };
-      assert.equal(body.input_tokens, 42);
+      const floor = Buffer.byteLength(JSON.stringify(tools)) + Buffer.byteLength("You are helpful.") + Buffer.byteLength("hello");
+      assert.ok(body.input_tokens >= floor);
       assert.ok(body.context_window >= body.auto_compact_token_limit);
     });
   });
 
-  it("falls back to an estimate when provider countTokens rejects", async () => {
-    const provider = {
-      async countTokens() {
-        throw new Error("Unsupported parameter: max_output_tokens");
-      },
-    };
-
-    await withServer(provider, async (baseUrl) => {
+  it("counts UTF-8 bytes conservatively", async () => {
+    await withServer({}, async (baseUrl) => {
       const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
           max_tokens: 1024,
-          messages: [{ role: "user", content: "hello" }],
+          messages: [{ role: "user", content: "hello 안녕 👋" }],
         }),
       });
       assert.equal(res.status, 200);
       const body = await res.json() as { input_tokens: number };
-      assert.ok(body.input_tokens > 0);
+      assert.ok(body.input_tokens >= Buffer.byteLength("hello 안녕 👋"));
     });
   });
 

@@ -420,7 +420,7 @@ export function createApp(opts?: {
   app.post("/v1/messages/count_tokens", async (req: Request, res: Response) => {
     try {
       const body = req.body;
-      const { messages, tools, toolChoice, stop, reasoningEffort } = anthropicRequestToInternal({
+      const { messages } = anthropicRequestToInternal({
         model: body.model,
         messages: body.messages || [],
         system: body.system,
@@ -430,32 +430,7 @@ export function createApp(opts?: {
         stopSequences: body.stop_sequences,
         thinking: body.thinking,
       });
-      const countTokens = (provider as { countTokens?: (
-        messages: Message[],
-        opts?: {
-          model?: string;
-          tools?: ToolSchema[];
-          toolChoice?: string | Record<string, unknown>;
-          stop?: string | string[];
-          reasoningEffort?: string;
-        },
-      ) => Promise<number> }).countTokens;
-      let inputTokens: number;
-      if (typeof countTokens === "function") {
-        try {
-          inputTokens = await countTokens.call(provider, messages, {
-            model: MODEL,
-            tools: tools ?? undefined,
-            toolChoice: toolChoice ?? undefined,
-            stop: stop ?? undefined,
-            reasoningEffort: reasoningEffort ?? undefined,
-          });
-        } catch {
-          inputTokens = estimateInputTokens(messages, body.tools);
-        }
-      } else {
-        inputTokens = estimateInputTokens(messages, body.tools);
-      }
+      const inputTokens = estimateInputTokens(messages, body);
       res.json({
         input_tokens: inputTokens,
         context_window: getContextWindow(),
@@ -571,16 +546,24 @@ function messagesFromCompactBody(body: Record<string, unknown>): {
 }
 
 
-function estimateInputTokens(messages: Message[], tools?: unknown): number {
-  let chars = 0;
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+}
+
+function estimateInputTokens(messages: Message[], rawPayload?: unknown): number {
+  let total = 32;
   for (const message of messages) {
-    chars += message.role.length + message.content.length + 8;
-    chars += (message.images?.length || 0) * 4500;
-    if (message.tool_calls?.length) chars += JSON.stringify(message.tool_calls).length;
-    if (message.reasoning_content) chars += message.reasoning_content.length;
+    total += 12 + byteLength(message.role) + byteLength(message.content);
+    total += (message.images?.length || 0) * 8500;
+    if (message.tool_calls?.length) total += jsonByteLength(message.tool_calls);
+    if (message.reasoning_content) total += byteLength(message.reasoning_content);
   }
-  if (tools != null) chars += JSON.stringify(tools).length;
-  return Math.max(1, Math.ceil(chars / 3));
+  if (rawPayload != null) total += jsonByteLength(rawPayload);
+  return Math.max(1, total);
 }
 
 

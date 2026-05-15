@@ -245,18 +245,33 @@ try:
         return messages, None
 
 
-    def _estimate_input_tokens(messages: list[Message], tools: Any = None) -> int:
-        chars = 0
+    def _token_bytes(value: str) -> int:
+        return len(value.encode("utf-8"))
+
+
+    def _json_bytes(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8"))
+
+
+    def _estimate_input_tokens(messages: list[Message], raw_payload: Any = None) -> int:
+        """Conservative count_tokens estimate for Codex/GPT byte-pair tokenizers.
+
+        GPT-5-class OpenAI models use the o200k_base BPE family. Without a
+        count-only Codex OAuth endpoint, use UTF-8 bytes as an upper bound for
+        text tokens, then add protocol overhead for roles, message boundaries,
+        tools, and images.
+        """
+        total = 32
         for message in messages:
-            chars += len(message.role.value) + len(message.content) + 8
-            chars += len(message.images) * 4500
+            total += 12 + _token_bytes(message.role.value) + _token_bytes(message.content)
+            total += len(message.images) * 8500
             if message.tool_calls:
-                chars += len(json.dumps([tc.__dict__ for tc in message.tool_calls], default=str))
+                total += _json_bytes([tc.__dict__ for tc in message.tool_calls])
             if message.reasoning_content:
-                chars += len(message.reasoning_content)
-        if tools is not None:
-            chars += len(json.dumps(tools, default=str))
-        return max(1, (chars + 2) // 3)
+                total += _token_bytes(message.reasoning_content)
+        if raw_payload is not None:
+            total += _json_bytes(raw_payload)
+        return max(1, total)
 
 
     # ------------------------------------------------------------------
@@ -531,12 +546,11 @@ try:
 
     @app.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
-        provider = _get_provider()
         body = await http_request.json()
         try:
-            messages, tools, tool_choice, stop, reasoning_effort = anthropic_request_to_internal(
-                model=body.get("model", MODEL),
-                messages=body.get("messages", []),
+            messages, _tools, _tool_choice, _stop, _reasoning_effort = anthropic_request_to_internal(
+                model=body.get("model"),
+                messages=body.get("messages") or [],
                 system=body.get("system"),
                 max_tokens=body.get("max_tokens", 4096),
                 tools=body.get("tools"),
@@ -544,17 +558,7 @@ try:
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
             )
-            try:
-                input_tokens = provider.count_tokens(
-                    messages,
-                    model=MODEL,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    stop=stop,
-                    reasoning_effort=reasoning_effort,
-                )
-            except Exception:
-                input_tokens = _estimate_input_tokens(messages, body.get("tools"))
+            input_tokens = _estimate_input_tokens(messages, body)
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
         return JSONResponse(content={
