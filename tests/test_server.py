@@ -170,6 +170,25 @@ def test_messages_count_tokens_returns_real_provider_value(client, monkeypatch):
     server_mod._provider = None
 
 
+def test_messages_count_tokens_falls_back_to_estimate_when_provider_rejects(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    class DummyProvider:
+        def count_tokens(self, messages, **kwargs):
+            raise RuntimeError("Unsupported parameter: max_output_tokens")
+
+    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
+    resp = client.post("/v1/messages/count_tokens", json={
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["input_tokens"] > 0
+    server_mod._provider = None
+
+
 def test_messages_compact_accepts_anthropic_body(client, monkeypatch):
     import codex_as_api.server as server_mod
 

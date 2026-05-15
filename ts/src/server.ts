@@ -440,16 +440,22 @@ export function createApp(opts?: {
           reasoningEffort?: string;
         },
       ) => Promise<number> }).countTokens;
-      if (typeof countTokens !== "function") {
-        throw new ChatGPTOAuthError("provider does not support real token counting");
+      let inputTokens: number;
+      if (typeof countTokens === "function") {
+        try {
+          inputTokens = await countTokens.call(provider, messages, {
+            model: MODEL,
+            tools: tools ?? undefined,
+            toolChoice: toolChoice ?? undefined,
+            stop: stop ?? undefined,
+            reasoningEffort: reasoningEffort ?? undefined,
+          });
+        } catch {
+          inputTokens = estimateInputTokens(messages, body.tools);
+        }
+      } else {
+        inputTokens = estimateInputTokens(messages, body.tools);
       }
-      const inputTokens = await countTokens.call(provider, messages, {
-        model: MODEL,
-        tools: tools ?? undefined,
-        toolChoice: toolChoice ?? undefined,
-        stop: stop ?? undefined,
-        reasoningEffort: reasoningEffort ?? undefined,
-      });
       res.json({
         input_tokens: inputTokens,
         context_window: getContextWindow(),
@@ -562,6 +568,19 @@ function messagesFromCompactBody(body: Record<string, unknown>): {
 
   const rawMessages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
   return { messages: requestMessagesToInternal(rawMessages), reasoningEffort: null };
+}
+
+
+function estimateInputTokens(messages: Message[], tools?: unknown): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += message.role.length + message.content.length + 8;
+    chars += (message.images?.length || 0) * 4500;
+    if (message.tool_calls?.length) chars += JSON.stringify(message.tool_calls).length;
+    if (message.reasoning_content) chars += message.reasoning_content.length;
+  }
+  if (tools != null) chars += JSON.stringify(tools).length;
+  return Math.max(1, Math.ceil(chars / 3));
 }
 
 

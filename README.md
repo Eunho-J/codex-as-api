@@ -264,7 +264,7 @@ curl -N http://localhost:18080/v1/messages \
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. It asks the Codex backend for real `input_tokens` usage with `max_output_tokens: 0`, forwarding converted tools, tool choice, stop sequences, and thinking/reasoning settings, then returns the configured context-window metadata.
+Anthropic-compatible token counting helper. It asks the Codex backend for real `input_tokens` usage when available, forwarding converted tools, tool choice, stop sequences, and thinking/reasoning settings. If the backend rejects zero-token counting, it falls back to a local estimate and still returns the configured context-window metadata.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -566,6 +566,12 @@ npm test
 
 
 ## Release Notes
+
+### v0.3.2
+
+- Restore immediate Anthropic streaming so Claude Code receives events without waiting for the backend response to finish.
+- Fall back to local token estimates when the backend rejects zero-token count requests.
+- Keep real final streaming usage metadata in `message_delta`.
 
 ### v0.3.1
 

@@ -304,21 +304,10 @@ export async function* anthropicStreamAdapter(
   model: string,
   requestId: string,
 ): AsyncGenerator<string> {
-  const events: Record<string, unknown>[] = [];
-  try {
-    for await (const event of eventIterator) {
-      events.push(event);
-    }
-  } catch (err) {
-    yield messageStartSse(model, requestId, { input_tokens: 0, output_tokens: 0 });
-    for (const chunk of renderAnthropicStreamEvents(events)) yield chunk;
-    throw err;
+  yield messageStartSse(model, requestId, { input_tokens: 0, output_tokens: 0 });
+  for await (const chunk of renderAnthropicStreamEvents(eventIterator)) {
+    yield chunk;
   }
-
-  const usage = usageFromProviderEvent(events.findLast((e) => e.type === "finish")?.usage);
-  const startUsage = { ...usage, output_tokens: 1 };
-  yield messageStartSse(model, requestId, startUsage);
-  for (const chunk of renderAnthropicStreamEvents(events)) yield chunk;
 }
 
 function messageStartSse(
@@ -375,14 +364,14 @@ function numeric(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function* renderAnthropicStreamEvents(
-  events: Record<string, unknown>[],
-): Generator<string> {
+async function* renderAnthropicStreamEvents(
+  events: AsyncIterable<Record<string, unknown>>,
+): AsyncGenerator<string> {
   let blockIndex = 0;
   let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let hasAnyContent = false;
 
-  for (const event of events) {
+  for await (const event of events) {
     const typ = event.type;
 
     if (typ === "reasoning_delta" || typ === "reasoning_raw_delta") {

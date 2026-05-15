@@ -72,7 +72,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.3.1",
+        version="0.3.2",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -243,6 +243,20 @@ try:
         raw_messages = body.get("messages") if isinstance(body.get("messages"), list) else []
         messages = _request_messages_to_internal([ChatMessage.model_validate(m) for m in raw_messages])
         return messages, None
+
+
+    def _estimate_input_tokens(messages: list[Message], tools: Any = None) -> int:
+        chars = 0
+        for message in messages:
+            chars += len(message.role.value) + len(message.content) + 8
+            chars += len(message.images) * 4500
+            if message.tool_calls:
+                chars += len(json.dumps([tc.__dict__ for tc in message.tool_calls], default=str))
+            if message.reasoning_content:
+                chars += len(message.reasoning_content)
+        if tools is not None:
+            chars += len(json.dumps(tools, default=str))
+        return max(1, (chars + 2) // 3)
 
 
     # ------------------------------------------------------------------
@@ -530,14 +544,17 @@ try:
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
             )
-            input_tokens = provider.count_tokens(
-                messages,
-                model=MODEL,
-                tools=tools,
-                tool_choice=tool_choice,
-                stop=stop,
-                reasoning_effort=reasoning_effort,
-            )
+            try:
+                input_tokens = provider.count_tokens(
+                    messages,
+                    model=MODEL,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    stop=stop,
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception:
+                input_tokens = _estimate_input_tokens(messages, body.get("tools"))
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
         return JSONResponse(content={

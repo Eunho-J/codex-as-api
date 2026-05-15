@@ -1,5 +1,18 @@
 # Release Notes
 
+## v0.3.2
+
+### Claude Code compatibility fix
+- Restored immediate Anthropic streaming so clients receive `message_start` before the backend response completes.
+- `/v1/messages/count_tokens` now falls back to a local estimate when the Codex backend rejects zero-token counting with `Unsupported parameter: max_output_tokens`.
+- Keeps real final streaming usage in `message_delta` while avoiding stream buffering.
+
+### Validation
+- Python: `PYTHONPATH=src pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build`
+- Live smoke: `/v1/messages/count_tokens` and streaming `/v1/messages` against local server
+
 ## v0.3.1
 
 ### Real Anthropic token accounting

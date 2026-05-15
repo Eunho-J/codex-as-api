@@ -288,12 +288,8 @@ def anthropic_stream_adapter(
     request_id: str,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
-    events: list[dict[str, Any]] = []
-    events.extend(event_stream)
-    usage = _anthropic_usage_from_provider(events[-1].get("usage") if events and events[-1].get("type") == "finish" else None)
-    start_usage = {**usage, "output_tokens": 1}
-    yield _message_start_sse(model, request_id, start_usage)
-    yield from _render_anthropic_stream_events(events)
+    yield _message_start_sse(model, request_id, {"input_tokens": 0, "output_tokens": 0})
+    yield from _render_anthropic_stream_events(event_stream)
 
 
 def _message_start_sse(model: str, request_id: str, usage: dict[str, Any]) -> str:
@@ -335,7 +331,7 @@ def _anthropic_usage_from_provider(usage: Any) -> dict[str, Any]:
     return out
 
 
-def _render_anthropic_stream_events(events: list[dict[str, Any]]) -> Iterator[str]:
+def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterator[str]:
     block_index = 0
     current_block: str | None = None  # "thinking", "text", "tool_use"
     has_any_content = False

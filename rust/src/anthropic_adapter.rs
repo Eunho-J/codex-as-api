@@ -48,9 +48,7 @@ pub fn anthropic_request_to_internal(
         .filter(|a| !a.is_empty())
         .map(|arr| convert_tools(arr));
 
-    let tool_choice = body
-        .get("tool_choice")
-        .map(|tc| convert_tool_choice(tc));
+    let tool_choice = body.get("tool_choice").map(|tc| convert_tool_choice(tc));
 
     let stop = body
         .get("stop_sequences")
@@ -61,10 +59,7 @@ pub fn anthropic_request_to_internal(
                 .collect()
         });
 
-    let reasoning_effort = body
-        .get("thinking")
-        .map(|t| convert_thinking(t))
-        .flatten();
+    let reasoning_effort = body.get("thinking").map(|t| convert_thinking(t)).flatten();
 
     (messages, tools, tool_choice, stop, reasoning_effort)
 }
@@ -137,7 +132,8 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             .unwrap_or("tool-call")
                             .to_string();
                         let raw_content = block.get("content").unwrap_or(&Value::Null);
-                        let (result_content, tool_result_images) = extract_tool_result_content_with_images(raw_content);
+                        let (result_content, tool_result_images) =
+                            extract_tool_result_content_with_images(raw_content);
                         out.push(Message {
                             role: MessageRole::Tool,
                             content: result_content,
@@ -166,14 +162,9 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                                     .get("media_type")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("image/png");
-                                let data = source
-                                    .get("data")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                image_urls.push(format!(
-                                    "data:{};base64,{}",
-                                    media_type, data
-                                ));
+                                let data =
+                                    source.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                                image_urls.push(format!("data:{};base64,{}", media_type, data));
                             }
                         }
                     }
@@ -215,10 +206,7 @@ fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<Stri
                                 .get("media_type")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("image/png");
-                            let data = source
-                                .get("data")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
                             images.push(format!("data:{};base64,{}", media_type, data));
                         }
                     }
@@ -274,10 +262,15 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                             .and_then(|v| v.as_object())
                             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                             .unwrap_or_default();
-                        tool_calls.push(ToolCall { id, name, arguments });
+                        tool_calls.push(ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        });
                     }
                     "thinking" => {
-                        if let Some(thinking_text) = block.get("thinking").and_then(|v| v.as_str()) {
+                        if let Some(thinking_text) = block.get("thinking").and_then(|v| v.as_str())
+                        {
                             if !thinking_text.is_empty() {
                                 reasoning_content = Some(thinking_text.to_string());
                             }
@@ -419,19 +412,11 @@ fn map_stop_reason(finish_reason: &str, has_tool_calls: bool) -> &'static str {
 
 pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let usage = events
-        .iter()
-        .rev()
-        .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("finish"))
-        .and_then(|event| event.get("usage"))
-        .map(anthropic_usage_from_provider)
-        .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}));
-    let mut start_usage = usage.clone();
-    if let Some(obj) = start_usage.as_object_mut() {
-        obj.insert("output_tokens".to_string(), json!(1));
-    }
-
-    out.push(message_start_sse(model, request_id, &start_usage));
+    out.push(message_start_sse(
+        model,
+        request_id,
+        &json!({"input_tokens": 0, "output_tokens": 0}),
+    ));
 
     let mut block_index: u32 = 0;
     let mut current_block: Option<&'static str> = None;
@@ -546,8 +531,16 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                     ));
                     block_index += 1;
                 }
-                let tool_id = event.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let tool_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool_id = event
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = event
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let tool_args = event.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 out.push(sse(
                     "content_block_start",
@@ -665,7 +658,11 @@ fn usage_i64(usage: &Value, key: &str, fallback_key: Option<&str>) -> i64 {
 }
 
 fn anthropic_usage_from_provider(usage: &Value) -> Value {
-    let mut cache_read = usage_i64(usage, "cache_read_input_tokens", Some("cached_input_tokens"));
+    let mut cache_read = usage_i64(
+        usage,
+        "cache_read_input_tokens",
+        Some("cached_input_tokens"),
+    );
     if cache_read == 0 {
         cache_read = usage
             .get("input_tokens_details")
@@ -675,9 +672,18 @@ fn anthropic_usage_from_provider(usage: &Value) -> Value {
             .unwrap_or(0);
     }
     let mut out = serde_json::Map::new();
-    out.insert("input_tokens".to_string(), json!(usage_i64(usage, "input_tokens", Some("prompt_tokens"))));
-    out.insert("output_tokens".to_string(), json!(usage_i64(usage, "output_tokens", Some("completion_tokens"))));
-    out.insert("cache_creation_input_tokens".to_string(), json!(usage_i64(usage, "cache_creation_input_tokens", None)));
+    out.insert(
+        "input_tokens".to_string(),
+        json!(usage_i64(usage, "input_tokens", Some("prompt_tokens"))),
+    );
+    out.insert(
+        "output_tokens".to_string(),
+        json!(usage_i64(usage, "output_tokens", Some("completion_tokens"))),
+    );
+    out.insert(
+        "cache_creation_input_tokens".to_string(),
+        json!(usage_i64(usage, "cache_creation_input_tokens", None)),
+    );
     out.insert("cache_read_input_tokens".to_string(), json!(cache_read));
     for key in ["cache_creation", "server_tool_use", "service_tier"] {
         if let Some(value) = usage.get(key) {
@@ -904,7 +910,10 @@ mod tests {
             ]}],
         });
         let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
-        assert_eq!(msgs[0].reasoning_content, Some("Let me think...".to_string()));
+        assert_eq!(
+            msgs[0].reasoning_content,
+            Some("Let me think...".to_string())
+        );
         assert_eq!(msgs[0].content, "Answer.");
     }
 
@@ -1041,7 +1050,13 @@ mod tests {
 
     #[test]
     fn test_response_reasoning() {
-        let resp = make_response("Answer.", vec![], "stop", None, Some("My reasoning.".to_string()));
+        let resp = make_response(
+            "Answer.",
+            vec![],
+            "stop",
+            None,
+            Some("My reasoning.".to_string()),
+        );
         let out = internal_response_to_anthropic(&resp, "claude-3", "msg_r");
         let content = out["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "thinking");
@@ -1221,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_routes_real_cumulative_usage() {
+    fn test_stream_routes_real_cumulative_usage_in_message_delta() {
         let events = vec![
             json!({"type": "content", "text": "hi"}),
             json!({
@@ -1240,17 +1255,17 @@ mod tests {
         let chunks = anthropic_stream_adapter(&events, "m", "id");
         let parsed = get_sse_events(&chunks);
         let msg_start = parsed.iter().find(|(e, _)| e == "message_start").unwrap();
-        assert_eq!(msg_start.1["message"]["usage"]["input_tokens"], 123);
-        assert_eq!(msg_start.1["message"]["usage"]["output_tokens"], 1);
-        assert_eq!(msg_start.1["message"]["usage"]["cache_creation_input_tokens"], 11);
-        assert_eq!(msg_start.1["message"]["usage"]["cache_read_input_tokens"], 13);
-        assert_eq!(msg_start.1["message"]["usage"]["server_tool_use"]["web_search_requests"], 2);
+        assert_eq!(msg_start.1["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(msg_start.1["message"]["usage"]["output_tokens"], 0);
         let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(msg_delta.1["usage"]["input_tokens"], 123);
         assert_eq!(msg_delta.1["usage"]["output_tokens"], 7);
         assert_eq!(msg_delta.1["usage"]["cache_creation_input_tokens"], 11);
         assert_eq!(msg_delta.1["usage"]["cache_read_input_tokens"], 13);
-        assert_eq!(msg_delta.1["usage"]["server_tool_use"]["web_search_requests"], 2);
+        assert_eq!(
+            msg_delta.1["usage"]["server_tool_use"]["web_search_requests"],
+            2
+        );
     }
 
     #[test]

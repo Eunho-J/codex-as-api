@@ -145,6 +145,30 @@ describe("Anthropic compatibility helper routes", () => {
     });
   });
 
+  it("falls back to an estimate when provider countTokens rejects", async () => {
+    const provider = {
+      async countTokens() {
+        throw new Error("Unsupported parameter: max_output_tokens");
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json() as { input_tokens: number };
+      assert.ok(body.input_tokens > 0);
+    });
+  });
+
+
   it("accepts Anthropic shaped compact requests on /v1/messages/compact", async () => {
     const provider = {
       async compactMessages(messages: Array<{ content: string }>, opts: { model?: string; reasoningEffort?: string }) {
