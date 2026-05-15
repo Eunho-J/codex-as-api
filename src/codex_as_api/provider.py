@@ -384,6 +384,7 @@ class ChatGPTOAuthProvider:
         client_metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         del temperature  # ChatGPT Codex backend rejects explicit temperature for this endpoint.
+        del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         instructions, input_items = _split_instructions_and_input(messages)
         if instructions == "":
             raise ChatGPTOAuthError("ChatGPT OAuth Responses request requires system instructions")
@@ -400,8 +401,6 @@ class ChatGPTOAuthProvider:
         }
         if prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
-        if max_tokens is not None:
-            payload["max_output_tokens"] = max_tokens
         if stop is not None:
             payload["stop"] = list(stop)
         if previous_response_id is not None:

@@ -15,8 +15,27 @@ import {
   imageGenerationFromItem,
   usageFromResponse,
   REMOTE_COMPACTION_MARKER,
+  ChatGPTOAuthProvider,
 } from "../provider.js";
 import { ChatGPTOAuthError } from "../auth.js";
+
+function providerMessages(): Message[] {
+  return [
+    { role: MessageRole.SYSTEM, content: "You are helpful." },
+    { role: MessageRole.USER, content: "Hello" },
+  ];
+}
+
+describe("ChatGPTOAuthProvider payload", () => {
+  it("omits max_output_tokens even when maxTokens is set", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; maxTokens: number }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", maxTokens: 1024 });
+
+    assert.equal(Object.hasOwn(payload, "max_output_tokens"), false);
+  });
+});
 
 describe("decodeSSEBlock", () => {
   it("parses data lines", () => {

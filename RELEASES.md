@@ -1,5 +1,16 @@
 # Release Notes
 
+## v0.3.3
+
+### Claude Code retry fix
+- Stop forwarding Anthropic/OpenAI `max_tokens` as Codex `max_output_tokens` because the Codex OAuth Responses backend rejects that parameter.
+- Add Python, TypeScript, and Rust regression coverage to keep provider payloads free of `max_output_tokens` even when clients send `max_tokens`.
+
+### Validation
+- Python: `PYTHONPATH=src pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build`
+
 ## v0.3.2
 
 ### Claude Code compatibility fix

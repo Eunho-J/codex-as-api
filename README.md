@@ -567,6 +567,11 @@ npm test
 
 ## Release Notes
 
+### v0.3.3
+
+- Stop forwarding client `max_tokens` as Codex `max_output_tokens`, restoring Claude Code compatibility with the Codex OAuth backend.
+- Add Python, TypeScript, and Rust regression tests for the provider payload.
+
 ### v0.3.2
 
 - Restore immediate Anthropic streaming so Claude Code receives events without waiting for the backend response to finish.

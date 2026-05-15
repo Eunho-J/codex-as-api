@@ -599,12 +599,7 @@ impl ChatGPTOAuthProvider {
                     .insert("prompt_cache_key".to_string(), Value::String(key.to_string()));
             }
         }
-        if let Some(max) = max_tokens {
-            payload
-                .as_object_mut()
-                .unwrap()
-                .insert("max_output_tokens".to_string(), json!(max));
-        }
+        let _ = max_tokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         if let Some(s) = stop {
             payload.as_object_mut().unwrap().insert(
                 "stop".to_string(),
@@ -1180,6 +1175,55 @@ pub fn usage_from_response(value: &Value) -> Option<Usage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_responses_payload_omits_max_output_tokens_when_max_tokens_is_set() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                Some(1024),
+                None,
+                Some("gpt-5.5"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(payload.get("max_output_tokens").is_none());
+    }
 
     #[test]
     fn test_split_instructions_and_input() {

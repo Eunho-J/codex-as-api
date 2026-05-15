@@ -1,6 +1,6 @@
 {
   "name": "codex-as-api",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth",
   "license": "Apache-2.0",
   "repository": {

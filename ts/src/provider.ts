@@ -444,7 +444,7 @@ export class ChatGPTOAuthProvider {
       store: false,
       include: [],
     };
-    if (opts.maxTokens != null) payload.max_output_tokens = opts.maxTokens;
+    void opts.maxTokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
     if (opts.promptCacheKey)
       payload.prompt_cache_key = opts.promptCacheKey;
     if (opts.stop != null)

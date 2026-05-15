@@ -7,6 +7,7 @@ import pytest
 from codex_as_api.auth import ChatGPTOAuthError
 from codex_as_api.messages import Message, MessageRole, ToolCall, ToolSchema
 from codex_as_api.provider import (
+    ChatGPTOAuthProvider,
     REMOTE_COMPACTION_MARKER,
     _decode_sse_block,
     _image_generation_from_item,
@@ -20,6 +21,35 @@ from codex_as_api.provider import (
     _usage_from_response,
     _validate_image_content_items,
 )
+
+
+def _provider_messages() -> list[Message]:
+    return [
+        Message(role=MessageRole.SYSTEM, content="You are helpful."),
+        Message(role=MessageRole.USER, content="Hello"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# ChatGPTOAuthProvider payload
+# ---------------------------------------------------------------------------
+
+
+def test_responses_payload_omits_max_output_tokens_when_max_tokens_is_set():
+    provider = ChatGPTOAuthProvider()
+
+    payload = provider._responses_payload(  # noqa: SLF001 - regression test for backend payload
+        _provider_messages(),
+        model="gpt-5.5",
+        tools=None,
+        temperature=None,
+        reasoning_effort=None,
+        stop=None,
+        prompt_cache_key=None,
+        max_tokens=1024,
+    )
+
+    assert "max_output_tokens" not in payload
 
 
 # ---------------------------------------------------------------------------
