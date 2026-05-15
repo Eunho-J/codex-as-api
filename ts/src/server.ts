@@ -417,10 +417,10 @@ export function createApp(opts?: {
   app.post("/v1/compact", compact);
   app.post("/v1/messages/compact", compact);
 
-  app.post("/v1/messages/count_tokens", (req: Request, res: Response) => {
+  app.post("/v1/messages/count_tokens", async (req: Request, res: Response) => {
     try {
       const body = req.body;
-      const { messages } = anthropicRequestToInternal({
+      const { messages, tools, toolChoice, stop, reasoningEffort } = anthropicRequestToInternal({
         model: body.model,
         messages: body.messages || [],
         system: body.system,
@@ -430,7 +430,26 @@ export function createApp(opts?: {
         stopSequences: body.stop_sequences,
         thinking: body.thinking,
       });
-      const inputTokens = estimateInputTokens(messages, body.tools);
+      const countTokens = (provider as { countTokens?: (
+        messages: Message[],
+        opts?: {
+          model?: string;
+          tools?: ToolSchema[];
+          toolChoice?: string | Record<string, unknown>;
+          stop?: string | string[];
+          reasoningEffort?: string;
+        },
+      ) => Promise<number> }).countTokens;
+      if (typeof countTokens !== "function") {
+        throw new ChatGPTOAuthError("provider does not support real token counting");
+      }
+      const inputTokens = await countTokens.call(provider, messages, {
+        model: MODEL,
+        tools: tools ?? undefined,
+        toolChoice: toolChoice ?? undefined,
+        stop: stop ?? undefined,
+        reasoningEffort: reasoningEffort ?? undefined,
+      });
       res.json({
         input_tokens: inputTokens,
         context_window: getContextWindow(),
@@ -545,17 +564,6 @@ function messagesFromCompactBody(body: Record<string, unknown>): {
   return { messages: requestMessagesToInternal(rawMessages), reasoningEffort: null };
 }
 
-function estimateInputTokens(messages: Message[], tools?: unknown): number {
-  let chars = 0;
-  for (const message of messages) {
-    chars += message.role.length + message.content.length + 8;
-    chars += (message.images?.length || 0) * 4500;
-    if (message.tool_calls?.length) chars += JSON.stringify(message.tool_calls).length;
-    if (message.reasoning_content) chars += message.reasoning_content.length;
-  }
-  if (tools != null) chars += JSON.stringify(tools).length;
-  return Math.max(1, Math.ceil(chars / 3));
-}
 
 function requestMessagesToInternal(
   rawMessages: Record<string, unknown>[],

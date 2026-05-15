@@ -466,6 +466,42 @@ class TestAnthropicStreamAdapter:
         assert msg_delta["delta"]["stop_reason"] == "end_turn"
         assert msg_delta["usage"]["output_tokens"] == 3
 
+    def test_routes_real_cumulative_usage_into_message_start_and_delta(self):
+        events = [
+            {"type": "content", "text": "hi"},
+            {
+                "type": "finish",
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 123,
+                    "output_tokens": 7,
+                    "cache_creation_input_tokens": 11,
+                    "cache_read_input_tokens": 13,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 11, "ephemeral_1h_input_tokens": 0},
+                    "server_tool_use": {"web_search_requests": 2},
+                },
+            },
+        ]
+        result = self._collect_events(events)
+        msg_start = [e for e in result if e["type"] == "message_start"][0]
+        assert msg_start["message"]["usage"] == {
+            "input_tokens": 123,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 11,
+            "cache_read_input_tokens": 13,
+            "cache_creation": {"ephemeral_5m_input_tokens": 11, "ephemeral_1h_input_tokens": 0},
+            "server_tool_use": {"web_search_requests": 2},
+        }
+        msg_delta = [e for e in result if e["type"] == "message_delta"][0]
+        assert msg_delta["usage"] == {
+            "input_tokens": 123,
+            "output_tokens": 7,
+            "cache_creation_input_tokens": 11,
+            "cache_read_input_tokens": 13,
+            "cache_creation": {"ephemeral_5m_input_tokens": 11, "ephemeral_1h_input_tokens": 0},
+            "server_tool_use": {"web_search_requests": 2},
+        }
+
     def test_multiple_tool_calls(self):
         events = [
             {"type": "tool_call", "id": "tc-1", "name": "tool_a", "arguments": {"a": 1}},

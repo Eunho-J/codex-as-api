@@ -141,7 +141,6 @@ class ChatGPTOAuthProvider:
         text: dict | None = None,
         client_metadata: dict[str, str] | None = None,
     ) -> Iterator[dict[str, Any]]:
-        del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         payload = self._responses_payload(
             messages,
             model=model,
@@ -151,6 +150,7 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
+            max_tokens=max_tokens,
             previous_response_id=previous_response_id,
             service_tier=service_tier,
             text=text,
@@ -342,6 +342,35 @@ class ChatGPTOAuthProvider:
             raise ChatGPTOAuthError("ChatGPT OAuth response returned no output items")
         return output_items
 
+    def count_tokens(
+        self,
+        messages: Sequence[Message],
+        *,
+        model: str | None = None,
+        tools: Sequence[ToolSchema] | None = None,
+        tool_choice: str | dict | None = None,
+        stop: Sequence[str] | None = None,
+        reasoning_effort: str | None = None,
+    ) -> int:
+        usage: dict[str, Any] | None = None
+        for event in self.chat_stream(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+            reasoning_effort=reasoning_effort,
+            max_tokens=0,
+            stop=stop,
+        ):
+            if event.get("type") == "finish" and isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+        if usage is None:
+            raise ChatGPTOAuthError("remote count_tokens response missing usage")
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+        if not isinstance(input_tokens, int) or isinstance(input_tokens, bool):
+            raise ChatGPTOAuthError("remote count_tokens response missing input token count")
+        return input_tokens
+
     def compact_messages(
         self,
         messages: Sequence[Message],
@@ -376,6 +405,7 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None,
         stop: Sequence[str] | None,
         prompt_cache_key: str | None,
+        max_tokens: int | None = None,
         previous_response_id: str | None = None,
         service_tier: str | None = None,
         text: dict | None = None,
@@ -398,6 +428,8 @@ class ChatGPTOAuthProvider:
         }
         if prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
         if stop is not None:
             payload["stop"] = list(stop)
         if previous_response_id is not None:

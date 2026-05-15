@@ -113,8 +113,16 @@ describe("server error handling", () => {
 });
 
 describe("Anthropic compatibility helper routes", () => {
-  it("returns a count_tokens estimate with context metadata", async () => {
-    await withServer({}, async (baseUrl) => {
+  it("returns real provider count_tokens with context metadata", async () => {
+    const provider = {
+      async countTokens(messages: Array<{ content: string }>, opts: { model?: string }) {
+        assert.equal(opts.model, "gpt-5.5");
+        assert.deepEqual(messages.map((m) => m.content), ["You are helpful.", "hello"]);
+        return 42;
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
       const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -132,7 +140,7 @@ describe("Anthropic compatibility helper routes", () => {
         context_window: number;
         auto_compact_token_limit: number;
       };
-      assert.ok(body.input_tokens > 0);
+      assert.equal(body.input_tokens, 42);
       assert.ok(body.context_window >= body.auto_compact_token_limit);
     });
   });

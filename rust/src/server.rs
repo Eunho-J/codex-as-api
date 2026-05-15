@@ -302,25 +302,6 @@ fn auto_compact_token_limit(state: &AppState) -> i64 {
         .unwrap_or_else(|| (context_window(state) as f64 * 0.8) as i64)
 }
 
-fn estimate_input_tokens(messages: &[Message], tools: Option<&Value>) -> i64 {
-    let mut chars: usize = 0;
-    for message in messages {
-        chars += format!("{:?}", message.role).len() + message.content.len() + 8;
-        chars += message.images.len() * 4500;
-        if !message.tool_calls.is_empty() {
-            chars += serde_json::to_string(&message.tool_calls)
-                .unwrap_or_default()
-                .len();
-        }
-        if let Some(reasoning) = &message.reasoning_content {
-            chars += reasoning.len();
-        }
-    }
-    if let Some(tools_value) = tools {
-        chars += tools_value.to_string().len();
-    }
-    std::cmp::max(1, ((chars + 2) / 3) as i64)
-}
 
 fn messages_from_compact_body(body: &Value) -> (Vec<Message>, Option<String>) {
     if body.get("system").is_some()
@@ -796,10 +777,27 @@ async fn anthropic_count_tokens(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let (messages, _tools, _tool_choice, _stop, _reasoning_effort) =
-        anthropic_request_to_internal(&body);
+    let (messages, tools, tool_choice, stop, reasoning_effort) = anthropic_request_to_internal(&body);
+    let provider = state.provider.clone();
+    let request_model = state.model.clone();
+    let input_tokens = task::spawn_blocking(move || {
+        provider.count_tokens(
+            &messages,
+            tools.as_deref(),
+            tool_choice.as_ref(),
+            stop.as_deref(),
+            reasoning_effort.as_deref(),
+            Some(request_model.as_str()),
+        )
+    })
+    .await
+    .unwrap()
+    .map_err(|e| {
+        let status = map_error_status(&e);
+        error_response(status, e.to_string()).into_response()
+    })?;
     Ok(Json(json!({
-        "input_tokens": estimate_input_tokens(&messages, body.get("tools")),
+        "input_tokens": input_tokens,
         "context_window": context_window(&state),
         "auto_compact_token_limit": auto_compact_token_limit(&state),
     })))

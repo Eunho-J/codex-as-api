@@ -147,7 +147,16 @@ def test_chat_completions_missing_auth_returns_auth_error(tmp_path, monkeypatch)
     server_mod._provider = None
 
 
-def test_messages_count_tokens_returns_estimate(client):
+def test_messages_count_tokens_returns_real_provider_value(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    class DummyProvider:
+        def count_tokens(self, messages, *, model=None, tools=None, tool_choice=None, stop=None, reasoning_effort=None):
+            assert model == server_mod.MODEL
+            assert [m.content for m in messages] == ["You are helpful.", "hello"]
+            return 42
+
+    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
     resp = client.post("/v1/messages/count_tokens", json={
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
@@ -156,8 +165,9 @@ def test_messages_count_tokens_returns_estimate(client):
     })
     assert resp.status_code == 200
     body = resp.json()
-    assert body["input_tokens"] > 0
+    assert body["input_tokens"] == 42
     assert body["context_window"] >= body["auto_compact_token_limit"]
+    server_mod._provider = None
 
 
 def test_messages_compact_accepts_anthropic_body(client, monkeypatch):

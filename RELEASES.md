@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.3.1
+
+### Real Anthropic token accounting
+- `/v1/messages/count_tokens` now asks the Codex backend for real input-token usage with `max_output_tokens: 0` instead of returning a local estimate.
+- Token counting forwards Anthropic-converted tools, tool choice, stop sequences, and thinking/reasoning settings across Python, TypeScript, and Rust.
+- Provider requests now pass `max_output_tokens` through to Codex where requested.
+
+### Streaming usage parity
+- Anthropic streaming now propagates real cumulative usage details from the backend, including cache creation/read fields, server tool use, and service tier metadata when present.
+- `message_start` and final `message_delta` usage payloads now match the backend-reported accounting across all implementations.
+
+### Validation
+- Python: `PYTHONPATH=src pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build`
+
 ## v0.3.0
 
 ### Codex config parity

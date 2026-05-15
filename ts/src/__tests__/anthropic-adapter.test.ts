@@ -449,6 +449,44 @@ describe("anthropicStreamAdapter", () => {
     assert.equal((msgDelta.usage as Record<string, unknown>).output_tokens, 3);
   });
 
+  it("routes real cumulative usage into message_start and message_delta", async () => {
+    const events = [
+      { type: "content", text: "hi" },
+      {
+        type: "finish",
+        finish_reason: "stop",
+        usage: {
+          input_tokens: 123,
+          output_tokens: 7,
+          cache_creation_input_tokens: 11,
+          cache_read_input_tokens: 13,
+          cache_creation: { ephemeral_5m_input_tokens: 11, ephemeral_1h_input_tokens: 0 },
+          server_tool_use: { web_search_requests: 2 },
+        },
+      },
+    ];
+    const result = await collectStreamEvents(events);
+    const msgStart = result.find((e) => e.type === "message_start")!;
+    assert.deepEqual((msgStart.message as Record<string, unknown>).usage, {
+      input_tokens: 123,
+      output_tokens: 1,
+      cache_creation_input_tokens: 11,
+      cache_read_input_tokens: 13,
+      cache_creation: { ephemeral_5m_input_tokens: 11, ephemeral_1h_input_tokens: 0 },
+      server_tool_use: { web_search_requests: 2 },
+    });
+
+    const msgDelta = result.find((e) => e.type === "message_delta")!;
+    assert.deepEqual(msgDelta.usage, {
+      input_tokens: 123,
+      output_tokens: 7,
+      cache_creation_input_tokens: 11,
+      cache_read_input_tokens: 13,
+      cache_creation: { ephemeral_5m_input_tokens: 11, ephemeral_1h_input_tokens: 0 },
+      server_tool_use: { web_search_requests: 2 },
+    });
+  });
+
   it("multiple tool calls", async () => {
     const events = [
       { type: "tool_call", id: "tc-1", name: "tool_a", arguments: { a: 1 } },

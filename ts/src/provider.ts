@@ -332,6 +332,31 @@ export class ChatGPTOAuthProvider {
     return text;
   }
 
+  async countTokens(
+    messages: Message[],
+    opts: ChatOptions = {},
+  ): Promise<number> {
+    const payload = this.responsesPayload(messages, { ...opts, maxTokens: 0 });
+    let usage: Usage | null = null;
+    for await (const event of this.postSSE("/responses", payload)) {
+      const typ = event.type;
+      if (typ === "response.failed") {
+        throw new ChatGPTOAuthError(responseFailureMessage(event, "failed"));
+      } else if (typ === "response.incomplete") {
+        throw new ChatGPTOAuthError(responseFailureMessage(event, "incomplete"));
+      } else if (typ === "response.completed") {
+        const response = event.response;
+        if (typeof response === "object" && response !== null) {
+          usage = usageFromResponse((response as Record<string, unknown>).usage);
+        }
+      }
+    }
+    if (!usage) {
+      throw new ChatGPTOAuthError("remote count_tokens response missing usage");
+    }
+    return usage.prompt_tokens;
+  }
+
   async compactMessages(
     messages: Message[],
     opts: { model?: string; reasoningEffort?: string } = {},
@@ -443,6 +468,7 @@ export class ChatGPTOAuthProvider {
       store: false,
       include: [],
     };
+    if (opts.maxTokens != null) payload.max_output_tokens = opts.maxTokens;
     if (opts.promptCacheKey)
       payload.prompt_cache_key = opts.promptCacheKey;
     if (opts.stop != null)

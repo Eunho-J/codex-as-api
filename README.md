@@ -17,7 +17,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Reasoning** — configurable reasoning effort with streaming thinking content
 - **Codex features** — `prompt_cache_key`, `previous_response_id`, subagent headers, remote compaction
 - **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model and context-window settings
-- **Token counting & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
+- **Real token counting & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
 - **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
 
@@ -264,7 +264,7 @@ curl -N http://localhost:18080/v1/messages \
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. It returns an estimated `input_tokens` value plus the configured context-window metadata.
+Anthropic-compatible token counting helper. It asks the Codex backend for real `input_tokens` usage with `max_output_tokens: 0`, forwarding converted tools, tool choice, stop sequences, and thinking/reasoning settings, then returns the configured context-window metadata.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -566,6 +566,13 @@ npm test
 
 
 ## Release Notes
+
+### v0.3.1
+
+- Use real backend token counting for `/v1/messages/count_tokens` with `max_output_tokens: 0` instead of local estimates.
+- Forward converted Anthropic tools, tool choice, stop sequences, and thinking/reasoning settings during token-count requests.
+- Propagate cumulative Anthropic streaming usage, including cache accounting, server tool use, and service tier metadata when available.
+- Pass `max_output_tokens` through provider requests across Python, TypeScript, and Rust.
 
 ### v0.3.0
 

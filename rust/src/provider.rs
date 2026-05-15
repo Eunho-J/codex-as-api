@@ -166,7 +166,7 @@ impl ChatGPTOAuthProvider {
         tools: Option<&[ToolSchema]>,
         temperature: Option<f64>,
         reasoning_effort: Option<&str>,
-        _max_tokens: Option<i64>,
+        max_tokens: Option<i64>,
         stop: Option<&[String]>,
         prompt_cache_key: Option<&str>,
         subagent: Option<&str>,
@@ -185,6 +185,7 @@ impl ChatGPTOAuthProvider {
             reasoning_effort,
             stop,
             prompt_cache_key,
+            max_tokens,
             previous_response_id,
             model,
             tool_choice,
@@ -435,6 +436,45 @@ impl ChatGPTOAuthProvider {
         Ok(text)
     }
 
+    pub fn count_tokens(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        tool_choice: Option<&Value>,
+        stop: Option<&[String]>,
+        reasoning_effort: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<i64, ProviderError> {
+        let events = self.chat_stream(
+            messages,
+            tools,
+            None,
+            reasoning_effort,
+            Some(0),
+            stop,
+            None,
+            None,
+            None,
+            None,
+            model,
+            tool_choice,
+            None,
+            None,
+            None,
+        )?;
+        let usage = events
+            .iter()
+            .rev()
+            .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("finish"))
+            .and_then(|event| event.get("usage"))
+            .ok_or_else(|| ProviderError::Request("remote count_tokens response missing usage".to_string()))?;
+        usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| ProviderError::Request("remote count_tokens response missing input token count".to_string()))
+    }
+
     pub fn compact_messages(
         &self,
         messages: &[Message],
@@ -556,6 +596,7 @@ impl ChatGPTOAuthProvider {
         reasoning_effort: Option<&str>,
         stop: Option<&[String]>,
         prompt_cache_key: Option<&str>,
+        max_tokens: Option<i64>,
         previous_response_id: Option<&str>,
         model: Option<&str>,
         tool_choice: Option<&Value>,
@@ -595,6 +636,12 @@ impl ChatGPTOAuthProvider {
                     .unwrap()
                     .insert("prompt_cache_key".to_string(), Value::String(key.to_string()));
             }
+        }
+        if let Some(max) = max_tokens {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("max_output_tokens".to_string(), json!(max));
         }
         if let Some(s) = stop {
             payload.as_object_mut().unwrap().insert(

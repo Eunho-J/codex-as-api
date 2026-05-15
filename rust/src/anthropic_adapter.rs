@@ -419,28 +419,23 @@ fn map_stop_reason(finish_reason: &str, has_tool_calls: bool) -> &'static str {
 
 pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let usage = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(|v| v.as_str()) == Some("finish"))
+        .and_then(|event| event.get("usage"))
+        .map(anthropic_usage_from_provider)
+        .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}));
+    let mut start_usage = usage.clone();
+    if let Some(obj) = start_usage.as_object_mut() {
+        obj.insert("output_tokens".to_string(), json!(1));
+    }
 
-    out.push(sse(
-        "message_start",
-        &json!({
-            "type": "message_start",
-            "message": {
-                "id": request_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            },
-        }),
-    ));
+    out.push(message_start_sse(model, request_id, &start_usage));
 
     let mut block_index: u32 = 0;
     let mut current_block: Option<&'static str> = None;
     let mut has_any_content = false;
-    let mut output_tokens: i64 = 0;
 
     for event in events {
         let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -621,20 +616,15 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                     .unwrap_or("stop");
                 let stop_reason = map_stop_reason(finish_reason, false);
 
-                if let Some(usage) = event.get("usage").and_then(|v| v.as_object()) {
-                    output_tokens = usage
-                        .get("output_tokens")
-                        .or_else(|| usage.get("completion_tokens"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                }
-
                 out.push(sse(
                     "message_delta",
                     &json!({
                         "type": "message_delta",
                         "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                        "usage": {"output_tokens": output_tokens},
+                        "usage": event
+                            .get("usage")
+                            .map(anthropic_usage_from_provider)
+                            .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0})),
                     }),
                 ));
                 out.push(sse("message_stop", &json!({"type": "message_stop"})));
@@ -647,6 +637,55 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
     out
 }
 
+fn message_start_sse(model: &str, request_id: &str, usage: &Value) -> String {
+    sse(
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage,
+            },
+        }),
+    )
+}
+
+fn usage_i64(usage: &Value, key: &str, fallback_key: Option<&str>) -> i64 {
+    usage
+        .get(key)
+        .or_else(|| fallback_key.and_then(|k| usage.get(k)))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
+fn anthropic_usage_from_provider(usage: &Value) -> Value {
+    let mut cache_read = usage_i64(usage, "cache_read_input_tokens", Some("cached_input_tokens"));
+    if cache_read == 0 {
+        cache_read = usage
+            .get("input_tokens_details")
+            .or_else(|| usage.get("prompt_tokens_details"))
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("input_tokens".to_string(), json!(usage_i64(usage, "input_tokens", Some("prompt_tokens"))));
+    out.insert("output_tokens".to_string(), json!(usage_i64(usage, "output_tokens", Some("completion_tokens"))));
+    out.insert("cache_creation_input_tokens".to_string(), json!(usage_i64(usage, "cache_creation_input_tokens", None)));
+    out.insert("cache_read_input_tokens".to_string(), json!(cache_read));
+    for key in ["cache_creation", "server_tool_use", "service_tier"] {
+        if let Some(value) = usage.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
 fn sse(event_type: &str, data: &Value) -> String {
     format!(
         "event: {}\ndata: {}\n\n",
@@ -1179,6 +1218,39 @@ mod tests {
         let parsed = get_sse_events(&chunks);
         let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(msg_delta.1["usage"]["output_tokens"], 42);
+    }
+
+    #[test]
+    fn test_stream_routes_real_cumulative_usage() {
+        let events = vec![
+            json!({"type": "content", "text": "hi"}),
+            json!({
+                "type": "finish",
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 123,
+                    "output_tokens": 7,
+                    "cache_creation_input_tokens": 11,
+                    "cache_read_input_tokens": 13,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 11, "ephemeral_1h_input_tokens": 0},
+                    "server_tool_use": {"web_search_requests": 2}
+                },
+            }),
+        ];
+        let chunks = anthropic_stream_adapter(&events, "m", "id");
+        let parsed = get_sse_events(&chunks);
+        let msg_start = parsed.iter().find(|(e, _)| e == "message_start").unwrap();
+        assert_eq!(msg_start.1["message"]["usage"]["input_tokens"], 123);
+        assert_eq!(msg_start.1["message"]["usage"]["output_tokens"], 1);
+        assert_eq!(msg_start.1["message"]["usage"]["cache_creation_input_tokens"], 11);
+        assert_eq!(msg_start.1["message"]["usage"]["cache_read_input_tokens"], 13);
+        assert_eq!(msg_start.1["message"]["usage"]["server_tool_use"]["web_search_requests"], 2);
+        let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
+        assert_eq!(msg_delta.1["usage"]["input_tokens"], 123);
+        assert_eq!(msg_delta.1["usage"]["output_tokens"], 7);
+        assert_eq!(msg_delta.1["usage"]["cache_creation_input_tokens"], 11);
+        assert_eq!(msg_delta.1["usage"]["cache_read_input_tokens"], 13);
+        assert_eq!(msg_delta.1["usage"]["server_tool_use"]["web_search_requests"], 2);
     }
 
     #[test]

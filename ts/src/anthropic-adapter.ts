@@ -304,7 +304,29 @@ export async function* anthropicStreamAdapter(
   model: string,
   requestId: string,
 ): AsyncGenerator<string> {
-  yield sse("message_start", {
+  const events: Record<string, unknown>[] = [];
+  try {
+    for await (const event of eventIterator) {
+      events.push(event);
+    }
+  } catch (err) {
+    yield messageStartSse(model, requestId, { input_tokens: 0, output_tokens: 0 });
+    for (const chunk of renderAnthropicStreamEvents(events)) yield chunk;
+    throw err;
+  }
+
+  const usage = usageFromProviderEvent(events.findLast((e) => e.type === "finish")?.usage);
+  const startUsage = { ...usage, output_tokens: 1 };
+  yield messageStartSse(model, requestId, startUsage);
+  for (const chunk of renderAnthropicStreamEvents(events)) yield chunk;
+}
+
+function messageStartSse(
+  model: string,
+  requestId: string,
+  usage: Record<string, unknown>,
+): string {
+  return sse("message_start", {
     type: "message_start",
     message: {
       id: requestId,
@@ -314,16 +336,53 @@ export async function* anthropicStreamAdapter(
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage,
     },
   });
+}
 
+function usageFromProviderEvent(usageEvent: unknown): Record<string, unknown> {
+  if (typeof usageEvent !== "object" || usageEvent === null || Array.isArray(usageEvent)) {
+    return { input_tokens: 0, output_tokens: 0 };
+  }
+  const u = usageEvent as Record<string, unknown>;
+  const inputTokens = numeric(u.input_tokens ?? u.prompt_tokens);
+  const outputTokens = numeric(u.output_tokens ?? u.completion_tokens);
+  const tokenDetails = u.input_tokens_details ?? u.prompt_tokens_details;
+  let cacheRead = numeric(u.cache_read_input_tokens ?? u.cached_input_tokens);
+  if (
+    cacheRead === 0 &&
+    typeof tokenDetails === "object" &&
+    tokenDetails !== null &&
+    !Array.isArray(tokenDetails)
+  ) {
+    cacheRead = numeric((tokenDetails as Record<string, unknown>).cached_tokens);
+  }
+
+  const result: Record<string, unknown> = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: numeric(u.cache_creation_input_tokens),
+    cache_read_input_tokens: cacheRead,
+  };
+  for (const key of ["cache_creation", "server_tool_use", "service_tier"] as const) {
+    if (u[key] !== undefined) result[key] = u[key];
+  }
+  return result;
+}
+
+function numeric(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function* renderAnthropicStreamEvents(
+  events: Record<string, unknown>[],
+): Generator<string> {
   let blockIndex = 0;
   let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let hasAnyContent = false;
-  let outputTokens = 0;
 
-  for await (const event of eventIterator) {
+  for (const event of events) {
     const typ = event.type;
 
     if (typ === "reasoning_delta" || typ === "reasoning_raw_delta") {
@@ -431,22 +490,16 @@ export async function* anthropicStreamAdapter(
 
       const finishReason = String(event.finish_reason ?? "stop");
       const stopReason = mapStopReason(finishReason, false);
-      const usageEvent = event.usage;
-      if (typeof usageEvent === "object" && usageEvent !== null) {
-        const u = usageEvent as Record<string, unknown>;
-        outputTokens = Number(u.output_tokens ?? u.completion_tokens ?? 0);
-      }
 
       yield sse("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: outputTokens },
+        usage: usageFromProviderEvent(event.usage),
       });
       yield sse("message_stop", { type: "message_stop" });
     }
   }
 }
-
 function sse(eventType: string, data: Record<string, unknown>): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
 }

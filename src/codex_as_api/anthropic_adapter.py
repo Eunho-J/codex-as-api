@@ -288,8 +288,16 @@ def anthropic_stream_adapter(
     request_id: str,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
-    # Emit message_start
-    yield _sse("message_start", {
+    events: list[dict[str, Any]] = []
+    events.extend(event_stream)
+    usage = _anthropic_usage_from_provider(events[-1].get("usage") if events and events[-1].get("type") == "finish" else None)
+    start_usage = {**usage, "output_tokens": 1}
+    yield _message_start_sse(model, request_id, start_usage)
+    yield from _render_anthropic_stream_events(events)
+
+
+def _message_start_sse(model: str, request_id: str, usage: dict[str, Any]) -> str:
+    return _sse("message_start", {
         "type": "message_start",
         "message": {
             "id": request_id,
@@ -299,16 +307,40 @@ def anthropic_stream_adapter(
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": usage,
         },
     })
 
+
+def _num(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _anthropic_usage_from_provider(usage: Any) -> dict[str, Any]:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0}
+    token_details = usage.get("input_tokens_details", usage.get("prompt_tokens_details"))
+    cache_read = _num(usage.get("cache_read_input_tokens", usage.get("cached_input_tokens")))
+    if cache_read == 0 and isinstance(token_details, dict):
+        cache_read = _num(token_details.get("cached_tokens"))
+    out: dict[str, Any] = {
+        "input_tokens": _num(usage.get("input_tokens", usage.get("prompt_tokens"))),
+        "output_tokens": _num(usage.get("output_tokens", usage.get("completion_tokens"))),
+        "cache_creation_input_tokens": _num(usage.get("cache_creation_input_tokens")),
+        "cache_read_input_tokens": cache_read,
+    }
+    for key in ("cache_creation", "server_tool_use", "service_tier"):
+        if key in usage:
+            out[key] = usage[key]
+    return out
+
+
+def _render_anthropic_stream_events(events: list[dict[str, Any]]) -> Iterator[str]:
     block_index = 0
     current_block: str | None = None  # "thinking", "text", "tool_use"
     has_any_content = False
-    output_tokens = 0
 
-    for event in event_stream:
+    for event in events:
         typ = event.get("type")
 
         if typ in ("reasoning_delta", "reasoning_raw_delta"):
@@ -408,18 +440,13 @@ def anthropic_stream_adapter(
 
             finish_reason = str(event.get("finish_reason") or "stop")
             stop_reason = _map_stop_reason(finish_reason, False)
-            usage = event.get("usage")
-            if isinstance(usage, dict):
-                output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
 
             yield _sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+                "usage": _anthropic_usage_from_provider(event.get("usage")),
             })
             yield _sse("message_stop", {"type": "message_stop"})
-
-
 def _sse(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
