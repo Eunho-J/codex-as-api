@@ -209,7 +209,50 @@ describe("anthropicRequestToInternal", () => {
       messages: [{ role: "user", content: "hi" }],
       toolChoice: { type: "tool", name: "get_weather" },
     });
-    assert.deepEqual(toolChoice, { type: "function", function: { name: "get_weather" } });
+    assert.deepEqual(toolChoice, { type: "function", name: "get_weather" });
+  });
+
+  it("converts Anthropic web_search server tool", () => {
+    const { tools } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{
+        type: "web_search_20260209",
+        name: "web_search",
+        allowed_domains: ["example.com"],
+        max_uses: 8,
+        user_location: { type: "approximate", country: "US" },
+      }],
+    });
+    assert.ok(tools);
+    assert.equal(tools[0].name, "web_search");
+    assert.equal(tools[0].parameters.__codex_as_api_tool_type, "web_search");
+    const openaiTool = tools[0].parameters.openai_tool as Record<string, unknown>;
+    assert.equal(openaiTool.type, "web_search");
+    assert.equal(openaiTool.external_web_access, true);
+    assert.deepEqual(openaiTool.filters, { allowed_domains: ["example.com"] });
+    assert.deepEqual(openaiTool.user_location, { type: "approximate", country: "US" });
+  });
+
+  it("rejects unsupported Anthropic web_search blocked_domains", () => {
+    assert.throws(() => anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{
+        type: "web_search_20250305",
+        name: "web_search",
+        blocked_domains: ["example.com"],
+      }],
+    }), /blocked_domains/);
+  });
+
+  it("converts web_search tool_choice to hosted tool choice", () => {
+    const { toolChoice } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      toolChoice: { type: "tool", name: "web_search" },
+    });
+    assert.deepEqual(toolChoice, { type: "web_search" });
   });
 
   it("tool_choice none", () => {
@@ -350,6 +393,31 @@ describe("internalResponseToAnthropic", () => {
     const result = internalResponseToAnthropic(resp, "m", "msg_1");
     const usage = result.usage as Record<string, unknown>;
     assert.equal(usage.cache_read_input_tokens, 50);
+  });
+
+  it("adds web_search server tool blocks before text", () => {
+    const resp = makeResponse({
+      content: "Final answer",
+      raw: {
+        events: [{
+          type: "web_search_call",
+          id: "srvtoolu_ws1",
+          input: { query: "latest news" },
+          content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
+        }],
+      },
+    });
+    const result = internalResponseToAnthropic(resp, "m", "msg_1");
+    const content = result.content as Record<string, unknown>[];
+    assert.deepEqual(content.map((c) => c.type), ["server_tool_use", "web_search_tool_result", "text"]);
+    assert.equal(content[0].name, "web_search");
+    assert.equal(content[1].tool_use_id, "srvtoolu_ws1");
+    assert.deepEqual((content[1].content as unknown[])[0], {
+      type: "web_search_result",
+      url: "https://example.com",
+      title: "Example",
+    });
+    assert.deepEqual((result.usage as Record<string, unknown>).server_tool_use, { web_search_requests: 1 });
   });
 });
 
@@ -496,6 +564,30 @@ describe("anthropicStreamAdapter", () => {
     assert.equal((blockStarts[1].content_block as Record<string, unknown>).name, "tool_b");
     assert.equal(blockStarts[0].index, 0);
     assert.equal(blockStarts[1].index, 1);
+  });
+
+  it("web_search_call stream emits server tool result before text", async () => {
+    const events = [
+      {
+        type: "web_search_call",
+        id: "srvtoolu_ws1",
+        input: { query: "current time" },
+        content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
+      },
+      { type: "content", text: "It is noon." },
+      { type: "finish", finish_reason: "stop" },
+    ];
+    const result = await collectStreamEvents(events);
+    const blockStarts = result.filter((e) => e.type === "content_block_start");
+    assert.deepEqual(blockStarts.map((e) => (e.content_block as Record<string, unknown>).type), [
+      "server_tool_use",
+      "web_search_tool_result",
+      "text",
+    ]);
+    const msgDelta = result.find((e) => e.type === "message_delta")!;
+    assert.deepEqual((msgDelta.usage as Record<string, unknown>).server_tool_use, {
+      web_search_requests: 1,
+    });
   });
 });
 

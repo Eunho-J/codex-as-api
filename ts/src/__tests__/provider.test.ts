@@ -10,6 +10,7 @@ import {
   toolSchemaToResponseDict,
   setReasoningPayload,
   toolCallFromResponseItem,
+  webSearchEventFromResponseItem,
   textFromResponseItems,
   validateImageContentItems,
   imageGenerationFromItem,
@@ -34,6 +35,29 @@ describe("ChatGPTOAuthProvider payload", () => {
     }).responsesPayload(providerMessages(), { model: "gpt-5.5", maxTokens: 1024 });
 
     assert.equal(Object.hasOwn(payload, "max_output_tokens"), false);
+  });
+
+  it("includes web_search hosted tool sources in Responses payload", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const webSearchTool: ToolSchema = {
+      name: "web_search",
+      description: "Web search",
+      parameters: {
+        __codex_as_api_tool_type: "web_search",
+        openai_tool: { type: "web_search", external_web_access: true },
+      },
+    };
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; tools: ToolSchema[]; toolChoice: Record<string, unknown> }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      tools: [webSearchTool],
+      toolChoice: { type: "web_search" },
+    });
+
+    assert.deepEqual(payload.tools, [{ type: "web_search", external_web_access: true }]);
+    assert.deepEqual(payload.tool_choice, { type: "web_search" });
+    assert.deepEqual(payload.include, ["web_search_call.action.sources"]);
   });
 });
 
@@ -228,6 +252,72 @@ describe("toolSchemaToResponseDict", () => {
     assert.equal(result.type, "function");
     assert.equal(result.name, "get_weather");
     assert.equal(result.strict, false);
+  });
+
+  it("converts internal web_search schema to hosted tool", () => {
+    const tool: ToolSchema = {
+      name: "web_search",
+      description: "Web search",
+      parameters: {
+        __codex_as_api_tool_type: "web_search",
+        openai_tool: {
+          type: "web_search",
+          external_web_access: true,
+          filters: { allowed_domains: ["example.com"] },
+        },
+      },
+    };
+    assert.deepEqual(toolSchemaToResponseDict(tool), {
+      type: "web_search",
+      external_web_access: true,
+      filters: { allowed_domains: ["example.com"] },
+    });
+  });
+});
+
+describe("webSearchEventFromResponseItem", () => {
+  it("extracts sources from web_search_call action", () => {
+    const result = webSearchEventFromResponseItem({
+      type: "web_search_call",
+      id: "ws_1",
+      action: {
+        type: "search",
+        query: "hello",
+        sources: [{ url: "https://example.com", title: "Example", page_age: "today" }],
+      },
+    });
+    assert.ok(result);
+    assert.equal(result.id, "srvtoolu_ws_1");
+    assert.deepEqual(result.input, { query: "hello" });
+    assert.deepEqual(result.content, [{
+      type: "web_search_result",
+      url: "https://example.com",
+      title: "Example",
+      page_age: "today",
+    }]);
+  });
+
+  it("falls back to url_citation annotations", () => {
+    const result = webSearchEventFromResponseItem(
+      { type: "web_search_call", id: "ws_1", action: { type: "search", queries: ["q"] } },
+      [
+        { type: "web_search_call", id: "ws_1" },
+        {
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: "answer",
+            annotations: [{ type: "url_citation", url: "https://a.test", title: "A" }],
+          }],
+        },
+      ],
+    );
+    assert.ok(result);
+    assert.deepEqual(result.content, [{
+      type: "web_search_result",
+      url: "https://a.test",
+      title: "A",
+    }]);
   });
 });
 

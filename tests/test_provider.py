@@ -20,6 +20,7 @@ from codex_as_api.provider import (
     _tool_schema_to_response_dict,
     _usage_from_response,
     _validate_image_content_items,
+    _web_search_event_from_response_item,
 )
 
 
@@ -50,6 +51,33 @@ def test_responses_payload_omits_max_output_tokens_when_max_tokens_is_set():
     )
 
     assert "max_output_tokens" not in payload
+
+
+def test_responses_payload_includes_web_search_sources():
+    provider = ChatGPTOAuthProvider()
+    web_search_tool = ToolSchema(
+        name="web_search",
+        description="Web search",
+        parameters={
+            "__codex_as_api_tool_type": "web_search",
+            "openai_tool": {"type": "web_search", "external_web_access": True},
+        },
+    )
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        tools=[web_search_tool],
+        tool_choice={"type": "web_search"},
+        temperature=None,
+        reasoning_effort=None,
+        stop=None,
+        prompt_cache_key=None,
+    )
+
+    assert payload["tools"] == [{"type": "web_search", "external_web_access": True}]
+    assert payload["tool_choice"] == {"type": "web_search"}
+    assert payload["include"] == ["web_search_call.action.sources"]
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +391,70 @@ def test_tool_schema_to_response_dict():
     assert d["description"] == "Search the web"
     assert d["parameters"] == {"type": "object"}
     assert d["strict"] is False
+
+
+def test_tool_schema_to_response_dict_web_search():
+    tool = ToolSchema(
+        name="web_search",
+        description="Web search",
+        parameters={
+            "__codex_as_api_tool_type": "web_search",
+            "openai_tool": {
+                "type": "web_search",
+                "external_web_access": True,
+                "filters": {"allowed_domains": ["example.com"]},
+            },
+        },
+    )
+    assert _tool_schema_to_response_dict(tool) == {
+        "type": "web_search",
+        "external_web_access": True,
+        "filters": {"allowed_domains": ["example.com"]},
+    }
+
+
+def test_web_search_event_from_response_item_action_sources():
+    result = _web_search_event_from_response_item({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {
+            "type": "search",
+            "query": "hello",
+            "sources": [{"url": "https://example.com", "title": "Example", "page_age": "today"}],
+        },
+    })
+    assert result is not None
+    assert result["id"] == "srvtoolu_ws_1"
+    assert result["input"] == {"query": "hello"}
+    assert result["content"] == [{
+        "type": "web_search_result",
+        "url": "https://example.com",
+        "title": "Example",
+        "page_age": "today",
+    }]
+
+
+def test_web_search_event_from_response_item_annotation_fallback():
+    result = _web_search_event_from_response_item(
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "queries": ["q"]}},
+        [
+            {"type": "web_search_call", "id": "ws_1"},
+            {
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "answer",
+                    "annotations": [{"type": "url_citation", "url": "https://a.test", "title": "A"}],
+                }],
+            },
+        ],
+    )
+    assert result is not None
+    assert result["content"] == [{
+        "type": "web_search_result",
+        "url": "https://a.test",
+        "title": "A",
+    }]
 
 
 # ---------------------------------------------------------------------------

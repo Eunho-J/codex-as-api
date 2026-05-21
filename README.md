@@ -539,6 +539,12 @@ The provider handles:
 - Image generation and inspection
 - Remote conversation compaction
 
+## Release & package publishing
+
+- Bump versions in `pyproject.toml`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
+- Publish a GitHub Release such as `v0.4.0` from the matching commit.
+- The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
+
 ## Tests
 
 ### Python
@@ -566,6 +572,12 @@ npm test
 
 
 ## Release Notes
+
+### v0.4.0
+
+- Add Claude Code-compatible Anthropic hosted web search support by mapping `web_search_*` server tools to OpenAI Responses `web_search`.
+- Return `server_tool_use` and `web_search_tool_result` blocks so Claude Code can parse web search results reliably.
+- Prepare TypeScript package publishing to npmjs and GitHub Packages via GitHub Actions.
 
 ### v0.3.3
 

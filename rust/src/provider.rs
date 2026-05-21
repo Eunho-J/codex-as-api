@@ -144,11 +144,7 @@ impl ChatGPTOAuthProvider {
             }
         };
 
-        let tail_events: Vec<Value> = if raw_events.len() > 20 {
-            raw_events[raw_events.len() - 20..].to_vec()
-        } else {
-            raw_events
-        };
+        let tail_events = compact_raw_events(&raw_events);
 
         Ok(AssistantResponse {
             content: content_parts.join(""),
@@ -210,6 +206,7 @@ impl ChatGPTOAuthProvider {
         let mut result_events: Vec<Value> = Vec::new();
         let mut final_output: Vec<Value> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
+        let mut yielded_web_search_ids: HashSet<String> = HashSet::new();
         let mut saw_text_delta = false;
         let mut saw_reasoning_delta = false;
 
@@ -235,6 +232,12 @@ impl ChatGPTOAuthProvider {
                                     "name": tc.name,
                                     "arguments": tc.arguments,
                                 }));
+                            }
+                            if let Some(web_search) = web_search_event_from_response_item(item, &[]) {
+                                if let Some(id) = web_search.get("id").and_then(|v| v.as_str()) {
+                                    yielded_web_search_ids.insert(id.to_string());
+                                }
+                                result_events.push(web_search);
                             }
                         }
                     }
@@ -294,6 +297,15 @@ impl ChatGPTOAuthProvider {
                                     if item.is_object() {
                                         final_output.push(item.clone());
                                     }
+                                }
+                            }
+                        }
+                        for item in &final_output {
+                            if let Some(web_search) = web_search_event_from_response_item(item, &final_output) {
+                                let id = web_search.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                if !yielded_web_search_ids.contains(id) {
+                                    yielded_web_search_ids.insert(id.to_string());
+                                    result_events.push(web_search);
                                 }
                             }
                         }
@@ -574,6 +586,14 @@ impl ChatGPTOAuthProvider {
             ));
         }
 
+        if let Some(ts) = tools {
+            for tool in ts {
+                if let Some(error) = tool.parameters.get("__codex_as_api_error").and_then(|v| v.as_str()) {
+                    return Err(ProviderError::Request(error.to_string()));
+                }
+            }
+        }
+
         let tools_array: Vec<Value> = match tools {
             Some(ts) => ts.iter().map(tool_schema_to_response_dict).collect(),
             None => vec![],
@@ -590,6 +610,12 @@ impl ChatGPTOAuthProvider {
             "store": false,
             "include": [],
         });
+        if tools_array.iter().any(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("web_search")) {
+            payload.as_object_mut().unwrap().insert(
+                "include".to_string(),
+                json!(["web_search_call.action.sources"]),
+            );
+        }
 
         if let Some(key) = prompt_cache_key {
             if !key.is_empty() {
@@ -1016,6 +1042,19 @@ fn message_item(role: &str, content: &str, images: &[String]) -> Value {
 }
 
 fn tool_schema_to_response_dict(tool: &ToolSchema) -> Value {
+    if tool
+        .parameters
+        .get("__codex_as_api_tool_type")
+        .and_then(|v| v.as_str())
+        == Some("web_search")
+    {
+        return tool
+            .parameters
+            .get("openai_tool")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "web_search", "external_web_access": true}));
+    }
     json!({
         "type": "function",
         "name": tool.name,
@@ -1023,6 +1062,122 @@ fn tool_schema_to_response_dict(tool: &ToolSchema) -> Value {
         "parameters": tool.parameters,
         "strict": false,
     })
+}
+
+fn compact_raw_events(events: &[Value]) -> Vec<Value> {
+    let mut keep: Vec<Value> = events
+        .iter()
+        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("web_search_call"))
+        .cloned()
+        .collect();
+    let start = events.len().saturating_sub(20);
+    for event in &events[start..] {
+        if !keep.iter().any(|kept| kept == event) {
+            keep.push(event.clone());
+        }
+    }
+    keep
+}
+
+fn web_search_event_from_response_item(item: &Value, all_items: &[Value]) -> Option<Value> {
+    if item.get("type").and_then(|v| v.as_str()) != Some("web_search_call") {
+        return None;
+    }
+    let raw_id = item
+        .get("id")
+        .or_else(|| item.get("call_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let tool_id = if raw_id.starts_with("srvtoolu_") {
+        raw_id
+    } else {
+        format!(
+            "srvtoolu_{}",
+            raw_id
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>()
+        )
+    };
+    let action = item.get("action").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+    let mut sources = web_search_sources_from_action(&action);
+    if sources.is_empty() && !all_items.is_empty() {
+        sources.extend(web_search_sources_from_annotations(all_items));
+    }
+    Some(json!({
+        "type": "web_search_call",
+        "id": tool_id,
+        "input": {"query": web_search_query_from_action(&action)},
+        "content": sources,
+    }))
+}
+
+fn web_search_query_from_action(action: &Value) -> String {
+    if let Some(query) = action.get("query").and_then(|v| v.as_str()) {
+        return query.to_string();
+    }
+    if let Some(queries) = action.get("queries").and_then(|v| v.as_array()) {
+        if let Some(first) = queries.iter().filter_map(|q| q.as_str()).find(|q| !q.is_empty()) {
+            return first.to_string();
+        }
+    }
+    action
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn web_search_sources_from_action(action: &Value) -> Vec<Value> {
+    normalize_web_search_sources(action.get("sources").unwrap_or(&Value::Null))
+}
+
+fn web_search_sources_from_annotations(items: &[Value]) -> Vec<Value> {
+    let mut raw = Vec::new();
+    for item in items {
+        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+            for part in content {
+                if let Some(annotations) = part.get("annotations").and_then(|v| v.as_array()) {
+                    for ann in annotations {
+                        if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation") {
+                            raw.push(ann.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    normalize_web_search_sources(&Value::Array(raw))
+}
+
+fn normalize_web_search_sources(value: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let Some(sources) = value.as_array() else {
+        return out;
+    };
+    for source in sources {
+        let Some(url) = source.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if url.is_empty() || seen.contains(url) {
+            continue;
+        }
+        seen.insert(url.to_string());
+        let mut result = serde_json::Map::new();
+        result.insert("type".to_string(), json!("web_search_result"));
+        result.insert("url".to_string(), json!(url));
+        result.insert(
+            "title".to_string(),
+            json!(source.get("title").and_then(|v| v.as_str()).unwrap_or(url)),
+        );
+        if let Some(page_age) = source.get("page_age").and_then(|v| v.as_str()) {
+            result.insert("page_age".to_string(), json!(page_age));
+        }
+        out.push(Value::Object(result));
+    }
+    out
 }
 
 fn set_reasoning_payload(
@@ -1223,6 +1378,65 @@ mod tests {
             .unwrap();
 
         assert!(payload.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn test_responses_payload_includes_web_search_sources() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+        let tools = vec![ToolSchema {
+            name: "web_search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({
+                "__codex_as_api_tool_type": "web_search",
+                "openai_tool": {"type": "web_search", "external_web_access": true},
+            }),
+        }];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                Some(&tools),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                Some(&json!({"type": "web_search"})),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(payload["tools"], json!([{"type": "web_search", "external_web_access": true}]));
+        assert_eq!(payload["tool_choice"], json!({"type": "web_search"}));
+        assert_eq!(payload["include"], json!(["web_search_call.action.sources"]));
     }
 
     #[test]

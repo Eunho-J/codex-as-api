@@ -176,12 +176,58 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[ToolSchema]:
         name = tool.get("name")
         if not name:
             continue
+        if _is_anthropic_web_search_tool(tool):
+            result.append(ToolSchema(
+                name="web_search",
+                description="Anthropic hosted web search",
+                parameters=_anthropic_web_search_parameters(tool),
+            ))
+            continue
         result.append(ToolSchema(
             name=str(name),
             description=str(tool.get("description") or ""),
             parameters=tool.get("input_schema") or {},
         ))
     return result
+
+
+def _is_anthropic_web_search_tool(tool: dict[str, Any]) -> bool:
+    return (
+        tool.get("name") == "web_search"
+        and isinstance(tool.get("type"), str)
+        and tool["type"].startswith("web_search_")
+    )
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    out = [v for v in value if isinstance(v, str) and v]
+    return out or None
+
+
+def _anthropic_web_search_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    if _string_list(tool.get("blocked_domains")):
+        raise ValueError(
+            "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; use allowed_domains instead"
+        )
+
+    openai_tool: dict[str, Any] = {"type": "web_search", "external_web_access": True}
+    allowed_domains = _string_list(tool.get("allowed_domains"))
+    if allowed_domains:
+        openai_tool["filters"] = {"allowed_domains": allowed_domains}
+    user_location = tool.get("user_location")
+    if isinstance(user_location, dict):
+        openai_tool["user_location"] = user_location
+
+    return {
+        "__codex_as_api_tool_type": "web_search",
+        "openai_tool": openai_tool,
+        "anthropic": {
+            "type": tool.get("type"),
+            "max_uses": tool.get("max_uses"),
+        },
+    }
 
 
 def _convert_tool_choice(tc: dict[str, Any] | None) -> str | dict | None:
@@ -193,7 +239,9 @@ def _convert_tool_choice(tc: dict[str, Any] | None) -> str | dict | None:
     if tc_type == "any":
         return "required"
     if tc_type == "tool":
-        return {"type": "function", "function": {"name": tc.get("name")}}
+        if tc.get("name") == "web_search":
+            return {"type": "web_search"}
+        return {"type": "function", "name": tc.get("name")}
     if tc_type == "none":
         return "none"
     return "auto"
@@ -227,6 +275,9 @@ def internal_response_to_anthropic(
             "signature": "sig-placeholder",
         })
 
+    web_search_blocks = _web_search_blocks_from_raw(response.raw)
+    content.extend(web_search_blocks)
+
     if response.content:
         content.append({"type": "text", "text": response.content})
 
@@ -248,6 +299,7 @@ def internal_response_to_anthropic(
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": response.usage.cached_tokens,
         }
+    usage_dict = _merge_server_tool_usage(usage_dict, response.raw, len(web_search_blocks) // 2)
 
     if not content:
         content.append({"type": "text", "text": ""})
@@ -262,6 +314,41 @@ def internal_response_to_anthropic(
         "stop_sequence": None,
         "usage": usage_dict,
     }
+
+
+def _web_search_blocks_from_raw(raw: dict | None) -> list[dict[str, Any]]:
+    events = raw.get("events") if isinstance(raw, dict) else None
+    if not isinstance(events, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "web_search_call":
+            continue
+        tool_id = str(event.get("id") or f"srvtoolu_{len(blocks) // 2}")
+        input_obj = event.get("input") if isinstance(event.get("input"), dict) else {"query": ""}
+        result_content = event.get("content") if isinstance(event.get("content"), list) else []
+        blocks.append({"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": input_obj})
+        blocks.append({"type": "web_search_tool_result", "tool_use_id": tool_id, "content": result_content})
+    return blocks
+
+
+def _merge_server_tool_usage(
+    usage: dict[str, Any],
+    raw: dict | None,
+    web_search_requests: int,
+) -> dict[str, Any]:
+    events = raw.get("events") if isinstance(raw, dict) else None
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict) or event.get("type") != "finish":
+                continue
+            raw_usage = event.get("usage")
+            if isinstance(raw_usage, dict) and "server_tool_use" in raw_usage:
+                usage["server_tool_use"] = raw_usage["server_tool_use"]
+                return usage
+    if web_search_requests > 0 and "server_tool_use" not in usage:
+        usage["server_tool_use"] = {"web_search_requests": web_search_requests}
+    return usage
 
 
 def _map_stop_reason(finish_reason: str, has_tool_calls: bool) -> str:
@@ -335,6 +422,7 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
     block_index = 0
     current_block: str | None = None  # "thinking", "text", "tool_use"
     has_any_content = False
+    web_search_requests = 0
 
     for event in events:
         typ = event.get("type")
@@ -415,6 +503,46 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             block_index += 1
             current_block = None
 
+        elif typ == "web_search_call":
+            has_any_content = True
+            web_search_requests += 1
+            if current_block is not None:
+                if current_block == "thinking":
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                    })
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                block_index += 1
+            tool_id = str(event.get("id") or "")
+            tool_input = event.get("input") if isinstance(event.get("input"), dict) else {"query": ""}
+            result_content = event.get("content") if isinstance(event.get("content"), list) else []
+            yield _sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}},
+            })
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)},
+            })
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            block_index += 1
+            yield _sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_content,
+                },
+            })
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            block_index += 1
+            current_block = None
+
         elif typ == "finish":
             if current_block is not None:
                 if current_block == "thinking":
@@ -440,9 +568,18 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             yield _sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": _anthropic_usage_from_provider(event.get("usage")),
+                "usage": _usage_with_synthesized_web_search(
+                    _anthropic_usage_from_provider(event.get("usage")),
+                    web_search_requests,
+                ),
             })
             yield _sse("message_stop", {"type": "message_stop"})
+
+
+def _usage_with_synthesized_web_search(usage: dict[str, Any], web_search_requests: int) -> dict[str, Any]:
+    if web_search_requests > 0 and "server_tool_use" not in usage:
+        usage["server_tool_use"] = {"web_search_requests": web_search_requests}
+    return usage
 def _sse(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 

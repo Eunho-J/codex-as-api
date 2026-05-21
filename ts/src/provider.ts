@@ -119,7 +119,7 @@ export class ChatGPTOAuthProvider {
       finish_reason: finishReason,
       usage,
       reasoning_content: reasoningParts.join("") || null,
-      raw: { events: rawEvents.slice(-20) },
+      raw: { events: compactRawEvents(rawEvents) },
     };
   }
 
@@ -140,6 +140,7 @@ export class ChatGPTOAuthProvider {
 
     const finalOutput: Record<string, unknown>[] = [];
     const reasoningParts: string[] = [];
+    const yieldedWebSearchIds = new Set<string>();
     let sawTextDelta = false;
     let sawReasoningDelta = false;
 
@@ -169,6 +170,11 @@ export class ChatGPTOAuthProvider {
               name: tool.name,
               arguments: tool.arguments,
             };
+          }
+          const webSearch = webSearchEventFromResponseItem(itemDict);
+          if (webSearch) {
+            yieldedWebSearchIds.add(String(webSearch.id));
+            yield webSearch;
           }
         }
       } else if (typ === "response.reasoning_summary_part.added") {
@@ -215,6 +221,13 @@ export class ChatGPTOAuthProvider {
               if (typeof item === "object" && item !== null) {
                 finalOutput.push(item as Record<string, unknown>);
               }
+            }
+          }
+          for (const item of finalOutput) {
+            const webSearch = webSearchEventFromResponseItem(item, finalOutput);
+            if (webSearch && !yieldedWebSearchIds.has(String(webSearch.id))) {
+              yieldedWebSearchIds.add(String(webSearch.id));
+              yield webSearch;
             }
           }
           if (!sawTextDelta) {
@@ -444,6 +457,9 @@ export class ChatGPTOAuthProvider {
       store: false,
       include: [],
     };
+    if ((payload.tools as Record<string, unknown>[]).some((tool) => tool.type === "web_search")) {
+      payload.include = ["web_search_call.action.sources"];
+    }
     void opts.maxTokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
     if (opts.promptCacheKey)
       payload.prompt_cache_key = opts.promptCacheKey;
@@ -749,6 +765,17 @@ export function messageItem(
 export function toolSchemaToResponseDict(
   tool: ToolSchema,
 ): Record<string, unknown> {
+  if (tool.parameters.__codex_as_api_tool_type === "web_search") {
+    const openaiTool = tool.parameters.openai_tool;
+    if (
+      typeof openaiTool === "object" &&
+      openaiTool !== null &&
+      !Array.isArray(openaiTool)
+    ) {
+      return { ...(openaiTool as Record<string, unknown>) };
+    }
+    return { type: "web_search", external_web_access: true };
+  }
   return {
     type: "function",
     name: tool.name,
@@ -756,6 +783,95 @@ export function toolSchemaToResponseDict(
     parameters: tool.parameters,
     strict: false,
   };
+}
+
+function compactRawEvents(events: Record<string, unknown>[]): Record<string, unknown>[] {
+  const keep = events.filter((event) => event.type === "web_search_call");
+  for (const event of events.slice(-20)) {
+    if (!keep.includes(event)) keep.push(event);
+  }
+  return keep;
+}
+
+export function webSearchEventFromResponseItem(
+  item: Record<string, unknown>,
+  allItems: Record<string, unknown>[] = [],
+): StreamEvent | null {
+  if (item.type !== "web_search_call") return null;
+  const rawId = String(item.id ?? item.call_id ?? crypto.randomUUID().replace(/-/g, ""));
+  const id = rawId.startsWith("srvtoolu_") ? rawId : `srvtoolu_${rawId.replace(/[^A-Za-z0-9_]/g, "")}`;
+  const action = (typeof item.action === "object" && item.action !== null && !Array.isArray(item.action))
+    ? item.action as Record<string, unknown>
+    : {};
+  const query = webSearchQueryFromAction(action);
+  const sources = webSearchSourcesFromAction(action);
+  if (!sources.length && allItems.length) {
+    sources.push(...webSearchSourcesFromAnnotations(allItems));
+  }
+  return {
+    type: "web_search_call",
+    id,
+    input: { query },
+    content: sources,
+  };
+}
+
+function webSearchQueryFromAction(action: Record<string, unknown>): string {
+  const query = action.query;
+  if (typeof query === "string") return query;
+  const queries = action.queries;
+  if (Array.isArray(queries)) {
+    const first = queries.find((q): q is string => typeof q === "string" && q.length > 0);
+    if (first) return first;
+  }
+  const url = action.url;
+  if (typeof url === "string") return url;
+  return "";
+}
+
+function webSearchSourcesFromAction(action: Record<string, unknown>): Record<string, unknown>[] {
+  return normalizeWebSearchSources(action.sources);
+}
+
+function webSearchSourcesFromAnnotations(items: Record<string, unknown>[]): Record<string, unknown>[] {
+  const rawSources: Record<string, unknown>[] = [];
+  for (const item of items) {
+    const content = item.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (typeof part !== "object" || part === null) continue;
+      const annotations = (part as Record<string, unknown>).annotations;
+      if (!Array.isArray(annotations)) continue;
+      for (const ann of annotations) {
+        if (typeof ann !== "object" || ann === null) continue;
+        const a = ann as Record<string, unknown>;
+        if (a.type !== "url_citation") continue;
+        rawSources.push(a);
+      }
+    }
+  }
+  return normalizeWebSearchSources(rawSources);
+}
+
+function normalizeWebSearchSources(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  const out: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const source of value) {
+    if (typeof source !== "object" || source === null) continue;
+    const s = source as Record<string, unknown>;
+    const url = typeof s.url === "string" ? s.url : "";
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    const result: Record<string, unknown> = {
+      type: "web_search_result",
+      url,
+      title: typeof s.title === "string" ? s.title : url,
+    };
+    if (typeof s.page_age === "string") result.page_age = s.page_age;
+    out.push(result);
+  }
+  return out;
 }
 
 export function setReasoningPayload(

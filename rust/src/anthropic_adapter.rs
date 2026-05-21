@@ -301,6 +301,14 @@ fn convert_tools(tools: &[Value]) -> Vec<ToolSchema> {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
+        if is_anthropic_web_search_tool(tool) {
+            result.push(ToolSchema {
+                name: "web_search".to_string(),
+                description: "Anthropic hosted web search".to_string(),
+                parameters: anthropic_web_search_parameters(tool),
+            });
+            continue;
+        }
         let description = tool
             .get("description")
             .and_then(|v| v.as_str())
@@ -319,6 +327,50 @@ fn convert_tools(tools: &[Value]) -> Vec<ToolSchema> {
     result
 }
 
+fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+    tool.get("name").and_then(|v| v.as_str()) == Some("web_search")
+        && tool
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.starts_with("web_search_"))
+            .unwrap_or(false)
+}
+
+fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    let arr = value?.as_array()?;
+    let out: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .collect();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn anthropic_web_search_parameters(tool: &Value) -> Value {
+    if string_array(tool.get("blocked_domains")).is_some() {
+        return json!({
+            "__codex_as_api_tool_type": "web_search",
+            "__codex_as_api_error": "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; use allowed_domains instead",
+        });
+    }
+    let mut openai_tool = serde_json::Map::new();
+    openai_tool.insert("type".to_string(), json!("web_search"));
+    openai_tool.insert("external_web_access".to_string(), json!(true));
+    if let Some(allowed) = string_array(tool.get("allowed_domains")) {
+        openai_tool.insert("filters".to_string(), json!({"allowed_domains": allowed}));
+    }
+    if let Some(user_location) = tool.get("user_location").filter(|v| v.is_object()) {
+        openai_tool.insert("user_location".to_string(), user_location.clone());
+    }
+    json!({
+        "__codex_as_api_tool_type": "web_search",
+        "openai_tool": Value::Object(openai_tool),
+        "anthropic": {
+            "type": tool.get("type").cloned().unwrap_or(Value::Null),
+            "max_uses": tool.get("max_uses").cloned().unwrap_or(Value::Null),
+        },
+    })
+}
+
 fn convert_tool_choice(tc: &Value) -> Value {
     let tc_type = tc.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match tc_type {
@@ -326,7 +378,11 @@ fn convert_tool_choice(tc: &Value) -> Value {
         "any" => json!("required"),
         "tool" => {
             let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            json!({"type": "function", "function": {"name": name}})
+            if name == "web_search" {
+                json!({"type": "web_search"})
+            } else {
+                json!({"type": "function", "name": name})
+            }
         }
         "none" => json!("none"),
         _ => json!("auto"),
@@ -356,6 +412,9 @@ pub fn internal_response_to_anthropic(
         }));
     }
 
+    let web_search_blocks = web_search_blocks_from_raw(response.raw.as_ref());
+    content.extend(web_search_blocks.clone());
+
     if !response.content.is_empty() {
         content.push(json!({"type": "text", "text": response.content}));
     }
@@ -371,7 +430,7 @@ pub fn internal_response_to_anthropic(
 
     let stop_reason = map_stop_reason(&response.finish_reason, !response.tool_calls.is_empty());
 
-    let usage_dict = match &response.usage {
+    let mut usage_dict = match &response.usage {
         Some(u) => json!({
             "input_tokens": u.prompt_tokens,
             "output_tokens": u.completion_tokens,
@@ -380,6 +439,7 @@ pub fn internal_response_to_anthropic(
         }),
         None => json!({"input_tokens": 0, "output_tokens": 0}),
     };
+    usage_dict = merge_server_tool_usage(usage_dict, response.raw.as_ref(), web_search_blocks.len() / 2);
 
     if content.is_empty() {
         content.push(json!({"type": "text", "text": ""}));
@@ -395,6 +455,60 @@ pub fn internal_response_to_anthropic(
         "stop_sequence": null,
         "usage": usage_dict,
     })
+}
+
+fn web_search_blocks_from_raw(raw: Option<&Value>) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    let Some(events) = raw
+        .and_then(|r| r.get("events"))
+        .and_then(|v| v.as_array()) else {
+        return blocks;
+    };
+    for event in events {
+        if event.get("type").and_then(|v| v.as_str()) != Some("web_search_call") {
+            continue;
+        }
+        let tool_id = event
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("srvtoolu_{}", blocks.len() / 2));
+        let input = event.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({"query": ""}));
+        let content = event.get("content").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]));
+        blocks.push(json!({"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": input}));
+        blocks.push(json!({"type": "web_search_tool_result", "tool_use_id": tool_id, "content": content}));
+    }
+    blocks
+}
+
+fn merge_server_tool_usage(mut usage: Value, raw: Option<&Value>, web_search_requests: usize) -> Value {
+    if let Some(events) = raw
+        .and_then(|r| r.get("events"))
+        .and_then(|v| v.as_array())
+    {
+        for event in events {
+            if event.get("type").and_then(|v| v.as_str()) != Some("finish") {
+                continue;
+            }
+            if let Some(server_tool_use) = event
+                .get("usage")
+                .and_then(|u| u.get("server_tool_use"))
+                .cloned()
+            {
+                if let Some(map) = usage.as_object_mut() {
+                    map.insert("server_tool_use".to_string(), server_tool_use);
+                }
+                return usage;
+            }
+        }
+    }
+    if web_search_requests > 0 {
+        if let Some(map) = usage.as_object_mut() {
+            map.entry("server_tool_use".to_string())
+                .or_insert_with(|| json!({"web_search_requests": web_search_requests}));
+        }
+    }
+    usage
 }
 
 fn map_stop_reason(finish_reason: &str, has_tool_calls: bool) -> &'static str {
@@ -421,6 +535,7 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
     let mut block_index: u32 = 0;
     let mut current_block: Option<&'static str> = None;
     let mut has_any_content = false;
+    let mut web_search_requests: usize = 0;
 
     for event in events {
         let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -569,6 +684,73 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                 current_block = None;
             }
 
+            "web_search_call" => {
+                has_any_content = true;
+                web_search_requests += 1;
+                if let Some(cb) = current_block {
+                    if cb == "thinking" {
+                        out.push(sse(
+                            "content_block_delta",
+                            &json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                            }),
+                        ));
+                    }
+                    out.push(sse(
+                        "content_block_stop",
+                        &json!({"type": "content_block_stop", "index": block_index}),
+                    ));
+                    block_index += 1;
+                }
+                let tool_id = event.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_input = event.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({"query": ""}));
+                let result_content = event.get("content").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]));
+                out.push(sse(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}},
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": serde_json::to_string(&tool_input).unwrap_or_else(|_| "{}".to_string()),
+                        },
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block_index}),
+                ));
+                block_index += 1;
+                out.push(sse(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": tool_id,
+                            "content": result_content,
+                        },
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block_index}),
+                ));
+                block_index += 1;
+                current_block = None;
+            }
+
             "finish" => {
                 if let Some(cb) = current_block {
                     if cb == "thinking" {
@@ -614,10 +796,10 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                     &json!({
                         "type": "message_delta",
                         "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                        "usage": event
+                        "usage": usage_with_synthesized_web_search(event
                             .get("usage")
                             .map(anthropic_usage_from_provider)
-                            .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0})),
+                            .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0})), web_search_requests),
                     }),
                 ));
                 out.push(sse("message_stop", &json!({"type": "message_stop"})));
@@ -628,6 +810,16 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
     }
 
     out
+}
+
+fn usage_with_synthesized_web_search(mut usage: Value, web_search_requests: usize) -> Value {
+    if web_search_requests > 0 {
+        if let Some(map) = usage.as_object_mut() {
+            map.entry("server_tool_use".to_string())
+                .or_insert_with(|| json!({"web_search_requests": web_search_requests}));
+        }
+    }
+    usage
 }
 
 fn message_start_sse(model: &str, request_id: &str, usage: &Value) -> String {
@@ -955,8 +1147,15 @@ mod tests {
         let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(
             tc,
-            Some(json!({"type": "function", "function": {"name": "my_fn"}}))
+            Some(json!({"type": "function", "name": "my_fn"}))
         );
+    }
+
+    #[test]
+    fn test_tool_choice_web_search() {
+        let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "web_search"}});
+        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        assert_eq!(tc, Some(json!({"type": "web_search"})));
     }
 
     #[test]

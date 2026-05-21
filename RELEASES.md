@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.4.0
+
+### Anthropic hosted web search compatibility
+- Route Anthropic `web_search_*` server tools to the OpenAI Responses hosted `web_search` tool instead of treating them as function tools.
+- Convert hosted web search calls back into Anthropic `server_tool_use` and `web_search_tool_result` blocks for Claude Code compatibility.
+- Preserve or synthesize `usage.server_tool_use.web_search_requests` and cover the behavior across Python, TypeScript, and Rust.
+
+### Package publishing preparation
+- Add a GitHub Actions workflow that builds/tests the TypeScript package and can publish to npmjs (`codex-as-api`) and GitHub Packages (`@eunho-j/codex-as-api`) by manual dispatch.
+
+### Validation
+- Python: `.venv/bin/pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build`
+
 ## v0.3.3
 
 ### Claude Code retry fix

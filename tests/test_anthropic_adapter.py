@@ -167,7 +167,48 @@ class TestAnthropicRequestToInternal:
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "tool", "name": "get_weather"},
         )
-        assert tc == {"type": "function", "function": {"name": "get_weather"}}
+        assert tc == {"type": "function", "name": "get_weather"}
+
+    def test_web_search_tool_conversion(self):
+        _, tools, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{
+                "type": "web_search_20260209",
+                "name": "web_search",
+                "allowed_domains": ["example.com"],
+                "max_uses": 8,
+                "user_location": {"type": "approximate", "country": "US"},
+            }],
+        )
+        assert tools is not None
+        assert tools[0].name == "web_search"
+        assert tools[0].parameters["__codex_as_api_tool_type"] == "web_search"
+        assert tools[0].parameters["openai_tool"]["type"] == "web_search"
+        assert tools[0].parameters["openai_tool"]["external_web_access"] is True
+        assert tools[0].parameters["openai_tool"]["filters"] == {"allowed_domains": ["example.com"]}
+        assert tools[0].parameters["openai_tool"]["user_location"] == {"type": "approximate", "country": "US"}
+
+    def test_web_search_blocked_domains_raises(self):
+        import pytest
+        with pytest.raises(ValueError, match="blocked_domains"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "blocked_domains": ["example.com"],
+                }],
+            )
+
+    def test_web_search_tool_choice(self):
+        _, _, tc, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tool_choice={"type": "tool", "name": "web_search"},
+        )
+        assert tc == {"type": "web_search"}
 
     def test_tool_choice_none(self):
         _, _, tc, _, _ = anthropic_request_to_internal(
@@ -367,6 +408,30 @@ class TestInternalResponseToAnthropic:
         result = internal_response_to_anthropic(resp, "m", "msg_1")
         assert result["usage"]["cache_read_input_tokens"] == 50
 
+    def test_web_search_blocks_before_text(self):
+        resp = AssistantResponse(
+            content="Final answer",
+            tool_calls=(),
+            finish_reason="stop",
+            usage=None,
+            reasoning_content=None,
+            raw={"events": [{
+                "type": "web_search_call",
+                "id": "srvtoolu_ws1",
+                "input": {"query": "latest news"},
+                "content": [{"type": "web_search_result", "url": "https://example.com", "title": "Example"}],
+            }]},
+        )
+        result = internal_response_to_anthropic(resp, "m", "msg_1")
+        assert [block["type"] for block in result["content"]] == [
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        assert result["content"][0]["name"] == "web_search"
+        assert result["content"][1]["tool_use_id"] == "srvtoolu_ws1"
+        assert result["usage"]["server_tool_use"] == {"web_search_requests": 1}
+
 
 # ---------------------------------------------------------------------------
 # Streaming adapter
@@ -509,6 +574,27 @@ class TestAnthropicStreamAdapter:
         # Verify indices are sequential
         assert block_starts[0]["index"] == 0
         assert block_starts[1]["index"] == 1
+
+    def test_web_search_call_stream(self):
+        events = [
+            {
+                "type": "web_search_call",
+                "id": "srvtoolu_ws1",
+                "input": {"query": "current time"},
+                "content": [{"type": "web_search_result", "url": "https://example.com", "title": "Example"}],
+            },
+            {"type": "content", "text": "It is noon."},
+            {"type": "finish", "finish_reason": "stop"},
+        ]
+        result = self._collect_events(events)
+        block_starts = [e for e in result if e["type"] == "content_block_start"]
+        assert [e["content_block"]["type"] for e in block_starts] == [
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        msg_delta = [e for e in result if e["type"] == "message_delta"][0]
+        assert msg_delta["usage"]["server_tool_use"] == {"web_search_requests": 1}
 
 
 # ---------------------------------------------------------------------------

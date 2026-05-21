@@ -192,6 +192,14 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
     if (typeof tool !== "object" || tool === null) continue;
     const name = tool.name;
     if (!name) continue;
+    if (isAnthropicWebSearchTool(tool)) {
+      result.push({
+        name: "web_search",
+        description: "Anthropic hosted web search",
+        parameters: anthropicWebSearchParameters(tool),
+      });
+      continue;
+    }
     result.push({
       name: String(name),
       description: String(tool.description ?? ""),
@@ -203,6 +211,52 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
   return result;
 }
 
+function isAnthropicWebSearchTool(tool: Record<string, unknown>): boolean {
+  return tool.name === "web_search" &&
+    typeof tool.type === "string" &&
+    tool.type.startsWith("web_search_");
+}
+
+function stringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const result = value.filter((v): v is string => typeof v === "string" && v.length > 0);
+  return result.length ? result : null;
+}
+
+function anthropicWebSearchParameters(tool: Record<string, unknown>): Record<string, unknown> {
+  const blockedDomains = stringArray(tool.blocked_domains);
+  if (blockedDomains) {
+    throw new Error(
+      "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; use allowed_domains instead",
+    );
+  }
+
+  const openaiTool: Record<string, unknown> = {
+    type: "web_search",
+    external_web_access: true,
+  };
+  const allowedDomains = stringArray(tool.allowed_domains);
+  if (allowedDomains) {
+    openaiTool.filters = { allowed_domains: allowedDomains };
+  }
+  if (
+    typeof tool.user_location === "object" &&
+    tool.user_location !== null &&
+    !Array.isArray(tool.user_location)
+  ) {
+    openaiTool.user_location = tool.user_location;
+  }
+
+  return {
+    __codex_as_api_tool_type: "web_search",
+    openai_tool: openaiTool,
+    anthropic: {
+      type: tool.type,
+      max_uses: tool.max_uses,
+    },
+  };
+}
+
 function convertToolChoice(
   tc: Record<string, unknown> | null,
 ): string | Record<string, unknown> | null {
@@ -210,7 +264,10 @@ function convertToolChoice(
   const tcType = tc.type;
   if (tcType === "auto") return "auto";
   if (tcType === "any") return "required";
-  if (tcType === "tool") return { type: "function", function: { name: tc.name } };
+  if (tcType === "tool") {
+    if (tc.name === "web_search") return { type: "web_search" };
+    return { type: "function", name: tc.name };
+  }
   if (tcType === "none") return "none";
   return "auto";
 }
@@ -241,6 +298,9 @@ export function internalResponseToAnthropic(
     });
   }
 
+  const webSearchBlocks = webSearchBlocksFromRaw(response.raw);
+  content.push(...webSearchBlocks);
+
   if (response.content) {
     content.push({ type: "text", text: response.content });
   }
@@ -265,6 +325,7 @@ export function internalResponseToAnthropic(
       cache_read_input_tokens: response.usage.cached_tokens,
     };
   }
+  usageDict = mergeServerToolUsage(usageDict, response.raw, webSearchBlocks.length / 2);
 
   if (!content.length) {
     content.push({ type: "text", text: "" });
@@ -280,6 +341,48 @@ export function internalResponseToAnthropic(
     stop_sequence: null,
     usage: usageDict,
   };
+}
+
+function webSearchBlocksFromRaw(raw: Record<string, unknown> | null): Record<string, unknown>[] {
+  const events = Array.isArray(raw?.events) ? raw.events : [];
+  const blocks: Record<string, unknown>[] = [];
+  for (const event of events) {
+    if (typeof event !== "object" || event === null) continue;
+    const e = event as Record<string, unknown>;
+    if (e.type !== "web_search_call") continue;
+    const id = String(e.id || `srvtoolu_${blocks.length / 2}`);
+    const input = (typeof e.input === "object" && e.input !== null && !Array.isArray(e.input))
+      ? e.input
+      : { query: "" };
+    const content = Array.isArray(e.content) ? e.content : [];
+    blocks.push({ type: "server_tool_use", id, name: "web_search", input });
+    blocks.push({ type: "web_search_tool_result", tool_use_id: id, content });
+  }
+  return blocks;
+}
+
+function mergeServerToolUsage(
+  usage: Record<string, unknown>,
+  raw: Record<string, unknown> | null,
+  webSearchRequests: number,
+): Record<string, unknown> {
+  const events = Array.isArray(raw?.events) ? raw.events : [];
+  for (const event of events) {
+    if (typeof event !== "object" || event === null) continue;
+    const e = event as Record<string, unknown>;
+    if (e.type !== "finish") continue;
+    const rawUsage = e.usage;
+    if (typeof rawUsage !== "object" || rawUsage === null || Array.isArray(rawUsage)) continue;
+    const serverToolUse = (rawUsage as Record<string, unknown>).server_tool_use;
+    if (serverToolUse !== undefined) {
+      usage.server_tool_use = serverToolUse;
+      return usage;
+    }
+  }
+  if (webSearchRequests > 0 && usage.server_tool_use === undefined) {
+    usage.server_tool_use = { web_search_requests: webSearchRequests };
+  }
+  return usage;
 }
 
 function mapStopReason(finishReason: string, hasToolCalls: boolean): string {
@@ -370,6 +473,7 @@ async function* renderAnthropicStreamEvents(
   let blockIndex = 0;
   let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let hasAnyContent = false;
+  let webSearchRequests = 0;
 
   for await (const event of events) {
     const typ = event.type;
@@ -455,6 +559,49 @@ async function* renderAnthropicStreamEvents(
       yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
       blockIndex++;
       currentBlock = null;
+    } else if (typ === "web_search_call") {
+      hasAnyContent = true;
+      webSearchRequests++;
+      if (currentBlock !== null) {
+        if (currentBlock === "thinking") {
+          yield sse("content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "signature_delta", signature: "sig-placeholder" },
+          });
+        }
+        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+        blockIndex++;
+      }
+      const toolId = String(event.id ?? "");
+      const toolInput = (typeof event.input === "object" && event.input !== null
+        ? event.input
+        : { query: "" }) as Record<string, unknown>;
+      const resultContent = Array.isArray(event.content) ? event.content : [];
+      yield sse("content_block_start", {
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: { type: "server_tool_use", id: toolId, name: "web_search", input: {} },
+      });
+      yield sse("content_block_delta", {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(toolInput) },
+      });
+      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+      blockIndex++;
+      yield sse("content_block_start", {
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: {
+          type: "web_search_tool_result",
+          tool_use_id: toolId,
+          content: resultContent,
+        },
+      });
+      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+      blockIndex++;
+      currentBlock = null;
     } else if (typ === "finish") {
       if (currentBlock !== null) {
         if (currentBlock === "thinking") {
@@ -483,11 +630,21 @@ async function* renderAnthropicStreamEvents(
       yield sse("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: usageFromProviderEvent(event.usage),
+        usage: usageWithSynthesizedWebSearch(usageFromProviderEvent(event.usage), webSearchRequests),
       });
       yield sse("message_stop", { type: "message_stop" });
     }
   }
+}
+
+function usageWithSynthesizedWebSearch(
+  usage: Record<string, unknown>,
+  webSearchRequests: number,
+): Record<string, unknown> {
+  if (webSearchRequests > 0 && usage.server_tool_use === undefined) {
+    usage.server_tool_use = { web_search_requests: webSearchRequests };
+  }
+  return usage;
 }
 function sse(eventType: string, data: Record<string, unknown>): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;

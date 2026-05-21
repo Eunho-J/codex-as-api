@@ -119,7 +119,7 @@ class ChatGPTOAuthProvider:
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
-            raw={"events": raw_events[-20:]},
+            raw={"events": _compact_raw_events(raw_events)},
         )
 
     def chat_stream(
@@ -164,6 +164,7 @@ class ChatGPTOAuthProvider:
         stream = self._post_sse("/responses", payload, extra_headers=extra_headers)
         final_output: list[dict[str, Any]] = []
         reasoning_parts: list[str] = []
+        yielded_web_search_ids: set[str] = set()
         saw_text_delta = False
         saw_reasoning_delta = False
         for event in stream:
@@ -180,6 +181,10 @@ class ChatGPTOAuthProvider:
                     tool = _tool_call_from_response_item(item)
                     if tool is not None:
                         yield {"type": "tool_call", "id": tool.id, "name": tool.name, "arguments": tool.arguments}
+                    web_search = _web_search_event_from_response_item(item)
+                    if web_search is not None:
+                        yielded_web_search_ids.add(str(web_search["id"]))
+                        yield web_search
             elif typ == "response.reasoning_summary_part.added":
                 yield {
                     "type": "reasoning_section_break",
@@ -216,6 +221,11 @@ class ChatGPTOAuthProvider:
                     usage = response.get("usage")
                     if not final_output and isinstance(response.get("output"), list):
                         final_output.extend(item for item in response["output"] if isinstance(item, dict))
+                    for item in final_output:
+                        web_search = _web_search_event_from_response_item(item, final_output)
+                        if web_search is not None and str(web_search["id"]) not in yielded_web_search_ids:
+                            yielded_web_search_ids.add(str(web_search["id"]))
+                            yield web_search
                     if not saw_text_delta:
                         final_text = _text_from_response_items(final_output)
                         if final_text:
@@ -399,6 +409,8 @@ class ChatGPTOAuthProvider:
             "store": False,
             "include": [],
         }
+        if any(tool.get("type") == "web_search" for tool in payload["tools"]):
+            payload["include"] = ["web_search_call.action.sources"]
         if prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
         if stop is not None:
@@ -614,7 +626,100 @@ def _message_item(role: str, content: str, images: tuple[str, ...] = ()) -> dict
 
 
 def _tool_schema_to_response_dict(tool: ToolSchema) -> dict[str, Any]:
+    if tool.parameters.get("__codex_as_api_tool_type") == "web_search":
+        openai_tool = tool.parameters.get("openai_tool")
+        if isinstance(openai_tool, dict):
+            return dict(openai_tool)
+        return {"type": "web_search", "external_web_access": True}
     return {"type": "function", "name": tool.name, "description": tool.description, "parameters": tool.parameters, "strict": False}
+
+
+def _compact_raw_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    keep = [event for event in events if event.get("type") == "web_search_call"]
+    for event in events[-20:]:
+        if event not in keep:
+            keep.append(event)
+    return keep
+
+
+def _web_search_event_from_response_item(
+    item: dict[str, Any],
+    all_items: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any] | None:
+    if item.get("type") != "web_search_call":
+        return None
+    raw_id = str(item.get("id") or item.get("call_id") or uuid.uuid4().hex)
+    tool_id = raw_id if raw_id.startswith("srvtoolu_") else "srvtoolu_" + "".join(
+        ch for ch in raw_id if ch.isalnum() or ch == "_"
+    )
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    sources = _web_search_sources_from_action(action)
+    if not sources and all_items:
+        sources.extend(_web_search_sources_from_annotations(all_items))
+    return {
+        "type": "web_search_call",
+        "id": tool_id,
+        "input": {"query": _web_search_query_from_action(action)},
+        "content": sources,
+    }
+
+
+def _web_search_query_from_action(action: dict[str, Any]) -> str:
+    query = action.get("query")
+    if isinstance(query, str):
+        return query
+    queries = action.get("queries")
+    if isinstance(queries, list):
+        for q in queries:
+            if isinstance(q, str) and q:
+                return q
+    url = action.get("url")
+    return url if isinstance(url, str) else ""
+
+
+def _web_search_sources_from_action(action: dict[str, Any]) -> list[dict[str, Any]]:
+    return _normalize_web_search_sources(action.get("sources"))
+
+
+def _web_search_sources_from_annotations(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_sources: list[dict[str, Any]] = []
+    for item in items:
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            annotations = part.get("annotations")
+            if not isinstance(annotations, list):
+                continue
+            for ann in annotations:
+                if isinstance(ann, dict) and ann.get("type") == "url_citation":
+                    raw_sources.append(ann)
+    return _normalize_web_search_sources(raw_sources)
+
+
+def _normalize_web_search_sources(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in value:
+        if not isinstance(source, dict):
+            continue
+        url = source.get("url")
+        if not isinstance(url, str) or not url or url in seen:
+            continue
+        seen.add(url)
+        result: dict[str, Any] = {
+            "type": "web_search_result",
+            "url": url,
+            "title": source.get("title") if isinstance(source.get("title"), str) else url,
+        }
+        if isinstance(source.get("page_age"), str):
+            result["page_age"] = source["page_age"]
+        out.append(result)
+    return out
 
 
 def _set_reasoning_payload(payload: dict[str, Any], reasoning_effort: str | None) -> None:
