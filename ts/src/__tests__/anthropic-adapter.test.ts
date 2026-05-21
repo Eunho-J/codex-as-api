@@ -169,6 +169,47 @@ describe("anthropicRequestToInternal", () => {
     assert.equal(messages[0].content, "The answer is 42.");
   });
 
+  it("preserves assistant server web-search history as context text", () => {
+    const { messages } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{
+        role: "assistant",
+        content: [
+          { type: "server_tool_use", id: "srv_1", name: "web_search", input: { query: "codex" } },
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "srv_1",
+            content: [{ title: "Codex", url: "https://example.com", page_age: "1d" }],
+          },
+          { type: "text", text: "Summary" },
+        ],
+      }],
+    });
+    assert.match(messages[0].content, /server_tool_use: web_search/);
+    assert.match(messages[0].content, /https:\/\/example.com/);
+    assert.match(messages[0].content, /Summary/);
+  });
+
+  it("preserves non-text tool_result blocks as text context", () => {
+    const { messages } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "call-1",
+          content: [
+            { type: "search_result", title: "Docs", url: "https://docs.example", content: "body" },
+            { type: "document", title: "Spec", source: { type: "text", data: "document body" } },
+          ],
+        }],
+      }],
+    });
+    assert.equal(messages[0].role, MessageRole.TOOL);
+    assert.match(messages[0].content, /Docs/);
+    assert.match(messages[0].content, /document body/);
+  });
+
   it("tools conversion", () => {
     const { tools } = anthropicRequestToInternal({
       model: "test",
@@ -234,6 +275,15 @@ describe("anthropicRequestToInternal", () => {
     assert.deepEqual(openaiTool.user_location, { type: "approximate", country: "US" });
   });
 
+  it("converts unsuffixed Anthropic web_search server tool", () => {
+    const { tools } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "web_search", name: "web_search" }],
+    });
+    assert.equal(tools?.[0].parameters.__codex_as_api_tool_type, "web_search");
+  });
+
   it("rejects unsupported Anthropic web_search blocked_domains", () => {
     assert.throws(() => anthropicRequestToInternal({
       model: "test",
@@ -289,6 +339,27 @@ describe("anthropicRequestToInternal", () => {
       thinking: { type: "disabled" },
     });
     assert.equal(reasoningEffort, null);
+  });
+
+  it("maps Anthropic output_format to OpenAI Responses text.format", () => {
+    const { text } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      outputFormat: {
+        type: "json_schema",
+        name: "my schema!",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        strict: false,
+      },
+    });
+    assert.deepEqual(text, {
+      format: {
+        type: "json_schema",
+        name: "my_schema_",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        strict: false,
+      },
+    });
   });
 
   it("stop sequences", () => {

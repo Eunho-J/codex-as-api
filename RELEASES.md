@@ -1,5 +1,25 @@
 # Release Notes
 
+## v0.5.0
+
+### Claude Code conversation-history compatibility
+- Preserve Anthropic server-tool history blocks (`server_tool_use`, `web_search_tool_result`, and other `*_tool_result` blocks) as backend-readable context instead of silently dropping them on follow-up turns.
+- Preserve `redacted_thinking` placeholders without exposing unavailable reasoning text.
+- Preserve `document` and `search_result` content nested inside `tool_result` blocks.
+- Keep Python Anthropic streaming routes aligned with provider defaults so `text.format` and omitted optional knobs can pass through consistently.
+
+### Structured outputs
+- Map Anthropic `output_format` / `output_config.format`-style JSON schema requests to OpenAI Responses `text.format` for Claude Code side queries.
+- Keep JSON schema names OpenAI-compatible while preserving schema, description, and explicit `strict` settings.
+
+### Web search version tolerance
+- Accept unsuffixed `type: "web_search"` server tools in addition to versioned `web_search_*` tool types.
+
+### Validation
+- Python: `.venv/bin/pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build`
+
 ## v0.4.0
 
 ### Anthropic hosted web search compatibility

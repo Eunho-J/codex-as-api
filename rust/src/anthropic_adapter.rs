@@ -10,6 +10,7 @@ pub fn anthropic_request_to_internal(
     Option<Value>,
     Option<Vec<String>>,
     Option<String>,
+    Option<Value>,
 ) {
     let mut messages: Vec<Message> = Vec::new();
 
@@ -60,8 +61,9 @@ pub fn anthropic_request_to_internal(
         });
 
     let reasoning_effort = body.get("thinking").map(|t| convert_thinking(t)).flatten();
+    let text = anthropic_output_format_from_body(body).and_then(anthropic_output_format_to_openai_text);
 
-    (messages, tools, tool_choice, stop, reasoning_effort)
+    (messages, tools, tool_choice, stop, reasoning_effort, text)
 }
 
 fn extract_system_text(system: &Value) -> String {
@@ -168,7 +170,12 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        let rendered = render_anthropic_content_block(block);
+                        if !rendered.is_empty() {
+                            text_parts.push(rendered);
+                        }
+                    }
                 }
             }
             if !text_parts.is_empty() || !image_urls.is_empty() {
@@ -209,6 +216,11 @@ fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<Stri
                             let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
                             images.push(format!("data:{};base64,{}", media_type, data));
                         }
+                    }
+                } else {
+                    let rendered = render_anthropic_content_block(p);
+                    if !rendered.is_empty() {
+                        text_pieces.push(rendered);
                     }
                 }
             }
@@ -276,7 +288,23 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                             }
                         }
                     }
-                    _ => {}
+                    "redacted_thinking" => {
+                        if reasoning_content.is_none() {
+                            reasoning_content = Some("[redacted_thinking omitted]".to_string());
+                        }
+                    }
+                    "server_tool_use" => {
+                        text_parts.push(render_server_tool_use_block(block));
+                    }
+                    "web_search_tool_result" => {
+                        text_parts.push(render_generic_tool_result_block(block));
+                    }
+                    _ => {
+                        let rendered = render_anthropic_content_block(block);
+                        if !rendered.is_empty() {
+                            text_parts.push(rendered);
+                        }
+                    }
                 }
             }
 
@@ -332,7 +360,7 @@ fn is_anthropic_web_search_tool(tool: &Value) -> bool {
         && tool
             .get("type")
             .and_then(|v| v.as_str())
-            .map(|s| s.starts_with("web_search_"))
+            .map(|s| s == "web_search" || s.starts_with("web_search_"))
             .unwrap_or(false)
 }
 
@@ -395,6 +423,153 @@ fn convert_thinking(thinking: &Value) -> Option<String> {
         Some("adaptive") => Some("medium".to_string()),
         _ => None,
     }
+}
+
+fn anthropic_output_format_from_body(body: &Value) -> Option<&Value> {
+    body.get("output_format").or_else(|| {
+        body.get("output_config")
+            .and_then(|output_config| output_config.get("format"))
+    })
+}
+
+pub fn anthropic_output_format_to_openai_text(output_format: &Value) -> Option<Value> {
+    let typ = output_format.get("type").and_then(|v| v.as_str())?;
+    match typ {
+        "json_schema" => {
+            let schema = output_format.get("schema")?.as_object()?;
+            let name = sanitize_json_schema_name(
+                output_format
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("structured_output"),
+            );
+            let mut format = serde_json::Map::new();
+            format.insert("type".to_string(), json!("json_schema"));
+            format.insert("name".to_string(), json!(name));
+            format.insert("schema".to_string(), Value::Object(schema.clone()));
+            if let Some(description) = output_format.get("description").and_then(|v| v.as_str()) {
+                format.insert("description".to_string(), json!(description));
+            }
+            if let Some(strict) = output_format.get("strict").and_then(|v| v.as_bool()) {
+                format.insert("strict".to_string(), json!(strict));
+            }
+            Some(json!({"format": Value::Object(format)}))
+        }
+        "json_object" => Some(json!({"format": {"type": "json_object"}})),
+        _ => None,
+    }
+}
+
+fn sanitize_json_schema_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "structured_output".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn render_anthropic_content_block(block: &Value) -> String {
+    let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    match typ {
+        "document" => render_document_block(block),
+        "search_result" => render_search_result_block(block),
+        _ if typ.ends_with("_tool_result") => render_generic_tool_result_block(block),
+        _ => format!("\n\n[{}] {}\n", typ, safe_json(block)),
+    }
+}
+
+fn render_document_block(block: &Value) -> String {
+    let title = block
+        .get("title")
+        .or_else(|| block.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("document");
+    let mut body = String::new();
+    if let Some(source) = block.get("source").and_then(|v| v.as_object()) {
+        if source.get("type").and_then(|v| v.as_str()) == Some("text") {
+            body = source.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        } else if source.get("type").and_then(|v| v.as_str()) == Some("url") {
+            body = source.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        } else if let Some(media_type) = source.get("media_type").and_then(|v| v.as_str()) {
+            body = format!("[{}]", media_type);
+        }
+    }
+    if body.is_empty() {
+        format!("\n\n[document: {}]\n", title)
+    } else {
+        format!("\n\n[document: {}]\n{}\n", title, body)
+    }
+}
+
+fn render_search_result_block(block: &Value) -> String {
+    let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("search result");
+    let url = block.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    format!(
+        "\n\n[search_result] {}{}{}\n",
+        title,
+        if url.is_empty() { String::new() } else { format!(" ({})", url) },
+        if content.is_empty() { String::new() } else { format!("\n{}", content) },
+    )
+}
+
+fn render_server_tool_use_block(block: &Value) -> String {
+    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("server_tool");
+    let input = block.get("input").unwrap_or(&Value::Null);
+    format!("\n\n[server_tool_use: {}] {}\n", name, safe_json(input))
+}
+
+fn render_generic_tool_result_block(block: &Value) -> String {
+    let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("tool_result");
+    let Some(content) = block.get("content") else {
+        return format!("\n\n[{}]\n", typ);
+    };
+    if let Some(arr) = content.as_array() {
+        let lines: Vec<String> = arr
+            .iter()
+            .map(|item| {
+                if let Some(obj) = item.as_object() {
+                    let title = obj.get("title").and_then(|v| v.as_str());
+                    let url = obj.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = obj
+                        .get("text")
+                        .or_else(|| obj.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if title.is_some() || !url.is_empty() || !text.is_empty() {
+                        format!(
+                            "- {}{}{}",
+                            title.unwrap_or("result"),
+                            if url.is_empty() { String::new() } else { format!(" ({})", url) },
+                            if text.is_empty() { String::new() } else { format!(": {}", text) },
+                        )
+                    } else {
+                        safe_json(item)
+                    }
+                } else {
+                    item.to_string()
+                }
+            })
+            .collect();
+        if lines.is_empty() {
+            format!("\n\n[{}]\n", typ)
+        } else {
+            format!("\n\n[{}]\n{}\n", typ, lines.join("\n"))
+        }
+    } else if let Some(s) = content.as_str() {
+        format!("\n\n[{}]\n{}\n", typ, s)
+    } else {
+        format!("\n\n[{}] {}\n", typ, safe_json(content))
+    }
+}
+
+fn safe_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 pub fn internal_response_to_anthropic(
@@ -520,6 +695,8 @@ fn map_stop_reason(finish_reason: &str, has_tool_calls: bool) -> &'static str {
         "length" | "max_tokens" => "max_tokens",
         "tool_calls" | "tool_use" => "tool_use",
         "stop_sequence" => "stop_sequence",
+        "pause_turn" => "pause_turn",
+        "refusal" => "refusal",
         _ => "end_turn",
     }
 }
@@ -927,7 +1104,7 @@ mod tests {
             "messages": [],
             "system": "You are a helpful assistant.",
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::System);
         assert_eq!(msgs[0].content, "You are a helpful assistant.");
@@ -942,7 +1119,7 @@ mod tests {
                 {"type": "text", "text": "Part two."},
             ],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs[0].content, "Part one.\n\nPart two.");
     }
 
@@ -955,7 +1132,7 @@ mod tests {
                 {"type": "text", "text": "Only text."},
             ],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs[0].content, "Only text.");
     }
 
@@ -964,7 +1141,7 @@ mod tests {
         let body = json!({
             "messages": [{"role": "user", "content": "Hello"}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::User);
         assert_eq!(msgs[0].content, "Hello");
@@ -978,7 +1155,7 @@ mod tests {
                 {"type": "text", "text": "world"},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello world");
     }
@@ -991,7 +1168,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "call-1", "content": "result"},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::User);
         assert_eq!(msgs[0].content, "Before");
@@ -1010,7 +1187,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].content, "part A part B");
@@ -1025,7 +1202,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].tool_call_id, Some("call-img".to_string()));
@@ -1045,7 +1222,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].content, "file contents");
@@ -1060,7 +1237,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "", "content": "x"},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs[0].tool_call_id, Some("tool-call".to_string()));
     }
 
@@ -1069,7 +1246,7 @@ mod tests {
         let body = json!({
             "messages": [{"role": "assistant", "content": "I can help."}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs[0].role, MessageRole::Assistant);
         assert_eq!(msgs[0].content, "I can help.");
     }
@@ -1082,7 +1259,7 @@ mod tests {
                 {"type": "tool_use", "id": "tc-1", "name": "search", "input": {"q": "rust"}},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(msgs[0].content, "Calling tool.");
         assert_eq!(msgs[0].tool_calls.len(), 1);
         assert_eq!(msgs[0].tool_calls[0].id, "tc-1");
@@ -1101,12 +1278,45 @@ mod tests {
                 {"type": "text", "text": "Answer."},
             ]}],
         });
-        let (msgs, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(
             msgs[0].reasoning_content,
             Some("Let me think...".to_string())
         );
         assert_eq!(msgs[0].content, "Answer.");
+    }
+
+    #[test]
+    fn test_preserves_assistant_server_web_search_history() {
+        let body = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "codex"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
+                    {"title": "Codex", "url": "https://example.com", "page_age": "1d"},
+                ]},
+                {"type": "text", "text": "Summary"},
+            ]}],
+        });
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        assert!(msgs[0].content.contains("server_tool_use: web_search"));
+        assert!(msgs[0].content.contains("https://example.com"));
+        assert!(msgs[0].content.contains("Summary"));
+    }
+
+    #[test]
+    fn test_preserves_non_text_tool_result_blocks() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call-1", "content": [
+                    {"type": "search_result", "title": "Docs", "url": "https://docs.example", "content": "body"},
+                    {"type": "document", "title": "Spec", "source": {"type": "text", "data": "document body"}},
+                ]},
+            ]}],
+        });
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        assert_eq!(msgs[0].role, MessageRole::Tool);
+        assert!(msgs[0].content.contains("Docs"));
+        assert!(msgs[0].content.contains("document body"));
     }
 
     #[test]
@@ -1119,7 +1329,7 @@ mod tests {
                 "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}},
             }],
         });
-        let (_, tools, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body);
         let tools = tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "get_weather");
@@ -1130,21 +1340,21 @@ mod tests {
     #[test]
     fn test_tool_choice_auto() {
         let body = json!({"messages": [], "tool_choice": {"type": "auto"}});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(tc, Some(json!("auto")));
     }
 
     #[test]
     fn test_tool_choice_any() {
         let body = json!({"messages": [], "tool_choice": {"type": "any"}});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(tc, Some(json!("required")));
     }
 
     #[test]
     fn test_tool_choice_tool() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "my_fn"}});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(
             tc,
             Some(json!({"type": "function", "name": "my_fn"}))
@@ -1154,50 +1364,87 @@ mod tests {
     #[test]
     fn test_tool_choice_web_search() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "web_search"}});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(tc, Some(json!({"type": "web_search"})));
     }
 
     #[test]
     fn test_tool_choice_none() {
         let body = json!({"messages": [], "tool_choice": {"type": "none"}});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(tc, Some(json!("none")));
     }
 
     #[test]
     fn test_tool_choice_absent() {
         let body = json!({"messages": []});
-        let (_, _, tc, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(tc, None);
+    }
+
+    #[test]
+    fn test_unsuffixed_web_search_tool_conversion() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"type": "web_search", "name": "web_search"}],
+        });
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body);
+        let tools = tools.unwrap();
+        assert_eq!(
+            tools[0].parameters.get("__codex_as_api_tool_type"),
+            Some(&json!("web_search"))
+        );
     }
 
     #[test]
     fn test_thinking_enabled() {
         let body = json!({"messages": [], "thinking": {"type": "enabled"}});
-        let (_, _, _, _, effort) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
         assert_eq!(effort, Some("high".to_string()));
     }
 
     #[test]
     fn test_thinking_adaptive() {
         let body = json!({"messages": [], "thinking": {"type": "adaptive"}});
-        let (_, _, _, _, effort) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
         assert_eq!(effort, Some("medium".to_string()));
     }
 
     #[test]
     fn test_thinking_disabled() {
         let body = json!({"messages": [], "thinking": {"type": "disabled"}});
-        let (_, _, _, _, effort) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
         assert_eq!(effort, None);
     }
 
     #[test]
     fn test_stop_sequences() {
         let body = json!({"messages": [], "stop_sequences": ["STOP", "END"]});
-        let (_, _, _, stop, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, stop, _, _) = anthropic_request_to_internal(&body);
         assert_eq!(stop, Some(vec!["STOP".to_string(), "END".to_string()]));
+    }
+
+    #[test]
+    fn test_output_format_json_schema_maps_to_text_format() {
+        let body = json!({
+            "messages": [],
+            "output_format": {
+                "type": "json_schema",
+                "name": "my schema!",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
+                "strict": false,
+            },
+        });
+        let (_, _, _, _, _, text) = anthropic_request_to_internal(&body);
+        assert_eq!(
+            text,
+            Some(json!({"format": {
+                "type": "json_schema",
+                "name": "my_schema_",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
+                "strict": false,
+            }}))
+        );
     }
 
     // -----------------------------------------------------------------------

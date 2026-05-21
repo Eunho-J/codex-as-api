@@ -429,6 +429,7 @@ export function createApp(opts?: {
         toolChoice: body.tool_choice,
         stopSequences: body.stop_sequences,
         thinking: body.thinking,
+        outputFormat: anthropicOutputFormatFromBody(body),
       });
       const inputTokens = estimateInputTokens(messages, body);
       res.json({
@@ -459,7 +460,7 @@ export function createApp(opts?: {
         );
       }
 
-      const { messages, tools, toolChoice, stop, reasoningEffort } =
+      const { messages, tools, toolChoice, stop, reasoningEffort, text } =
         anthropicRequestToInternal({
           model: body.model,
           messages: body.messages || [],
@@ -469,6 +470,7 @@ export function createApp(opts?: {
           toolChoice: body.tool_choice,
           stopSequences: body.stop_sequences,
           thinking: body.thinking,
+          outputFormat: anthropicOutputFormatFromBody(body),
         });
 
       const clientModel = body.model || "claude-sonnet-4-5";
@@ -480,6 +482,7 @@ export function createApp(opts?: {
         reasoningEffort: reasoningEffort ?? undefined,
         maxTokens: body.max_tokens,
         stop: stop ?? undefined,
+        text: text ?? undefined,
         subagent,
         memgenRequest,
       };
@@ -537,12 +540,26 @@ function messagesFromCompactBody(body: Record<string, unknown>): {
       thinking: typeof body.thinking === "object" && body.thinking !== null
         ? body.thinking as Record<string, unknown>
         : undefined,
+      outputFormat: anthropicOutputFormatFromBody(body),
     });
     return { messages: converted.messages, reasoningEffort: converted.reasoningEffort };
   }
 
   const rawMessages = Array.isArray(body.messages) ? body.messages as Record<string, unknown>[] : [];
   return { messages: requestMessagesToInternal(rawMessages), reasoningEffort: null };
+}
+
+function anthropicOutputFormatFromBody(body: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (typeof body.output_format === "object" && body.output_format !== null && !Array.isArray(body.output_format)) {
+    return body.output_format as Record<string, unknown>;
+  }
+  if (typeof body.output_config === "object" && body.output_config !== null && !Array.isArray(body.output_config)) {
+    const format = (body.output_config as Record<string, unknown>).format;
+    if (typeof format === "object" && format !== null && !Array.isArray(format)) {
+      return format as Record<string, unknown>;
+    }
+  }
+  return undefined;
 }
 
 
@@ -703,4 +720,3 @@ export function main(): void {
     console.log(`codex-as-api listening on ${HOST}:${PORT}`);
   });
 }
-

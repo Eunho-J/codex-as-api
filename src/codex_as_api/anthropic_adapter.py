@@ -21,10 +21,11 @@ def anthropic_request_to_internal(
     tool_choice: dict[str, Any] | None = None,
     stop_sequences: list[str] | None = None,
     thinking: dict[str, Any] | None = None,
-) -> tuple[list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None]:
+    output_format: dict[str, Any] | None = None,
+) -> tuple[list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None]:
     """Convert Anthropic Messages request fields to internal types.
 
-    Returns (messages, tools, tool_choice, stop, reasoning_effort).
+    Returns (messages, tools, tool_choice, stop, reasoning_effort, text).
     """
     internal_messages: list[Message] = []
 
@@ -51,8 +52,9 @@ def anthropic_request_to_internal(
 
     # Convert thinking → reasoning_effort
     reasoning_effort = _convert_thinking(thinking)
+    text = anthropic_output_format_to_openai_text(output_format)
 
-    return internal_messages, internal_tools, internal_tool_choice, stop_sequences, reasoning_effort
+    return internal_messages, internal_tools, internal_tool_choice, stop_sequences, reasoning_effort, text
 
 
 def _extract_system_text(system: str | list[dict[str, Any]]) -> str:
@@ -106,6 +108,10 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                             media_type = source.get("media_type", "image/png")
                             data = source.get("data", "")
                             tool_result_images.append(f"data:{media_type};base64,{data}")
+                    else:
+                        rendered = _render_anthropic_content_block(p)
+                        if rendered:
+                            text_pieces.append(rendered)
                 result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
                 result_content = str(result_content) if result_content else ""
@@ -127,6 +133,10 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 media_type = source.get("media_type", "image/png")
                 data = source.get("data", "")
                 image_urls.append(f"data:{media_type};base64,{data}")
+        else:
+            rendered = _render_anthropic_content_block(block)
+            if rendered:
+                text_parts.append(rendered)
     if text_parts or image_urls:
         out.append(Message(
             role=MessageRole.USER,
@@ -160,6 +170,17 @@ def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Me
             thinking_text = block.get("thinking")
             if isinstance(thinking_text, str) and thinking_text:
                 reasoning_content = thinking_text
+        elif block_type == "redacted_thinking":
+            if reasoning_content is None:
+                reasoning_content = "[redacted_thinking omitted]"
+        elif block_type == "server_tool_use":
+            text_parts.append(_render_server_tool_use_block(block))
+        elif block_type == "web_search_tool_result":
+            text_parts.append(_render_generic_tool_result_block(block))
+        else:
+            rendered = _render_anthropic_content_block(block)
+            if rendered:
+                text_parts.append(rendered)
     out.append(Message(
         role=MessageRole.ASSISTANT,
         content="".join(text_parts),
@@ -195,7 +216,7 @@ def _is_anthropic_web_search_tool(tool: dict[str, Any]) -> bool:
     return (
         tool.get("name") == "web_search"
         and isinstance(tool.get("type"), str)
-        and tool["type"].startswith("web_search_")
+        and (tool["type"] == "web_search" or tool["type"].startswith("web_search_"))
     )
 
 
@@ -255,6 +276,103 @@ def _convert_thinking(thinking: dict[str, Any] | None) -> str | None:
     if thinking.get("type") == "adaptive":
         return "medium"
     return None
+
+
+def anthropic_output_format_to_openai_text(output_format: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(output_format, dict):
+        return None
+    typ = output_format.get("type")
+    if typ == "json_schema":
+        schema = output_format.get("schema")
+        if not isinstance(schema, dict):
+            return None
+        name = _sanitize_json_schema_name(str(output_format.get("name") or "structured_output"))
+        fmt: dict[str, Any] = {
+            "type": "json_schema",
+            "name": name,
+            "schema": schema,
+        }
+        if isinstance(output_format.get("description"), str):
+            fmt["description"] = output_format["description"]
+        if isinstance(output_format.get("strict"), bool):
+            fmt["strict"] = output_format["strict"]
+        return {"format": fmt}
+    if typ == "json_object":
+        return {"format": {"type": "json_object"}}
+    return None
+
+
+def _sanitize_json_schema_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in name)[:64]
+    return cleaned or "structured_output"
+
+
+def _render_anthropic_content_block(block: dict[str, Any]) -> str:
+    typ = block.get("type") if isinstance(block.get("type"), str) else "unknown"
+    if typ == "document":
+        return _render_document_block(block)
+    if typ == "search_result":
+        return _render_search_result_block(block)
+    if isinstance(typ, str) and typ.endswith("_tool_result"):
+        return _render_generic_tool_result_block(block)
+    return f"\n\n[{typ}] {_safe_json(block)}\n"
+
+
+def _render_document_block(block: dict[str, Any]) -> str:
+    title = block.get("title") if isinstance(block.get("title"), str) else block.get("name") if isinstance(block.get("name"), str) else "document"
+    source = block.get("source")
+    body = ""
+    if isinstance(source, dict):
+        if source.get("type") == "text" and isinstance(source.get("data"), str):
+            body = source["data"]
+        elif source.get("type") == "url" and isinstance(source.get("url"), str):
+            body = source["url"]
+        elif isinstance(source.get("media_type"), str):
+            body = f"[{source['media_type']}]"
+    return f"\n\n[document: {title}]" + (f"\n{body}" if body else "") + "\n"
+
+
+def _render_search_result_block(block: dict[str, Any]) -> str:
+    title = block.get("title") if isinstance(block.get("title"), str) else "search result"
+    url = block.get("url") if isinstance(block.get("url"), str) else ""
+    content = block.get("content") if isinstance(block.get("content"), str) else ""
+    return f"\n\n[search_result] {title}" + (f" ({url})" if url else "") + (f"\n{content}" if content else "") + "\n"
+
+
+def _render_server_tool_use_block(block: dict[str, Any]) -> str:
+    name = block.get("name") if isinstance(block.get("name"), str) else "server_tool"
+    return f"\n\n[server_tool_use: {name}] {_safe_json(block.get('input') or {})}\n"
+
+
+def _render_generic_tool_result_block(block: dict[str, Any]) -> str:
+    typ = block.get("type") if isinstance(block.get("type"), str) else "tool_result"
+    content = block.get("content")
+    if isinstance(content, list):
+        lines: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                title = item.get("title") if isinstance(item.get("title"), str) else None
+                url = item.get("url") if isinstance(item.get("url"), str) else ""
+                text = item.get("text") if isinstance(item.get("text"), str) else item.get("content") if isinstance(item.get("content"), str) else ""
+                if title or url or text:
+                    lines.append(f"- {title or 'result'}" + (f" ({url})" if url else "") + (f": {text}" if text else ""))
+                else:
+                    lines.append(_safe_json(item))
+            else:
+                lines.append(str(item))
+        return f"\n\n[{typ}]" + (f"\n{chr(10).join(lines)}" if lines else "") + "\n"
+    if isinstance(content, dict):
+        return f"\n\n[{typ}] {_safe_json(content)}\n"
+    if isinstance(content, str):
+        return f"\n\n[{typ}]\n{content}\n"
+    return f"\n\n[{typ}]\n"
+
+
+def _safe_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +479,8 @@ def _map_stop_reason(finish_reason: str, has_tool_calls: bool) -> str:
         "tool_calls": "tool_use",
         "tool_use": "tool_use",
         "stop_sequence": "stop_sequence",
+        "pause_turn": "pause_turn",
+        "refusal": "refusal",
     }
     return mapping.get(finish_reason, "end_turn")
 

@@ -19,12 +19,14 @@ export function anthropicRequestToInternal(opts: {
   toolChoice?: Record<string, unknown>;
   stopSequences?: string[];
   thinking?: Record<string, unknown>;
+  outputFormat?: Record<string, unknown>;
 }): {
   messages: Message[];
   tools: ToolSchema[] | null;
   toolChoice: string | Record<string, unknown> | null;
   stop: string[] | null;
   reasoningEffort: string | null;
+  text: Record<string, unknown> | null;
 } {
   const internalMessages: Message[] = [];
 
@@ -48,6 +50,7 @@ export function anthropicRequestToInternal(opts: {
   const internalTools = opts.tools ? convertTools(opts.tools) : null;
   const internalToolChoice = convertToolChoice(opts.toolChoice ?? null);
   const reasoningEffort = convertThinking(opts.thinking ?? null);
+  const text = anthropicOutputFormatToOpenAIText(opts.outputFormat ?? null);
 
   return {
     messages: internalMessages,
@@ -55,6 +58,7 @@ export function anthropicRequestToInternal(opts: {
     toolChoice: internalToolChoice,
     stop: opts.stopSequences ?? null,
     reasoningEffort,
+    text,
   };
 }
 
@@ -116,6 +120,9 @@ function convertUserMessage(
               const data = typeof source.data === "string" ? source.data : "";
               toolResultImages.push(`data:${mediaType};base64,${data}`);
             }
+          } else {
+            const rendered = renderAnthropicContentBlock(p);
+            if (rendered) textPieces.push(rendered);
           }
         }
         resultContent = textPieces.join("");
@@ -138,6 +145,9 @@ function convertUserMessage(
         const data = typeof source.data === "string" ? source.data : "";
         imageUrls.push(`data:${mediaType};base64,${data}`);
       }
+    } else {
+      const rendered = renderAnthropicContentBlock(b);
+      if (rendered) textParts.push(rendered);
     }
   }
   if (textParts.length || imageUrls.length) {
@@ -175,6 +185,17 @@ function convertAssistantMessage(
       if (typeof b.thinking === "string" && b.thinking) {
         reasoningContent = b.thinking;
       }
+    } else if (blockType === "redacted_thinking") {
+      if (reasoningContent === null) {
+        reasoningContent = "[redacted_thinking omitted]";
+      }
+    } else if (blockType === "server_tool_use") {
+      textParts.push(renderServerToolUseBlock(b));
+    } else if (blockType === "web_search_tool_result") {
+      textParts.push(renderWebSearchToolResultBlock(b));
+    } else {
+      const rendered = renderAnthropicContentBlock(b);
+      if (rendered) textParts.push(rendered);
     }
   }
   const msg: Message = {
@@ -214,7 +235,7 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
 function isAnthropicWebSearchTool(tool: Record<string, unknown>): boolean {
   return tool.name === "web_search" &&
     typeof tool.type === "string" &&
-    tool.type.startsWith("web_search_");
+    (tool.type === "web_search" || tool.type.startsWith("web_search_"));
 }
 
 function stringArray(value: unknown): string[] | null {
@@ -277,6 +298,113 @@ function convertThinking(thinking: Record<string, unknown> | null): string | nul
   if (thinking.type === "enabled") return "high";
   if (thinking.type === "adaptive") return "medium";
   return null;
+}
+
+export function anthropicOutputFormatToOpenAIText(
+  outputFormat: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (outputFormat === null || typeof outputFormat !== "object") return null;
+  const type = outputFormat.type;
+  if (type === "json_schema") {
+    const schema = outputFormat.schema;
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return null;
+    const name = sanitizeJsonSchemaName(
+      typeof outputFormat.name === "string" && outputFormat.name ? outputFormat.name : "structured_output",
+    );
+    const format: Record<string, unknown> = {
+      type: "json_schema",
+      name,
+      schema,
+    };
+    if (typeof outputFormat.description === "string") {
+      format.description = outputFormat.description;
+    }
+    if (typeof outputFormat.strict === "boolean") {
+      format.strict = outputFormat.strict;
+    }
+    return { format };
+  }
+  if (type === "json_object") {
+    return { format: { type: "json_object" } };
+  }
+  return null;
+}
+
+function sanitizeJsonSchemaName(name: string): string {
+  const cleaned = name.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+  return cleaned || "structured_output";
+}
+
+function renderAnthropicContentBlock(block: Record<string, unknown>): string {
+  const type = typeof block.type === "string" ? block.type : "unknown";
+  if (type === "document") return renderDocumentBlock(block);
+  if (type === "search_result") return renderSearchResultBlock(block);
+  if (type.endsWith("_tool_result")) return renderGenericToolResultBlock(block);
+  try {
+    return `\n\n[${type}] ${JSON.stringify(block)}\n`;
+  } catch {
+    return `\n\n[${type}]\n`;
+  }
+}
+
+function renderDocumentBlock(block: Record<string, unknown>): string {
+  const title = typeof block.title === "string" ? block.title : typeof block.name === "string" ? block.name : "document";
+  const source = block.source;
+  let body = "";
+  if (typeof source === "object" && source !== null && !Array.isArray(source)) {
+    const src = source as Record<string, unknown>;
+    if (src.type === "text" && typeof src.data === "string") body = src.data;
+    else if (src.type === "url" && typeof src.url === "string") body = src.url;
+    else if (typeof src.media_type === "string") body = `[${src.media_type}]`;
+  }
+  return `\n\n[document: ${title}]${body ? `\n${body}` : ""}\n`;
+}
+
+function renderSearchResultBlock(block: Record<string, unknown>): string {
+  const title = typeof block.title === "string" ? block.title : "search result";
+  const url = typeof block.url === "string" ? block.url : "";
+  const content = typeof block.content === "string" ? block.content : "";
+  return `\n\n[search_result] ${title}${url ? ` (${url})` : ""}${content ? `\n${content}` : ""}\n`;
+}
+
+function renderServerToolUseBlock(block: Record<string, unknown>): string {
+  const name = typeof block.name === "string" ? block.name : "server_tool";
+  const input = block.input ?? {};
+  return `\n\n[server_tool_use: ${name}] ${safeJson(input)}\n`;
+}
+
+function renderWebSearchToolResultBlock(block: Record<string, unknown>): string {
+  return renderGenericToolResultBlock({ ...block, type: "web_search_tool_result" });
+}
+
+function renderGenericToolResultBlock(block: Record<string, unknown>): string {
+  const type = typeof block.type === "string" ? block.type : "tool_result";
+  const content = block.content;
+  if (Array.isArray(content)) {
+    const rendered = content.map((item) => {
+      if (typeof item !== "object" || item === null) return String(item);
+      const i = item as Record<string, unknown>;
+      const title = typeof i.title === "string" ? i.title : undefined;
+      const url = typeof i.url === "string" ? i.url : undefined;
+      const text = typeof i.text === "string" ? i.text : typeof i.content === "string" ? i.content : undefined;
+      if (title || url || text) {
+        return `- ${title ?? "result"}${url ? ` (${url})` : ""}${text ? `: ${text}` : ""}`;
+      }
+      return safeJson(i);
+    }).join("\n");
+    return `\n\n[${type}]${rendered ? `\n${rendered}` : ""}\n`;
+  }
+  if (typeof content === "object" && content !== null) return `\n\n[${type}] ${safeJson(content)}\n`;
+  if (typeof content === "string") return `\n\n[${type}]\n${content}\n`;
+  return `\n\n[${type}]\n`;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +522,8 @@ function mapStopReason(finishReason: string, hasToolCalls: boolean): string {
     tool_calls: "tool_use",
     tool_use: "tool_use",
     stop_sequence: "stop_sequence",
+    pause_turn: "pause_turn",
+    refusal: "refusal",
   };
   return mapping[finishReason] ?? "end_turn";
 }

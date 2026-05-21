@@ -336,7 +336,7 @@ fn messages_from_compact_body(body: &Value) -> (Vec<Message>, Option<String>) {
         || body.get("tool_choice").is_some()
         || body.get("stop_sequences").is_some()
     {
-        let (messages, _tools, _tool_choice, _stop, reasoning_effort) =
+        let (messages, _tools, _tool_choice, _stop, reasoning_effort, _text) =
             anthropic_request_to_internal(body);
         return (messages, reasoning_effort);
     }
@@ -804,7 +804,7 @@ async fn anthropic_count_tokens(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let (messages, _tools, _tool_choice, _stop, _reasoning_effort) =
+    let (messages, _tools, _tool_choice, _stop, _reasoning_effort, _text) =
         anthropic_request_to_internal(&body);
     let input_tokens = estimate_input_tokens(&messages, Some(&body));
     Ok(Json(json!({
@@ -842,7 +842,7 @@ async fn anthropic_messages(
                 .map(|h| !matches!(h.to_lowercase().as_str(), "false" | "0" | ""))
         });
 
-    let (messages, tools, tool_choice, stop, reasoning_effort) =
+    let (messages, tools, tool_choice, stop, reasoning_effort, text) =
         anthropic_request_to_internal(&body);
 
     let stream = body
@@ -861,6 +861,7 @@ async fn anthropic_messages(
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_i64());
 
     let tool_choice_val: Option<Value> = tool_choice;
+    let text_val: Option<Value> = text;
 
     if stream {
         let provider = state.provider.clone();
@@ -870,6 +871,7 @@ async fn anthropic_messages(
             let tools_ref = tools.as_deref();
             let stop_ref = stop.as_deref();
             let tc_ref = tool_choice_val.as_ref();
+            let text_ref = text_val.as_ref();
 
             provider.chat_stream(
                 &messages,
@@ -885,7 +887,7 @@ async fn anthropic_messages(
                 Some(request_model_clone.as_str()),
                 tc_ref,
                 None,
-                None,
+                text_ref,
                 None,
             )
         })
@@ -939,6 +941,7 @@ async fn anthropic_messages(
             let tools_ref = tools.as_deref();
             let stop_ref = stop.as_deref();
             let tc_ref = tool_choice_val.as_ref();
+            let text_ref = text_val.as_ref();
 
             provider.chat(
                 &messages,
@@ -954,7 +957,7 @@ async fn anthropic_messages(
                 Some(request_model_clone.as_str()),
                 tc_ref,
                 None,
-                None,
+                text_ref,
                 None,
             )
         })

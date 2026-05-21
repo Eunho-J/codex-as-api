@@ -24,7 +24,7 @@ from codex_as_api.messages import (
 
 class TestAnthropicRequestToInternal:
     def test_system_string(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             system="You are helpful.",
@@ -34,7 +34,7 @@ class TestAnthropicRequestToInternal:
         assert messages[1].role is MessageRole.USER
 
     def test_system_content_blocks(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             system=[
@@ -45,14 +45,14 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "Rule 1\n\nRule 2"
 
     def test_no_system(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
         )
         assert messages[0].role is MessageRole.USER
 
     def test_user_text_message(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "Hello"}],
         )
@@ -61,7 +61,7 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "Hello"
 
     def test_user_content_blocks(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",
@@ -79,7 +79,7 @@ class TestAnthropicRequestToInternal:
         assert messages[1].tool_call_id == "call-1"
 
     def test_user_tool_result_only(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",
@@ -93,7 +93,7 @@ class TestAnthropicRequestToInternal:
         assert all(m.role is MessageRole.TOOL for m in messages)
 
     def test_assistant_text(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "assistant", "content": "Hello!"}],
         )
@@ -101,7 +101,7 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "Hello!"
 
     def test_assistant_tool_use_blocks(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "assistant",
@@ -117,7 +117,7 @@ class TestAnthropicRequestToInternal:
         assert messages[0].tool_calls[0].arguments == {"city": "Seoul"}
 
     def test_assistant_thinking_block(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "assistant",
@@ -130,8 +130,41 @@ class TestAnthropicRequestToInternal:
         assert messages[0].reasoning_content == "Let me think..."
         assert messages[0].content == "The answer is 42."
 
+    def test_preserves_assistant_server_web_search_history(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{
+                "role": "assistant",
+                "content": [
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "codex"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": [
+                        {"title": "Codex", "url": "https://example.com", "page_age": "1d"},
+                    ]},
+                    {"type": "text", "text": "Summary"},
+                ],
+            }],
+        )
+        assert "server_tool_use: web_search" in messages[0].content
+        assert "https://example.com" in messages[0].content
+        assert "Summary" in messages[0].content
+
+    def test_preserves_non_text_tool_result_blocks(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [
+                    {"type": "search_result", "title": "Docs", "url": "https://docs.example", "content": "body"},
+                    {"type": "document", "title": "Spec", "source": {"type": "text", "data": "document body"}},
+                ]}],
+            }],
+        )
+        assert messages[0].role is MessageRole.TOOL
+        assert "Docs" in messages[0].content
+        assert "document body" in messages[0].content
+
     def test_tools_conversion(self):
-        _, tools, _, _, _ = anthropic_request_to_internal(
+        _, tools, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tools=[{
@@ -146,7 +179,7 @@ class TestAnthropicRequestToInternal:
         assert tools[0].parameters == {"type": "object", "properties": {"city": {"type": "string"}}}
 
     def test_tool_choice_auto(self):
-        _, _, tc, _, _ = anthropic_request_to_internal(
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "auto"},
@@ -154,7 +187,7 @@ class TestAnthropicRequestToInternal:
         assert tc == "auto"
 
     def test_tool_choice_any(self):
-        _, _, tc, _, _ = anthropic_request_to_internal(
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "any"},
@@ -162,7 +195,7 @@ class TestAnthropicRequestToInternal:
         assert tc == "required"
 
     def test_tool_choice_specific(self):
-        _, _, tc, _, _ = anthropic_request_to_internal(
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "tool", "name": "get_weather"},
@@ -170,7 +203,7 @@ class TestAnthropicRequestToInternal:
         assert tc == {"type": "function", "name": "get_weather"}
 
     def test_web_search_tool_conversion(self):
-        _, tools, _, _, _ = anthropic_request_to_internal(
+        _, tools, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tools=[{
@@ -189,6 +222,15 @@ class TestAnthropicRequestToInternal:
         assert tools[0].parameters["openai_tool"]["filters"] == {"allowed_domains": ["example.com"]}
         assert tools[0].parameters["openai_tool"]["user_location"] == {"type": "approximate", "country": "US"}
 
+    def test_unsuffixed_web_search_tool_conversion(self):
+        _, tools, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "web_search", "name": "web_search"}],
+        )
+        assert tools is not None
+        assert tools[0].parameters["__codex_as_api_tool_type"] == "web_search"
+
     def test_web_search_blocked_domains_raises(self):
         import pytest
         with pytest.raises(ValueError, match="blocked_domains"):
@@ -203,7 +245,7 @@ class TestAnthropicRequestToInternal:
             )
 
     def test_web_search_tool_choice(self):
-        _, _, tc, _, _ = anthropic_request_to_internal(
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "tool", "name": "web_search"},
@@ -211,7 +253,7 @@ class TestAnthropicRequestToInternal:
         assert tc == {"type": "web_search"}
 
     def test_tool_choice_none(self):
-        _, _, tc, _, _ = anthropic_request_to_internal(
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             tool_choice={"type": "none"},
@@ -219,7 +261,7 @@ class TestAnthropicRequestToInternal:
         assert tc == "none"
 
     def test_thinking_enabled(self):
-        _, _, _, _, effort = anthropic_request_to_internal(
+        _, _, _, _, effort, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             thinking={"type": "enabled", "budget_tokens": 4096},
@@ -227,7 +269,7 @@ class TestAnthropicRequestToInternal:
         assert effort == "high"
 
     def test_thinking_adaptive(self):
-        _, _, _, _, effort = anthropic_request_to_internal(
+        _, _, _, _, effort, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             thinking={"type": "adaptive"},
@@ -235,15 +277,35 @@ class TestAnthropicRequestToInternal:
         assert effort == "medium"
 
     def test_thinking_disabled(self):
-        _, _, _, _, effort = anthropic_request_to_internal(
+        _, _, _, _, effort, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             thinking={"type": "disabled"},
         )
         assert effort is None
 
+    def test_output_format_json_schema_maps_to_text_format(self):
+        _, _, _, _, _, text = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            output_format={
+                "type": "json_schema",
+                "name": "my schema!",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
+                "strict": False,
+            },
+        )
+        assert text == {
+            "format": {
+                "type": "json_schema",
+                "name": "my_schema_",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
+                "strict": False,
+            },
+        }
+
     def test_stop_sequences(self):
-        _, _, _, stop, _ = anthropic_request_to_internal(
+        _, _, _, stop, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             stop_sequences=["STOP", "END"],
@@ -251,7 +313,7 @@ class TestAnthropicRequestToInternal:
         assert stop == ["STOP", "END"]
 
     def test_user_image_block(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",
@@ -272,7 +334,7 @@ class TestAnthropicRequestToInternal:
         assert messages[0].images[0] == "data:image/png;base64,iVBORw0KGgoAAAANS"
 
     def test_tool_result_with_content_blocks(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",
@@ -288,7 +350,7 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "result line 1result line 2"
 
     def test_tool_result_with_image(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",
@@ -308,7 +370,7 @@ class TestAnthropicRequestToInternal:
         assert messages[1].images[0] == "data:image/png;base64,iVBORw0KGgo"
 
     def test_tool_result_with_text_and_image(self):
-        messages, _, _, _, _ = anthropic_request_to_internal(
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{
                 "role": "user",

@@ -542,7 +542,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.4.0` from the matching commit.
+- Publish a GitHub Release such as `v0.5.0` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 ## Tests
@@ -572,6 +572,12 @@ npm test
 
 
 ## Release Notes
+
+### v0.5.0
+
+- Preserve Claude Code server-tool history (`server_tool_use`, `web_search_tool_result`, MCP/advisor-like result blocks) as backend context instead of dropping it on the next turn.
+- Support Anthropic `output_format` structured outputs by mapping JSON schema/object formats to OpenAI Responses `text.format`.
+- Preserve `document` and `search_result` content blocks inside tool results, keep Python streaming defaults aligned, and accept unsuffixed `web_search` server-tool types across Python, TypeScript, and Rust.
 
 ### v0.4.0
 

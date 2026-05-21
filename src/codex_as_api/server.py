@@ -57,6 +57,16 @@ def _error_status(exc: BaseException) -> int:
     return 500
 
 
+def _anthropic_output_format_from_body(body: dict[str, Any]) -> dict[str, Any] | None:
+    output_format = body.get("output_format")
+    if isinstance(output_format, dict):
+        return output_format
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict) and isinstance(output_config.get("format"), dict):
+        return output_config["format"]
+    return None
+
+
 def _error_type(exc: BaseException) -> str:
     if isinstance(exc, ChatGPTOAuthError):
         return "chatgpt_oauth_error"
@@ -228,7 +238,7 @@ try:
 
     def _messages_from_compact_body(body: dict[str, Any]) -> tuple[list[Message], str | None]:
         if any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
-            messages, _tools, _tool_choice, _stop, reasoning_effort = anthropic_request_to_internal(
+            messages, _tools, _tool_choice, _stop, reasoning_effort, _text = anthropic_request_to_internal(
                 model=str(body.get("model") or MODEL),
                 messages=body.get("messages") if isinstance(body.get("messages"), list) else [],
                 system=body.get("system"),
@@ -237,6 +247,7 @@ try:
                 tool_choice=body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None,
                 stop_sequences=body.get("stop_sequences") if isinstance(body.get("stop_sequences"), list) else None,
                 thinking=body.get("thinking") if isinstance(body.get("thinking"), dict) else None,
+                output_format=_anthropic_output_format_from_body(body),
             )
             return messages, reasoning_effort
 
@@ -548,7 +559,7 @@ try:
     async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
         body = await http_request.json()
         try:
-            messages, _tools, _tool_choice, _stop, _reasoning_effort = anthropic_request_to_internal(
+            messages, _tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
                 model=body.get("model"),
                 messages=body.get("messages") or [],
                 system=body.get("system"),
@@ -557,6 +568,7 @@ try:
                 tool_choice=body.get("tool_choice"),
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
+                output_format=_anthropic_output_format_from_body(body),
             )
             input_tokens = _estimate_input_tokens(messages, body)
         except Exception as exc:
@@ -573,7 +585,7 @@ try:
         body = await http_request.json()
 
         try:
-            messages, tools, tool_choice, stop, reasoning_effort = anthropic_request_to_internal(
+            messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
                 model=body.get("model", MODEL),
                 messages=body.get("messages", []),
                 system=body.get("system"),
@@ -582,6 +594,7 @@ try:
                 tool_choice=body.get("tool_choice"),
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
+                output_format=_anthropic_output_format_from_body(body),
             )
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
@@ -601,6 +614,7 @@ try:
                         tool_choice=tool_choice,
                         reasoning_effort=reasoning_effort,
                         stop=stop,
+                        text=text,
                     ),
                     model=client_model,
                     request_id=request_id,
@@ -622,6 +636,7 @@ try:
                 tool_choice=tool_choice,
                 reasoning_effort=reasoning_effort,
                 stop=stop,
+                text=text,
             )
         except ChatGPTOAuthError as exc:
             status = _error_status(exc)
