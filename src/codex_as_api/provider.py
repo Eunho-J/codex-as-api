@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import re
+import subprocess
 import threading
-import uuid
 import urllib.error
 import urllib.request
-from typing import Any, Iterator, Sequence
+import uuid
+from collections.abc import Iterator, Sequence
+from typing import Any
 
-from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .auth import (
     ChatGPTOAuthError,
     load_token_data,
@@ -15,6 +19,7 @@ from .auth import (
     refresh_token,
     register_token_secrets,
 )
+from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .protocol import (
     reasoning_from_response_items,
     response_failure_message,
@@ -23,7 +28,82 @@ from .protocol import (
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5"
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
+CODEX_CLI_ORIGINATOR = "codex_cli_rs"
+CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION"
+CODEX_CLI_NPM_PACKAGE = "@openai/codex"
 REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_CODEX_CLI_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$")
+_CODEX_CLI_VERSION_UNSET = object()
+_codex_cli_version_cache: str | None | object = _CODEX_CLI_VERSION_UNSET
+_codex_cli_version_lock = threading.Lock()
+
+
+def prime_codex_cli_version_cache() -> None:
+    resolve_codex_cli_version()
+
+
+def resolve_codex_cli_version() -> str | None:
+    override = _normalize_codex_cli_version(os.getenv(CODEX_CLI_VERSION_ENV))
+    if override:
+        return override
+    global _codex_cli_version_cache
+    with _codex_cli_version_lock:
+        if _codex_cli_version_cache is not _CODEX_CLI_VERSION_UNSET:
+            return _codex_cli_version_cache if isinstance(_codex_cli_version_cache, str) else None
+        _codex_cli_version_cache = _fetch_latest_codex_cli_version_from_npm()
+        return _codex_cli_version_cache if isinstance(_codex_cli_version_cache, str) else None
+
+
+def _fetch_latest_codex_cli_version_from_npm() -> str | None:
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed executable and arguments.
+            ["npm", "view", CODEX_CLI_NPM_PACKAGE, "version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _normalize_codex_cli_version(completed.stdout)
+
+
+def _normalize_codex_cli_version(value: str | None) -> str | None:
+    version = value.strip() if value else ""
+    if not version:
+        return None
+    return version if _CODEX_CLI_VERSION_RE.match(version) else None
+
+
+def codex_cli_headers_for_version(version: str | None) -> dict[str, str]:
+    headers = {"originator": CODEX_CLI_ORIGINATOR}
+    normalized = _normalize_codex_cli_version(version)
+    if normalized:
+        headers["User-Agent"] = _sanitize_header_value(
+            f"{CODEX_CLI_ORIGINATOR}/{normalized} ({_codex_os_info()}) codex-as-api"
+        )
+    return headers
+
+
+def _codex_cli_headers() -> dict[str, str]:
+    return codex_cli_headers_for_version(resolve_codex_cli_version())
+
+
+def _codex_os_info() -> str:
+    return f"{_codex_os_name()} {platform.release() or 'unknown'}; {platform.machine() or 'unknown'}"
+
+
+def _codex_os_name() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "Mac OS"
+    return system or "unknown"
+
+
+def _sanitize_header_value(value: str) -> str:
+    return "".join(ch if " " <= ch <= "~" else "_" for ch in value)
 
 
 class ChatGPTOAuthProvider:
@@ -430,6 +510,7 @@ class ChatGPTOAuthProvider:
         token = load_token_data(self.auth_json_path)
         register_token_secrets(token.access_token, token.refresh_token, token.id_token, token.account_id)
         headers = {
+            **_codex_cli_headers(),
             "Authorization": f"Bearer {token.access_token}",
             "ChatGPT-Account-Id": token.account_id,
             "Content-Type": "application/json",

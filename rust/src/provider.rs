@@ -3,12 +3,156 @@ use crate::messages::{AssistantResponse, Message, MessageRole, ToolCall, ToolSch
 use crate::protocol::{reasoning_from_response_items, response_failure_message};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
+use std::io::{BufRead, Read};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 pub const CHATGPT_OAUTH_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CHATGPT_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
 pub const REMOTE_COMPACTION_MARKER: &str = "[Remote Responses compacted history]";
 pub const REASONING_EFFORT_VALUES: &[&str] = &["high", "low", "medium", "minimal", "none", "xhigh"];
+const CODEX_CLI_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_CLI_VERSION_ENV: &str = "CODEX_AS_API_CODEX_CLI_VERSION";
+const CODEX_CLI_NPM_PACKAGE: &str = "@openai/codex";
+static CODEX_CLI_VERSION_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn prime_codex_cli_version_cache() {
+    let _ = resolve_codex_cli_version();
+}
+
+fn resolve_codex_cli_version() -> Option<String> {
+    if let Ok(value) = std::env::var(CODEX_CLI_VERSION_ENV) {
+        if let Some(version) = normalize_codex_cli_version(&value) {
+            return Some(version);
+        }
+    }
+    CODEX_CLI_VERSION_CACHE
+        .get_or_init(fetch_latest_codex_cli_version_from_npm)
+        .clone()
+}
+
+fn fetch_latest_codex_cli_version_from_npm() -> Option<String> {
+    let mut child = Command::new("npm")
+        .args(["view", CODEX_CLI_NPM_PACKAGE, "version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                return if status.success() {
+                    normalize_codex_cli_version(&stdout)
+                } else {
+                    None
+                };
+            }
+            Ok(None) => {
+                if started.elapsed() >= std::time::Duration::from_secs(3) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn normalize_codex_cli_version(value: &str) -> Option<String> {
+    let version = value.trim();
+    if version.is_empty() {
+        return None;
+    }
+    let mut chars = version.chars().peekable();
+    let mut numeric_parts = 0usize;
+    loop {
+        let mut digits = 0usize;
+        while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+            chars.next();
+            digits += 1;
+        }
+        if digits == 0 {
+            return None;
+        }
+        numeric_parts += 1;
+        if !matches!(chars.peek(), Some('.')) {
+            break;
+        }
+        chars.next();
+    }
+    if !(2..=4).contains(&numeric_parts) {
+        return None;
+    }
+    let rest: String = chars.collect();
+    if !rest.is_empty() {
+        let mut rest_chars = rest.chars();
+        if !matches!(rest_chars.next(), Some('-' | '+')) {
+            return None;
+        }
+        let mut suffix = 0usize;
+        for ch in rest_chars {
+            if !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-') {
+                return None;
+            }
+            suffix += 1;
+        }
+        if suffix == 0 {
+            return None;
+        }
+    }
+    Some(version.to_string())
+}
+
+fn codex_cli_headers() -> HashMap<String, String> {
+    codex_cli_headers_for_version(resolve_codex_cli_version().as_deref())
+}
+
+fn codex_cli_headers_for_version(version: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("originator".to_string(), CODEX_CLI_ORIGINATOR.to_string());
+    if let Some(version) = version.and_then(normalize_codex_cli_version) {
+        headers.insert(
+            "User-Agent".to_string(),
+            sanitize_header_value(&format!(
+                "{CODEX_CLI_ORIGINATOR}/{version} ({}) codex-as-api",
+                codex_os_info()
+            )),
+        );
+    }
+    headers
+}
+
+fn codex_os_info() -> String {
+    format!("{} unknown; {}", codex_os_name(), std::env::consts::ARCH)
+}
+
+fn codex_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "Mac OS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if matches!(ch, ' '..='~') { ch } else { '_' })
+        .collect()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -233,7 +377,8 @@ impl ChatGPTOAuthProvider {
                                     "arguments": tc.arguments,
                                 }));
                             }
-                            if let Some(web_search) = web_search_event_from_response_item(item, &[]) {
+                            if let Some(web_search) = web_search_event_from_response_item(item, &[])
+                            {
                                 if let Some(id) = web_search.get("id").and_then(|v| v.as_str()) {
                                     yielded_web_search_ids.insert(id.to_string());
                                 }
@@ -301,8 +446,11 @@ impl ChatGPTOAuthProvider {
                             }
                         }
                         for item in &final_output {
-                            if let Some(web_search) = web_search_event_from_response_item(item, &final_output) {
-                                let id = web_search.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(web_search) =
+                                web_search_event_from_response_item(item, &final_output)
+                            {
+                                let id =
+                                    web_search.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 if !yielded_web_search_ids.contains(id) {
                                     yielded_web_search_ids.insert(id.to_string());
                                     result_events.push(web_search);
@@ -313,8 +461,7 @@ impl ChatGPTOAuthProvider {
                             let final_text = text_from_response_items(&final_output);
                             if !final_text.is_empty() {
                                 saw_text_delta = true;
-                                result_events
-                                    .push(json!({"type": "content", "text": final_text}));
+                                result_events.push(json!({"type": "content", "text": final_text}));
                             }
                         }
                         if !saw_reasoning_delta {
@@ -448,7 +595,6 @@ impl ChatGPTOAuthProvider {
         Ok(text)
     }
 
-
     pub fn compact_messages(
         &self,
         messages: &[Message],
@@ -470,19 +616,14 @@ impl ChatGPTOAuthProvider {
             .get("output")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                ProviderError::Request(
-                    "remote compact response missing output array".to_string(),
-                )
+                ProviderError::Request("remote compact response missing output array".to_string())
             })?;
 
         let serialized = serde_json::to_string(output).unwrap();
         Ok(format!("{}\n{}", REMOTE_COMPACTION_MARKER, serialized))
     }
 
-    fn collect_response_output_items(
-        &self,
-        payload: &Value,
-    ) -> Result<Vec<Value>, ProviderError> {
+    fn collect_response_output_items(&self, payload: &Value) -> Result<Vec<Value>, ProviderError> {
         let mut output_items: Vec<Value> = Vec::new();
         let mut completed_output_seen = false;
         let mut seen_keys: HashSet<String> = HashSet::new();
@@ -588,7 +729,11 @@ impl ChatGPTOAuthProvider {
 
         if let Some(ts) = tools {
             for tool in ts {
-                if let Some(error) = tool.parameters.get("__codex_as_api_error").and_then(|v| v.as_str()) {
+                if let Some(error) = tool
+                    .parameters
+                    .get("__codex_as_api_error")
+                    .and_then(|v| v.as_str())
+                {
                     return Err(ProviderError::Request(error.to_string()));
                 }
             }
@@ -610,7 +755,10 @@ impl ChatGPTOAuthProvider {
             "store": false,
             "include": [],
         });
-        if tools_array.iter().any(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("web_search")) {
+        if tools_array
+            .iter()
+            .any(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("web_search"))
+        {
             payload.as_object_mut().unwrap().insert(
                 "include".to_string(),
                 json!(["web_search_call.action.sources"]),
@@ -619,10 +767,10 @@ impl ChatGPTOAuthProvider {
 
         if let Some(key) = prompt_cache_key {
             if !key.is_empty() {
-                payload
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("prompt_cache_key".to_string(), Value::String(key.to_string()));
+                payload.as_object_mut().unwrap().insert(
+                    "prompt_cache_key".to_string(),
+                    Value::String(key.to_string()),
+                );
             }
         }
         let _ = max_tokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
@@ -639,13 +787,16 @@ impl ChatGPTOAuthProvider {
             );
         }
         if let Some(st) = service_tier {
-            payload.as_object_mut().unwrap().insert(
-                "service_tier".to_string(),
-                Value::String(st.to_string()),
-            );
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("service_tier".to_string(), Value::String(st.to_string()));
         }
         if let Some(t) = text {
-            payload.as_object_mut().unwrap().insert("text".to_string(), t.clone());
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("text".to_string(), t.clone());
         }
         if let Some(cm) = client_metadata {
             let map: serde_json::Map<String, Value> = cm
@@ -666,14 +817,12 @@ impl ChatGPTOAuthProvider {
     fn headers(&self) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
         let token = auth::load_token_data(self.auth_json_path.as_deref())?;
         let mut headers = HashMap::new();
+        headers.extend(codex_cli_headers());
         headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", token.access_token),
         );
-        headers.insert(
-            "ChatGPT-Account-Id".to_string(),
-            token.account_id.clone(),
-        );
+        headers.insert("ChatGPT-Account-Id".to_string(), token.account_id.clone());
         headers.insert("Content-Type".to_string(), "application/json".to_string());
         if token.fedramp {
             headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
@@ -879,10 +1028,7 @@ fn image_generation_from_item(item: &Value) -> Result<Option<Value>, ProviderErr
     if item.get("type").and_then(|v| v.as_str()) != Some("image_generation_call") {
         return Ok(None);
     }
-    let result = item
-        .get("result")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let result = item.get("result").and_then(|v| v.as_str()).unwrap_or("");
     if result.trim().is_empty() {
         return Err(ProviderError::Request(
             "image_generation_call returned empty result".to_string(),
@@ -945,9 +1091,7 @@ pub fn split_instructions_and_input(messages: &[Message]) -> (String, Vec<Value>
     let mut input_messages: Vec<&Message> = Vec::new();
 
     for msg in messages {
-        if msg.role == MessageRole::System
-            && !msg.content.starts_with(REMOTE_COMPACTION_MARKER)
-        {
+        if msg.role == MessageRole::System && !msg.content.starts_with(REMOTE_COMPACTION_MARKER) {
             instructions.push(msg.content.clone());
         } else {
             input_messages.push(msg);
@@ -1100,7 +1244,11 @@ fn web_search_event_from_response_item(item: &Value, all_items: &[Value]) -> Opt
                 .collect::<String>()
         )
     };
-    let action = item.get("action").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+    let action = item
+        .get("action")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let mut sources = web_search_sources_from_action(&action);
     if sources.is_empty() && !all_items.is_empty() {
         sources.extend(web_search_sources_from_annotations(all_items));
@@ -1118,7 +1266,11 @@ fn web_search_query_from_action(action: &Value) -> String {
         return query.to_string();
     }
     if let Some(queries) = action.get("queries").and_then(|v| v.as_array()) {
-        if let Some(first) = queries.iter().filter_map(|q| q.as_str()).find(|q| !q.is_empty()) {
+        if let Some(first) = queries
+            .iter()
+            .filter_map(|q| q.as_str())
+            .find(|q| !q.is_empty())
+        {
             return first.to_string();
         }
     }
@@ -1206,10 +1358,7 @@ fn set_reasoning_payload(
         )));
     }
 
-    payload.insert(
-        "reasoning".to_string(),
-        json!({"effort": lower}),
-    );
+    payload.insert("reasoning".to_string(), json!({"effort": lower}));
 
     Ok(())
 }
@@ -1434,9 +1583,33 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(payload["tools"], json!([{"type": "web_search", "external_web_access": true}]));
+        assert_eq!(
+            payload["tools"],
+            json!([{"type": "web_search", "external_web_access": true}])
+        );
         assert_eq!(payload["tool_choice"], json!({"type": "web_search"}));
-        assert_eq!(payload["include"], json!(["web_search_call.action.sources"]));
+        assert_eq!(
+            payload["include"],
+            json!(["web_search_call.action.sources"])
+        );
+    }
+
+    #[test]
+    fn test_codex_cli_headers_include_official_originator_and_versioned_user_agent() {
+        let headers = codex_cli_headers_for_version(Some("1.2.3\n"));
+
+        assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        let user_agent = headers.get("User-Agent").unwrap();
+        assert!(user_agent.starts_with("codex_cli_rs/1.2.3 ("));
+        assert!(user_agent.ends_with(") codex-as-api"));
+    }
+
+    #[test]
+    fn test_codex_cli_headers_omit_user_agent_for_invalid_version() {
+        let headers = codex_cli_headers_for_version(Some("not-a-version"));
+
+        assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        assert!(!headers.contains_key("User-Agent"));
     }
 
     #[test]
@@ -1567,9 +1740,7 @@ mod tests {
 
     #[test]
     fn test_decode_sse_block_valid() {
-        let lines = vec![
-            "data: {\"type\": \"response.completed\"}".to_string(),
-        ];
+        let lines = vec!["data: {\"type\": \"response.completed\"}".to_string()];
         let event = decode_sse_block(&lines).unwrap();
         assert_eq!(event["type"], "response.completed");
     }
@@ -1615,7 +1786,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             name: Some("my_tool".to_string()),
             reasoning_content: None,
-                images: vec![],
+            images: vec![],
         };
         let items = messages_to_response_items(&[msg]);
         assert_eq!(items.len(), 1);
@@ -1626,7 +1797,10 @@ mod tests {
     #[test]
     fn test_validate_image_content_items_valid() {
         let mut img = HashMap::new();
-        img.insert("image_url".to_string(), "data:image/png;base64,abc".to_string());
+        img.insert(
+            "image_url".to_string(),
+            "data:image/png;base64,abc".to_string(),
+        );
         let result = validate_image_content_items(&[img]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["type"], "input_image");
@@ -1642,7 +1816,10 @@ mod tests {
     #[test]
     fn test_validate_image_content_items_wrong_prefix() {
         let mut img = HashMap::new();
-        img.insert("image_url".to_string(), "https://example.com/img.png".to_string());
+        img.insert(
+            "image_url".to_string(),
+            "https://example.com/img.png".to_string(),
+        );
         let result = validate_image_content_items(&[img]);
         assert!(result.is_err());
     }

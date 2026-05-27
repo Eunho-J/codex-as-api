@@ -7,7 +7,7 @@ import {
 } from "./auth.js";
 import type { Message, ToolCall, ToolSchema } from "./messages.js";
 import { MessageRole } from "./messages.js";
-import { ChatGPTOAuthProvider } from "./provider.js";
+import { ChatGPTOAuthProvider, primeCodexCliVersionCache } from "./provider.js";
 import {
   anthropicRequestToInternal,
   internalResponseToAnthropic,
@@ -715,6 +715,7 @@ function normalizeStop(stop: unknown): string[] | undefined {
 }
 
 export function main(): void {
+  primeCodexCliVersionCache();
   const app = createApp();
   app.listen(PORT, HOST, () => {
     console.log(`codex-as-api listening on ${HOST}:${PORT}`);

@@ -1,5 +1,18 @@
 # Release Notes
 
+## v0.5.1
+
+### Codex backend version-header compatibility
+- Add the official Codex CLI `originator` header and versioned `User-Agent` header to ChatGPT/Codex OAuth requests across Python, TypeScript, and Rust.
+- Resolve the latest `@openai/codex` version from npm during server startup and cache it for outgoing requests.
+- Keep `CODEX_AS_API_CODEX_CLI_VERSION` as an explicit override for offline or pinned deployments.
+
+### Validation
+- Python: `CODEX_AS_API_AUTH_PATH=/tmp/codex-as-api-missing-auth.json .venv/bin/pytest -q`
+- Rust: `cargo test`
+- TypeScript: `npm test && npm run build && npm pack --dry-run`
+- Python package dry run: `uv build --out-dir /tmp/codex-as-api-dist`
+
 ## v0.5.0
 
 ### Claude Code conversation-history compatibility

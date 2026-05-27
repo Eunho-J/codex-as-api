@@ -1,4 +1,6 @@
 import * as crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import * as os from "node:os";
 import {
   ChatGPTOAuthError,
   loadTokenData,
@@ -22,6 +24,9 @@ export const CHATGPT_OAUTH_DEFAULT_BASE_URL =
   "https://chatgpt.com/backend-api/codex";
 export const CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5";
 const REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]";
+const CODEX_CLI_ORIGINATOR = "codex_cli_rs";
+const CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION";
+const CODEX_CLI_NPM_PACKAGE = "@openai/codex";
 const REASONING_EFFORT_VALUES = new Set([
   "none",
   "minimal",
@@ -30,6 +35,88 @@ const REASONING_EFFORT_VALUES = new Set([
   "high",
   "xhigh",
 ]);
+let cachedCodexCliVersion: string | null | undefined;
+
+export function primeCodexCliVersionCache(): void {
+  void resolveCodexCliVersion();
+}
+
+export function resolveCodexCliVersion(): string | undefined {
+  const override = normalizeCodexCliVersion(
+    process.env[CODEX_CLI_VERSION_ENV],
+  );
+  if (override) return override;
+  if (cachedCodexCliVersion !== undefined) {
+    return cachedCodexCliVersion ?? undefined;
+  }
+  cachedCodexCliVersion = fetchLatestCodexCliVersionFromNpm() ?? null;
+  return cachedCodexCliVersion ?? undefined;
+}
+
+function fetchLatestCodexCliVersionFromNpm(): string | undefined {
+  try {
+    const output = execFileSync(
+      "npm",
+      ["view", CODEX_CLI_NPM_PACKAGE, "version"],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+      },
+    );
+    return normalizeCodexCliVersion(output);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeCodexCliVersion(value: string | undefined): string | undefined {
+  const version = value?.trim();
+  if (!version) return undefined;
+  return /^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
+    ? version
+    : undefined;
+}
+
+export function codexCliHeadersForVersion(
+  version: string | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    originator: CODEX_CLI_ORIGINATOR,
+  };
+  const normalized = normalizeCodexCliVersion(version);
+  if (normalized) {
+    headers["User-Agent"] = sanitizeHeaderValue(
+      `${CODEX_CLI_ORIGINATOR}/${normalized} (${codexOsInfo()}) codex-as-api`,
+    );
+  }
+  return headers;
+}
+
+function codexCliHeaders(): Record<string, string> {
+  return codexCliHeadersForVersion(resolveCodexCliVersion());
+}
+
+function codexOsInfo(): string {
+  return `${codexOsName()} ${os.release() || "unknown"}; ${os.arch() || "unknown"}`;
+}
+
+function codexOsName(): string {
+  switch (os.platform()) {
+    case "darwin":
+      return "Mac OS";
+    case "win32":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return os.platform() || "unknown";
+  }
+}
+
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "_");
+}
 
 export interface ChatOptions {
   model?: string;
@@ -481,6 +568,7 @@ export class ChatGPTOAuthProvider {
   private getHeaders(): Record<string, string> {
     const token = loadTokenData(this.authJsonPath);
     const headers: Record<string, string> = {
+      ...codexCliHeaders(),
       Authorization: `Bearer ${token.access_token}`,
       "ChatGPT-Account-Id": token.account_id,
       "Content-Type": "application/json",

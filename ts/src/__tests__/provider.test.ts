@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { MessageRole } from "../messages.js";
 import type { Message, ToolCall, ToolSchema } from "../messages.js";
 import {
@@ -17,6 +20,7 @@ import {
   usageFromResponse,
   REMOTE_COMPACTION_MARKER,
   ChatGPTOAuthProvider,
+  codexCliHeadersForVersion,
 } from "../provider.js";
 import { ChatGPTOAuthError } from "../auth.js";
 
@@ -25,6 +29,36 @@ function providerMessages(): Message[] {
     { role: MessageRole.SYSTEM, content: "You are helpful." },
     { role: MessageRole.USER, content: "Hello" },
   ];
+}
+
+function makeJwt(payload: Record<string, unknown>): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" }))
+    .toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${header}.${body}.sig`;
+}
+
+function writeAuthFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-provider-"));
+  const filePath = path.join(dir, "auth.json");
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      tokens: {
+        access_token: makeJwt({ exp: 9999999999 }),
+        refresh_token: "refresh-token",
+        id_token: makeJwt({
+          exp: 9999999999,
+          "https://api.openai.com/auth": {
+            chatgpt_account_id: "acc-123",
+            chatgpt_plan_type: "plus",
+            chatgpt_user_id: "user-abc",
+          },
+        }),
+      },
+    }),
+  );
+  return filePath;
 }
 
 describe("ChatGPTOAuthProvider payload", () => {
@@ -58,6 +92,41 @@ describe("ChatGPTOAuthProvider payload", () => {
     assert.deepEqual(payload.tools, [{ type: "web_search", external_web_access: true }]);
     assert.deepEqual(payload.tool_choice, { type: "web_search" });
     assert.deepEqual(payload.include, ["web_search_call.action.sources"]);
+  });
+});
+
+describe("Codex CLI request headers", () => {
+  it("formats official originator and versioned User-Agent headers", () => {
+    const headers = codexCliHeadersForVersion("1.2.3\n");
+
+    assert.equal(headers.originator, "codex_cli_rs");
+    assert.match(headers["User-Agent"], /^codex_cli_rs\/1\.2\.3 \(.+\) codex-as-api$/);
+  });
+
+  it("omits User-Agent when the npm version cannot be validated", () => {
+    const headers = codexCliHeadersForVersion("not-a-version");
+
+    assert.equal(headers.originator, "codex_cli_rs");
+    assert.equal(Object.hasOwn(headers, "User-Agent"), false);
+  });
+
+  it("adds Codex CLI headers to ChatGPT OAuth requests", () => {
+    const previous = process.env.CODEX_AS_API_CODEX_CLI_VERSION;
+    process.env.CODEX_AS_API_CODEX_CLI_VERSION = "9.8.7";
+    try {
+      const provider = new ChatGPTOAuthProvider({ authJsonPath: writeAuthFile() });
+      const headers = (provider as unknown as { getHeaders(): Record<string, string> }).getHeaders();
+
+      assert.equal(headers.originator, "codex_cli_rs");
+      assert.match(headers["User-Agent"], /^codex_cli_rs\/9\.8\.7 \(.+\) codex-as-api$/);
+      assert.match(headers.Authorization, /^Bearer /);
+    } finally {
+      if (previous == null) {
+        delete process.env.CODEX_AS_API_CODEX_CLI_VERSION;
+      } else {
+        process.env.CODEX_AS_API_CODEX_CLI_VERSION = previous;
+      }
+    }
   });
 });
 

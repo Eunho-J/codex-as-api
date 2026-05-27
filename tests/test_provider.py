@@ -7,8 +7,8 @@ import pytest
 from codex_as_api.auth import ChatGPTOAuthError
 from codex_as_api.messages import Message, MessageRole, ToolCall, ToolSchema
 from codex_as_api.provider import (
-    ChatGPTOAuthProvider,
     REMOTE_COMPACTION_MARKER,
+    ChatGPTOAuthProvider,
     _decode_sse_block,
     _image_generation_from_item,
     _message_item,
@@ -21,6 +21,7 @@ from codex_as_api.provider import (
     _usage_from_response,
     _validate_image_content_items,
     _web_search_event_from_response_item,
+    codex_cli_headers_for_version,
 )
 
 
@@ -78,6 +79,32 @@ def test_responses_payload_includes_web_search_sources():
     assert payload["tools"] == [{"type": "web_search", "external_web_access": True}]
     assert payload["tool_choice"] == {"type": "web_search"}
     assert payload["include"] == ["web_search_call.action.sources"]
+
+
+def test_codex_cli_headers_include_official_originator_and_versioned_user_agent():
+    headers = codex_cli_headers_for_version("1.2.3\n")
+
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["User-Agent"].startswith("codex_cli_rs/1.2.3 (")
+    assert headers["User-Agent"].endswith(") codex-as-api")
+
+
+def test_codex_cli_headers_omit_user_agent_for_invalid_version():
+    headers = codex_cli_headers_for_version("not-a-version")
+
+    assert headers == {"originator": "codex_cli_rs"}
+
+
+def test_provider_headers_include_codex_cli_headers(auth_json_factory, monkeypatch):
+    monkeypatch.setenv("CODEX_AS_API_CODEX_CLI_VERSION", "9.8.7")
+    provider = ChatGPTOAuthProvider(auth_json_path=str(auth_json_factory()))
+
+    headers = provider._headers()  # noqa: SLF001 - regression test for backend request headers
+
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["User-Agent"].startswith("codex_cli_rs/9.8.7 (")
+    assert headers["User-Agent"].endswith(") codex-as-api")
+    assert headers["Authorization"].startswith("Bearer ")
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ from typing import Any
 from .auth import ChatGPTOAuthError, ChatGPTOAuthMissingError, is_auth_locally_available
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
-from .provider import ChatGPTOAuthProvider
+from .provider import ChatGPTOAuthProvider, prime_codex_cli_version_cache
 
 
 def _env_int(name: str, default: int) -> int:
@@ -688,6 +688,7 @@ try:
 
     def main() -> None:
         import uvicorn
+        prime_codex_cli_version_cache()
         uvicorn.run("codex_as_api.server:app", host=HOST, port=PORT, log_level="info")
 
 except ImportError as _import_exc:

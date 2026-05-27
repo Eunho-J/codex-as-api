@@ -129,6 +129,7 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
+| `CODEX_AS_API_CODEX_CLI_VERSION` | latest `@openai/codex` from npm | Override the Codex CLI version used in backend request `User-Agent` headers |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
 
 The server also reads root-level Codex CLI settings from `~/.codex/config.toml`:
@@ -542,7 +543,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.5.0` from the matching commit.
+- Publish a GitHub Release such as `v0.5.1` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 ## Tests
@@ -572,6 +573,11 @@ npm test
 
 
 ## Release Notes
+
+### v0.5.1
+
+- Add official Codex CLI `originator` and versioned `User-Agent` headers for ChatGPT/Codex OAuth requests.
+- Resolve the latest `@openai/codex` version from npm at server startup, with `CODEX_AS_API_CODEX_CLI_VERSION` as an explicit override.
 
 ### v0.5.0
 
