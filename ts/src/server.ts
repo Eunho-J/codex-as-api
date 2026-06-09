@@ -7,7 +7,11 @@ import {
 } from "./auth.js";
 import type { Message, ToolCall, ToolSchema } from "./messages.js";
 import { MessageRole } from "./messages.js";
-import { ChatGPTOAuthProvider, primeCodexCliVersionCache } from "./provider.js";
+import {
+  ChatGPTOAuthProvider,
+  primeCodexCliVersionCache,
+  toOpenAIChatCompletionUsage,
+} from "./provider.js";
 import {
   anthropicRequestToInternal,
   internalResponseToAnthropic,
@@ -255,10 +259,10 @@ export function createApp(opts?: {
                 typeof event.usage === "object" &&
                 event.usage !== null
               ) {
-                usageDict = event.usage as Record<
-                  string,
-                  unknown
-                >;
+                const normalized = toOpenAIChatCompletionUsage(
+                  event.usage,
+                );
+                usageDict = normalized as Record<string, unknown> | null;
               }
               const chunk = {
                 id: requestId,
@@ -279,22 +283,20 @@ export function createApp(opts?: {
           }
 
           if (usageDict) {
-            const u = usageDict;
-            const finishChunk = {
-              id: requestId,
-              object: "chat.completion.chunk",
-              created,
-              model: modelId,
-              choices: [],
-              usage: {
-                prompt_tokens: u.prompt_tokens ?? 0,
-                completion_tokens: u.completion_tokens ?? 0,
-                total_tokens: u.total_tokens ?? 0,
-              },
-            };
-            res.write(
-              `data: ${JSON.stringify(finishChunk)}\n\n`,
-            );
+            const usage = toOpenAIChatCompletionUsage(usageDict);
+            if (usage) {
+              const finishChunk = {
+                id: requestId,
+                object: "chat.completion.chunk",
+                created,
+                model: modelId,
+                choices: [],
+                usage,
+              };
+              res.write(
+                `data: ${JSON.stringify(finishChunk)}\n\n`,
+              );
+            }
           }
 
           res.write("data: [DONE]\n\n");

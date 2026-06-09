@@ -23,6 +23,54 @@ async function withServer(
   }
 }
 
+describe("OpenAI streaming usage", () => {
+  it("emits prompt_tokens and completion_tokens in the final usage chunk", async () => {
+    const provider = {
+      async *chatStream() {
+        yield { type: "content", text: "ok" };
+        yield {
+          type: "finish",
+          finish_reason: "stop",
+          usage: {
+            input_tokens: 18,
+            output_tokens: 5,
+            total_tokens: 23,
+          },
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+
+      assert.equal(res.status, 200);
+      const body = await res.text();
+      const usageLine = body
+        .split("\n")
+        .find((line) => line.includes('"usage"'));
+      assert.ok(usageLine);
+      const payload = JSON.parse(usageLine!.replace(/^data: /, "")) as {
+        usage: {
+          prompt_tokens: number;
+          completion_tokens: number;
+          total_tokens: number;
+        };
+      };
+      assert.equal(payload.usage.prompt_tokens, 18);
+      assert.equal(payload.usage.completion_tokens, 5);
+      assert.equal(payload.usage.total_tokens, 23);
+    });
+  });
+});
+
 describe("server error handling", () => {
   it("ends OpenAI streams with an SSE error instead of sending JSON after headers", async () => {
     const provider = {

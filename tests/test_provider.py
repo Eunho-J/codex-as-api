@@ -19,6 +19,7 @@ from codex_as_api.provider import (
     _tool_call_from_response_item,
     _tool_schema_to_response_dict,
     _usage_from_response,
+    _to_openai_chat_completion_usage,
     _validate_image_content_items,
     _web_search_event_from_response_item,
     codex_cli_headers_for_version,
@@ -302,6 +303,28 @@ def test_usage_from_response_non_dict_returns_none():
 
 def test_usage_from_response_missing_tokens_returns_none():
     assert _usage_from_response({"total_tokens": 10}) is None
+
+
+def test_to_openai_chat_completion_usage_maps_responses_api_fields():
+    usage = _to_openai_chat_completion_usage(
+        {"input_tokens": 18, "output_tokens": 5, "total_tokens": 23}
+    )
+    assert usage == {
+        "prompt_tokens": 18,
+        "completion_tokens": 5,
+        "total_tokens": 23,
+    }
+
+
+def test_to_openai_chat_completion_usage_falls_back_to_total_tokens():
+    usage = _to_openai_chat_completion_usage(
+        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 23}
+    )
+    assert usage == {
+        "prompt_tokens": 23,
+        "completion_tokens": 0,
+        "total_tokens": 23,
+    }
 
 
 # ---------------------------------------------------------------------------

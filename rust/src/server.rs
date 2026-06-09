@@ -18,7 +18,7 @@ use crate::anthropic_adapter::{
 use crate::auth::{self, AuthError};
 use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
-use crate::provider::{ChatGPTOAuthProvider, ProviderError};
+use crate::provider::{to_openai_chat_completion_usage, ChatGPTOAuthProvider, ProviderError};
 
 const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
 
@@ -547,9 +547,7 @@ async fn chat_completions(
                 }
                 "finish" => {
                     if let Some(usage) = event.get("usage") {
-                        if usage.is_object() {
-                            usage_dict = Some(usage.clone());
-                        }
+                        usage_dict = to_openai_chat_completion_usage(usage);
                     }
                     let finish_reason = event
                         .get("finish_reason")
@@ -575,21 +573,19 @@ async fn chat_completions(
         }
 
         if let Some(u) = &usage_dict {
-            let finish_chunk = json!({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_id,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "completion_tokens": u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "total_tokens": u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                },
-            });
-            sse_events.push(Ok(
-                Event::default().data(serde_json::to_string(&finish_chunk).unwrap())
-            ));
+            if let Some(usage) = to_openai_chat_completion_usage(u) {
+                let finish_chunk = json!({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [],
+                    "usage": usage,
+                });
+                sse_events.push(Ok(
+                    Event::default().data(serde_json::to_string(&finish_chunk).unwrap())
+                ));
+            }
         }
 
         sse_events.push(Ok(Event::default().data("[DONE]")));

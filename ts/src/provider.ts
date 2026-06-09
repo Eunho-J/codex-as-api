@@ -1096,6 +1096,54 @@ export function imageGenerationFromItem(
   };
 }
 
+export interface OpenAIChatCompletionUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/** Normalize provider usage into OpenAI Chat Completions `usage` fields. */
+export function toOpenAIChatCompletionUsage(
+  value: unknown,
+): OpenAIChatCompletionUsage | null {
+  if (typeof value !== "object" || value === null) return null;
+  const parsed = usageFromResponse(value);
+  const raw = value as Record<string, unknown>;
+  let promptTokens =
+    parsed?.prompt_tokens ??
+    (typeof raw.prompt_tokens === "number"
+      ? raw.prompt_tokens
+      : typeof raw.input_tokens === "number"
+        ? raw.input_tokens
+        : 0);
+  let completionTokens =
+    parsed?.completion_tokens ??
+    (typeof raw.completion_tokens === "number"
+      ? raw.completion_tokens
+      : typeof raw.output_tokens === "number"
+        ? raw.output_tokens
+        : 0);
+  let totalTokens =
+    parsed?.total_tokens ??
+    (typeof raw.total_tokens === "number"
+      ? raw.total_tokens
+      : promptTokens + completionTokens);
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens > 0) {
+    promptTokens = totalTokens;
+  }
+  if (totalTokens === 0 && (promptTokens > 0 || completionTokens > 0)) {
+    totalTokens = promptTokens + completionTokens;
+  }
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) {
+    return null;
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  };
+}
+
 export function usageFromResponse(value: unknown): Usage | null {
   if (
     typeof value !== "object" ||

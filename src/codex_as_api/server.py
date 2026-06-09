@@ -11,7 +11,11 @@ from typing import Any
 from .auth import ChatGPTOAuthError, ChatGPTOAuthMissingError, is_auth_locally_available
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
-from .provider import ChatGPTOAuthProvider, prime_codex_cli_version_cache
+from .provider import (
+    ChatGPTOAuthProvider,
+    _to_openai_chat_completion_usage,
+    prime_codex_cli_version_cache,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -429,7 +433,7 @@ try:
                     elif typ == "finish":
                         usage = event.get("usage")
                         if isinstance(usage, dict):
-                            usage_dict = usage
+                            usage_dict = _to_openai_chat_completion_usage(usage)
                         chunk = {
                             "id": request_id,
                             "object": "chat.completion.chunk",
@@ -445,20 +449,17 @@ try:
 
                 # Usage summary chunk if available
                 if usage_dict:
-                    u = usage_dict
-                    finish_chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": u.get("prompt_tokens", 0),
-                            "completion_tokens": u.get("completion_tokens", 0),
-                            "total_tokens": u.get("total_tokens", 0),
-                        },
-                    }
-                    yield f"data: {json.dumps(finish_chunk)}\n\n"
+                    usage = _to_openai_chat_completion_usage(usage_dict)
+                    if usage:
+                        finish_chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [],
+                            "usage": usage,
+                        }
+                        yield f"data: {json.dumps(finish_chunk)}\n\n"
 
                 yield "data: [DONE]\n\n"
 

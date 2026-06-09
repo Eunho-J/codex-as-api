@@ -18,6 +18,7 @@ import {
   validateImageContentItems,
   imageGenerationFromItem,
   usageFromResponse,
+  toOpenAIChatCompletionUsage,
   REMOTE_COMPACTION_MARKER,
   ChatGPTOAuthProvider,
   codexCliHeadersForVersion,
@@ -687,5 +688,33 @@ describe("usageFromResponse", () => {
     });
     assert.ok(result);
     assert.equal(result.cached_tokens, 25);
+  });
+});
+
+describe("toOpenAIChatCompletionUsage", () => {
+  it("maps Responses API input/output tokens to OpenAI usage fields", () => {
+    const result = toOpenAIChatCompletionUsage({
+      input_tokens: 18,
+      output_tokens: 5,
+      total_tokens: 23,
+    });
+    assert.deepEqual(result, {
+      prompt_tokens: 18,
+      completion_tokens: 5,
+      total_tokens: 23,
+    });
+  });
+
+  it("falls back to total_tokens when prompt and completion are zero", () => {
+    const result = toOpenAIChatCompletionUsage({
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 23,
+    });
+    assert.deepEqual(result, {
+      prompt_tokens: 23,
+      completion_tokens: 0,
+      total_tokens: 23,
+    });
   });
 });

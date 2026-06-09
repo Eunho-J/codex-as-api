@@ -866,6 +866,38 @@ def _text_from_response_items(items: Sequence[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _to_openai_chat_completion_usage(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    parsed = _usage_from_response(value)
+    prompt_tokens = (
+        parsed.prompt_tokens
+        if parsed is not None
+        else int(value.get("prompt_tokens") or value.get("input_tokens") or 0)
+    )
+    completion_tokens = (
+        parsed.completion_tokens
+        if parsed is not None
+        else int(value.get("completion_tokens") or value.get("output_tokens") or 0)
+    )
+    total_tokens = (
+        parsed.total_tokens
+        if parsed is not None and parsed.total_tokens is not None
+        else int(value.get("total_tokens") or prompt_tokens + completion_tokens)
+    )
+    if prompt_tokens == 0 and completion_tokens == 0 and total_tokens > 0:
+        prompt_tokens = total_tokens
+    if total_tokens == 0 and (prompt_tokens > 0 or completion_tokens > 0):
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _usage_from_response(value: Any) -> Usage | None:
     if not isinstance(value, dict):
         return None

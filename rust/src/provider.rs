@@ -1476,6 +1476,48 @@ pub fn usage_from_response(value: &Value) -> Option<Usage> {
     Some(Usage::new(prompt, completion, total, cached_tokens))
 }
 
+pub fn to_openai_chat_completion_usage(value: &Value) -> Option<Value> {
+    let parsed = usage_from_response(value);
+    let obj = value.as_object()?;
+    let mut prompt_tokens = parsed
+        .as_ref()
+        .map(|usage| usage.prompt_tokens)
+        .unwrap_or_else(|| {
+            obj.get("prompt_tokens")
+                .or_else(|| obj.get("input_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        });
+    let mut completion_tokens = parsed
+        .as_ref()
+        .map(|usage| usage.completion_tokens)
+        .unwrap_or_else(|| {
+            obj.get("completion_tokens")
+                .or_else(|| obj.get("output_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        });
+    let mut total_tokens = parsed
+        .as_ref()
+        .map(|usage| usage.total_tokens)
+        .or_else(|| obj.get("total_tokens").and_then(|v| v.as_i64()))
+        .unwrap_or(prompt_tokens + completion_tokens);
+    if prompt_tokens == 0 && completion_tokens == 0 && total_tokens > 0 {
+        prompt_tokens = total_tokens;
+    }
+    if total_tokens == 0 && (prompt_tokens > 0 || completion_tokens > 0) {
+        total_tokens = prompt_tokens + completion_tokens;
+    }
+    if prompt_tokens == 0 && completion_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1736,6 +1778,32 @@ mod tests {
     fn test_usage_from_response_invalid() {
         let val = json!({"foo": "bar"});
         assert!(usage_from_response(&val).is_none());
+    }
+
+    #[test]
+    fn test_to_openai_chat_completion_usage_maps_responses_api_fields() {
+        let val = json!({
+            "input_tokens": 18,
+            "output_tokens": 5,
+            "total_tokens": 23
+        });
+        let usage = to_openai_chat_completion_usage(&val).unwrap();
+        assert_eq!(usage["prompt_tokens"], 18);
+        assert_eq!(usage["completion_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 23);
+    }
+
+    #[test]
+    fn test_to_openai_chat_completion_usage_falls_back_to_total_tokens() {
+        let val = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 23
+        });
+        let usage = to_openai_chat_completion_usage(&val).unwrap();
+        assert_eq!(usage["prompt_tokens"], 23);
+        assert_eq!(usage["completion_tokens"], 0);
+        assert_eq!(usage["total_tokens"], 23);
     }
 
     #[test]
