@@ -2,6 +2,7 @@ mod anthropic_adapter;
 mod auth;
 mod codex_config;
 mod messages;
+mod model_capabilities;
 mod protocol;
 mod provider;
 mod server;

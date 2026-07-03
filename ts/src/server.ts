@@ -146,6 +146,9 @@ export function createApp(opts?: {
           serviceTier: body.service_tier,
           text: body.text,
           clientMetadata: body.client_metadata,
+          codexMetadata: body.codex_metadata,
+          responsesLite: body.responses_lite,
+          parallelToolCalls: body.parallel_tool_calls,
         };
 
         const modelId = `codex-oauth:${body.model || MODEL}`;

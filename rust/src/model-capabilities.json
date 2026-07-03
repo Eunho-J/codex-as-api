@@ -1,0 +1,58 @@
+{
+  "models": {
+    "gpt-5.5": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "service_tiers": ["priority"],
+      "default_service_tier": null,
+      "source": "upstream-models-json"
+    },
+    "gpt-5.4": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "service_tiers": ["priority"],
+      "default_service_tier": null,
+      "source": "upstream-models-json"
+    },
+    "gpt-5.4-mini": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "medium",
+      "service_tiers": [],
+      "default_service_tier": null,
+      "source": "upstream-models-json"
+    },
+    "gpt-5.3-codex": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "service_tiers": [],
+      "default_service_tier": null,
+      "source": "upstream-models-json"
+    },
+    "gpt-5.2": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "service_tiers": [],
+      "default_service_tier": null,
+      "source": "upstream-models-json"
+    },
+    "gpt-5.3-codex-spark": {
+      "use_responses_lite": false,
+      "supports_parallel_tool_calls": false,
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "service_tiers": [],
+      "default_service_tier": null,
+      "source": "README-only; upstream ModelInfo entry not present in checked commit, keep conservative until verified"
+    }
+  }
+}

@@ -201,7 +201,56 @@ def test_load_token_data_root_not_dict_raises(tmp_path):
 def test_load_token_data_missing_tokens_raises(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text(json.dumps({}))
-    with pytest.raises(ChatGPTOAuthError):
+    with pytest.raises(ChatGPTOAuthError, match="file-backed ChatGPT OAuth tokens are required"):
+        load_token_data(str(p))
+
+
+def test_load_token_data_supports_latest_root_token_fields(tmp_path, make_jwt):
+    id_token = make_jwt({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acc-root",
+            "chatgpt_plan_type": "plus",
+            "chatgpt_user_id": "user-root",
+        }
+    })
+    access_token = make_jwt({"exp": 9999999999})
+    p = tmp_path / "auth.json"
+    p.write_text(json.dumps({
+        "access_token": access_token,
+        "refresh_token": "refresh-root",
+        "id_token": id_token,
+        "personal_access_token": "pat-present-but-not-primary",
+        "agent_identity": {"id": "agent"},
+    }))
+
+    data = load_token_data(str(p))
+
+    assert data.access_token == access_token
+    assert data.refresh_token == "refresh-root"
+    assert data.account_id == "acc-root"
+
+
+def test_load_token_data_pat_only_has_specific_error(tmp_path):
+    p = tmp_path / "auth.json"
+    p.write_text(json.dumps({"personal_access_token": "pat-only"}))
+
+    with pytest.raises(ChatGPTOAuthError, match="personal_access_token-only auth is not supported"):
+        load_token_data(str(p))
+
+
+def test_load_token_data_agent_identity_only_has_specific_error(tmp_path):
+    p = tmp_path / "auth.json"
+    p.write_text(json.dumps({"agent_identity": {"id": "agent-only"}}))
+
+    with pytest.raises(ChatGPTOAuthError, match="agent_identity-only auth is not supported"):
+        load_token_data(str(p))
+
+
+def test_load_token_data_bedrock_only_has_specific_error(tmp_path):
+    p = tmp_path / "auth.json"
+    p.write_text(json.dumps({"bedrock_api_key": "bedrock-only"}))
+
+    with pytest.raises(ChatGPTOAuthError, match="bedrock_api_key-only auth is not supported"):
         load_token_data(str(p))
 
 

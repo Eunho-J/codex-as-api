@@ -93,6 +93,83 @@ describe("ChatGPTOAuthProvider payload", () => {
     assert.deepEqual(payload.tool_choice, { type: "web_search" });
     assert.deepEqual(payload.include, ["web_search_call.action.sources"]);
   });
+
+  it("adds encrypted reasoning include when reasoning effort is present", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; reasoningEffort: string }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", reasoningEffort: "high" });
+
+    assert.deepEqual(payload.reasoning, { effort: "high" });
+    assert.deepEqual(payload.include, ["reasoning.encrypted_content"]);
+  });
+
+  it("forces Responses Lite payload shape", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const tool: ToolSchema = { name: "lookup", description: "Lookup", parameters: { type: "object" } };
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; tools: ToolSchema[]; responsesLite: boolean }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", tools: [tool], responsesLite: true });
+
+    assert.equal(Object.hasOwn(payload, "tools"), false);
+    assert.equal(payload.parallel_tool_calls, false);
+    assert.deepEqual((payload.input as Record<string, unknown>[])[0], { type: "developer_message", content: "You are helpful." });
+    assert.deepEqual((payload.input as Record<string, unknown>[])[1], {
+      type: "developer_message",
+      additional_tools: [{ type: "function", name: "lookup", description: "Lookup", parameters: { type: "object" }, strict: false }],
+    });
+  });
+
+  it("Responses Lite auto uses the shared capability table", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const payload = (provider as unknown as {
+      responsesPayload(
+        messages: Message[],
+        opts: { model: string; responsesLite: string; serviceTier: string },
+      ): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", responsesLite: "auto", serviceTier: "priority" });
+    const unknownPayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; serviceTier: string }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "unknown-model", serviceTier: "priority" });
+
+    assert.equal(Object.hasOwn(payload, "tools"), true);
+    assert.deepEqual(payload.text, { verbosity: "low" });
+    assert.equal(payload.service_tier, "priority");
+    assert.equal(Object.hasOwn(unknownPayload, "service_tier"), false);
+  });
+
+  it("parallel tool calls use the shared capability table", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; parallelToolCalls: boolean }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", parallelToolCalls: true });
+    const sparkPayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; parallelToolCalls: boolean }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.3-codex-spark", parallelToolCalls: true });
+    const litePayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; parallelToolCalls: boolean; responsesLite: boolean }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), { model: "gpt-5.5", parallelToolCalls: true, responsesLite: true });
+
+    assert.equal(payload.parallel_tool_calls, true);
+    assert.equal(sparkPayload.parallel_tool_calls, false);
+    assert.equal(litePayload.parallel_tool_calls, false);
+  });
+
+  it("codex metadata mode overlays reserved keys", () => {
+    const provider = new ChatGPTOAuthProvider({ authJsonPath: writeAuthFile() });
+    const payload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: { model: string; clientMetadata: Record<string, string>; codexMetadata: boolean }): Record<string, unknown>;
+    }).responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      clientMetadata: { app: "kept", turn_id: "user-value" },
+      codexMetadata: true,
+    });
+    const metadata = payload.client_metadata as Record<string, string>;
+
+    assert.equal(metadata.app, "kept");
+    assert.notEqual(metadata.turn_id, "user-value");
+    assert.equal(JSON.parse(metadata["x-codex-turn-metadata"]).source, "codex-as-api");
+  });
 });
 
 describe("Codex CLI request headers", () => {
@@ -395,12 +472,14 @@ describe("setReasoningPayload", () => {
     const payload: Record<string, unknown> = {};
     setReasoningPayload(payload, "high");
     assert.deepEqual(payload.reasoning, { effort: "high" });
+    assert.deepEqual(payload.include, ["reasoning.encrypted_content"]);
   });
 
   it("normalizes case", () => {
     const payload: Record<string, unknown> = {};
     setReasoningPayload(payload, "HIGH");
     assert.deepEqual(payload.reasoning, { effort: "high" });
+    assert.deepEqual(payload.include, ["reasoning.encrypted_content"]);
   });
 
   it("does nothing for undefined", () => {
@@ -428,6 +507,7 @@ describe("setReasoningPayload", () => {
       const payload: Record<string, unknown> = {};
       setReasoningPayload(payload, effort);
       assert.deepEqual(payload.reasoning, { effort });
+      assert.deepEqual(payload.include, ["reasoning.encrypted_content"]);
     }
   });
 });

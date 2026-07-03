@@ -56,7 +56,7 @@ class ChatGPTTokenData:
 
     @property
     def expired(self) -> bool:
-        return self.access_expires_at is not None and self.access_expires_at <= _dt.datetime.now(_dt.UTC)
+        return self.access_expires_at is not None and self.access_expires_at <= _dt.datetime.now(_dt.timezone.utc)
 
 
 def resolve_auth_path(raw: str | None = None) -> pathlib.Path:
@@ -86,7 +86,7 @@ def _expiration(jwt: str) -> _dt.datetime | None:
     exp = claims.get("exp")
     if not isinstance(exp, int):
         return None
-    return _dt.datetime.fromtimestamp(exp, _dt.UTC)
+    return _dt.datetime.fromtimestamp(exp, _dt.timezone.utc)
 
 
 def _auth_claims(jwt: str) -> dict[str, Any]:
@@ -123,14 +123,19 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
     if mode not in {"chatgpt", "Chatgpt", "chatgpt_auth_tokens", "ChatgptAuthTokens", None}:
         raise ChatGPTOAuthError(f"ChatGPT OAuth auth_mode required, got {mode!r}")
     tokens = data.get("tokens")
+    if tokens is None:
+        tokens = _root_tokens_from_latest_auth(data)
     if not isinstance(tokens, dict):
-        raise ChatGPTOAuthError("ChatGPT OAuth token data is not available")
+        raise ChatGPTOAuthError(_unsupported_auth_schema_message(data))
     access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or access_token == "":
+        raise ChatGPTOAuthError("ChatGPT OAuth access_token is missing")
     refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or refresh_token == "":
+        raise ChatGPTOAuthError("ChatGPT OAuth refresh_token is missing")
     id_token = tokens.get("id_token")
-    for name, value in (("access_token", access_token), ("refresh_token", refresh_token), ("id_token", id_token)):
-        if not isinstance(value, str) or value == "":
-            raise ChatGPTOAuthError(f"ChatGPT OAuth {name} is missing")
+    if not isinstance(id_token, str) or id_token == "":
+        raise ChatGPTOAuthError("ChatGPT OAuth id_token is missing")
     register_token_secrets(access_token, refresh_token, id_token)
     id_auth = _auth_claims(id_token)
     access_auth = _auth_claims(access_token)
@@ -139,7 +144,12 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
         raise ChatGPTOAuthError("ChatGPT OAuth account id not available; rerun codex login")
     register_token_secrets(account_id)
     plan = id_auth.get("chatgpt_plan_type") or access_auth.get("chatgpt_plan_type")
-    user = id_auth.get("chatgpt_user_id") or id_auth.get("user_id") or access_auth.get("chatgpt_user_id") or access_auth.get("user_id")
+    user = (
+        id_auth.get("chatgpt_user_id")
+        or id_auth.get("user_id")
+        or access_auth.get("chatgpt_user_id")
+        or access_auth.get("user_id")
+    )
     fedramp = bool(id_auth.get("chatgpt_account_is_fedramp") or access_auth.get("chatgpt_account_is_fedramp"))
     return ChatGPTTokenData(
         auth_path=path,
@@ -152,6 +162,24 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
         fedramp=fedramp,
         access_expires_at=_expiration(access_token),
     )
+
+
+def _root_tokens_from_latest_auth(data: dict[str, Any]) -> dict[str, Any] | None:
+    token_names = ("access_token", "refresh_token", "id_token", "account_id")
+    if any(isinstance(data.get(name), str) for name in token_names):
+        return {name: data[name] for name in token_names if name in data}
+    return None
+
+
+def _unsupported_auth_schema_message(data: dict[str, Any]) -> str:
+    token_keys = ("tokens", "access_token", "refresh_token", "id_token")
+    if "personal_access_token" in data and not any(key in data for key in token_keys):
+        return "ChatGPT OAuth personal_access_token-only auth is not supported; rerun codex login to create file-backed tokens"
+    if "agent_identity" in data and not any(key in data for key in token_keys):
+        return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens"
+    if "bedrock_api_key" in data and not any(key in data for key in token_keys):
+        return "ChatGPT OAuth bedrock_api_key-only auth is not supported by the ChatGPT OAuth backend"
+    return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; rerun codex login"
 
 
 def is_auth_locally_available(auth_json_path: str | pathlib.Path | None = None) -> bool:
@@ -234,6 +262,6 @@ def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTo
             tokens["access_token"] = payload["access_token"]
         if payload.get("refresh_token"):
             tokens["refresh_token"] = payload["refresh_token"]
-        data["last_refresh"] = _dt.datetime.now(_dt.UTC).isoformat().replace("+00:00", "Z")
+        data["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
         _write_auth_json(current.auth_path, data)
         return load_token_data(auth_json_path)

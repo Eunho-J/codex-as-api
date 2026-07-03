@@ -153,9 +153,10 @@ export function loadTokenData(authJsonPath?: string | null): ChatGPTTokenData {
   if (!validModes.has(mode as string | undefined | null)) {
     throw new ChatGPTOAuthError(`ChatGPT OAuth auth_mode required, got ${JSON.stringify(mode)}`);
   }
-  const tokens = d["tokens"];
+  let tokens = d["tokens"];
+  if (tokens == null) tokens = rootTokensFromLatestAuth(d);
   if (typeof tokens !== "object" || tokens === null || Array.isArray(tokens)) {
-    throw new ChatGPTOAuthError("ChatGPT OAuth token data is not available");
+    throw new ChatGPTOAuthError(unsupportedAuthSchemaMessage(d));
   }
   const t = tokens as Record<string, unknown>;
   const access_token = t["access_token"];
@@ -200,6 +201,26 @@ export function loadTokenData(authJsonPath?: string | null): ChatGPTTokenData {
     fedramp,
     access_expires_at: expiration(access_token as string),
   };
+}
+
+function rootTokensFromLatestAuth(data: Record<string, unknown>): Record<string, unknown> | null {
+  const names = ["access_token", "refresh_token", "id_token", "account_id"];
+  if (!names.some((name) => typeof data[name] === "string")) return null;
+  return Object.fromEntries(names.filter((name) => name in data).map((name) => [name, data[name]]));
+}
+
+function unsupportedAuthSchemaMessage(data: Record<string, unknown>): string {
+  const hasFileTokens = ["tokens", "access_token", "refresh_token", "id_token"].some((key) => key in data);
+  if ("personal_access_token" in data && !hasFileTokens) {
+    return "ChatGPT OAuth personal_access_token-only auth is not supported; rerun codex login to create file-backed tokens";
+  }
+  if ("agent_identity" in data && !hasFileTokens) {
+    return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens";
+  }
+  if ("bedrock_api_key" in data && !hasFileTokens) {
+    return "ChatGPT OAuth bedrock_api_key-only auth is not supported by the ChatGPT OAuth backend";
+  }
+  return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; rerun codex login";
 }
 
 export function isAuthLocallyAvailable(authJsonPath?: string | null): boolean {

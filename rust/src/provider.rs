@@ -1,5 +1,10 @@
 use crate::auth::{self, AuthError, ChatGPTTokenData};
 use crate::messages::{AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage};
+use crate::model_capabilities::{
+    apply_model_capability_fields, build_codex_client_metadata, resolve_codex_metadata_enabled,
+    should_enable_parallel_tool_calls, strip_image_detail_fields, use_responses_lite,
+    LITE_HEADER_NAME, LITE_HEADER_VALUE,
+};
 use crate::protocol::{reasoning_from_response_items, response_failure_message};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -201,6 +206,9 @@ impl ChatGPTOAuthProvider {
         service_tier: Option<&str>,
         text: Option<&Value>,
         client_metadata: Option<&HashMap<String, String>>,
+        codex_metadata: Option<bool>,
+        responses_lite: Option<&Value>,
+        parallel_tool_calls: Option<bool>,
     ) -> Result<AssistantResponse, ProviderError> {
         let mut content_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
@@ -225,6 +233,9 @@ impl ChatGPTOAuthProvider {
             service_tier,
             text,
             client_metadata,
+            codex_metadata,
+            responses_lite,
+            parallel_tool_calls,
         )?;
 
         for event in events {
@@ -317,6 +328,9 @@ impl ChatGPTOAuthProvider {
         service_tier: Option<&str>,
         text: Option<&Value>,
         client_metadata: Option<&HashMap<String, String>>,
+        codex_metadata: Option<bool>,
+        responses_lite: Option<&Value>,
+        parallel_tool_calls: Option<bool>,
     ) -> Result<Vec<Value>, ProviderError> {
         let _ = temperature;
         let payload = self.responses_payload(
@@ -332,9 +346,21 @@ impl ChatGPTOAuthProvider {
             service_tier,
             text,
             client_metadata,
+            codex_metadata,
+            responses_lite,
+            parallel_tool_calls,
         )?;
 
         let mut extra_headers: HashMap<String, String> = HashMap::new();
+        let mut payload = payload;
+        if payload
+            .as_object_mut()
+            .and_then(|obj| obj.remove("_codex_as_api_responses_lite"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            extra_headers.insert(LITE_HEADER_NAME.to_string(), LITE_HEADER_VALUE.to_string());
+        }
         if let Some(sa) = subagent {
             extra_headers.insert("x-openai-subagent".to_string(), sa.to_string());
         }
@@ -718,6 +744,9 @@ impl ChatGPTOAuthProvider {
         service_tier: Option<&str>,
         text: Option<&Value>,
         client_metadata: Option<&HashMap<String, String>>,
+        codex_metadata: Option<bool>,
+        responses_lite: Option<&Value>,
+        parallel_tool_calls: Option<bool>,
     ) -> Result<Value, ProviderError> {
         let (instructions, input_items) = split_instructions_and_input(messages);
 
@@ -743,14 +772,17 @@ impl ChatGPTOAuthProvider {
             Some(ts) => ts.iter().map(tool_schema_to_response_dict).collect(),
             None => vec![],
         };
+        let request_model = model.unwrap_or(&self.model);
+        let lite =
+            use_responses_lite(request_model, responses_lite).map_err(ProviderError::Request)?;
 
         let mut payload = json!({
-            "model": model.unwrap_or(&self.model),
+            "model": request_model,
             "instructions": instructions,
             "input": input_items,
             "tools": tools_array,
             "tool_choice": tool_choice.cloned().unwrap_or(json!("auto")),
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": should_enable_parallel_tool_calls(request_model, parallel_tool_calls, lite),
             "stream": true,
             "store": false,
             "include": [],
@@ -786,18 +818,12 @@ impl ChatGPTOAuthProvider {
                 Value::String(prid.to_string()),
             );
         }
-        if let Some(st) = service_tier {
-            payload
-                .as_object_mut()
-                .unwrap()
-                .insert("service_tier".to_string(), Value::String(st.to_string()));
-        }
-        if let Some(t) = text {
-            payload
-                .as_object_mut()
-                .unwrap()
-                .insert("text".to_string(), t.clone());
-        }
+        apply_model_capability_fields(
+            payload.as_object_mut().unwrap(),
+            request_model,
+            text,
+            service_tier,
+        );
         if let Some(cm) = client_metadata {
             let map: serde_json::Map<String, Value> = cm
                 .iter()
@@ -808,8 +834,23 @@ impl ChatGPTOAuthProvider {
                 .unwrap()
                 .insert("client_metadata".to_string(), Value::Object(map));
         }
+        if resolve_codex_metadata_enabled(codex_metadata).map_err(ProviderError::Request)? {
+            let merged =
+                build_codex_client_metadata(self.auth_json_path.as_deref(), client_metadata);
+            let map: serde_json::Map<String, Value> = merged
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("client_metadata".to_string(), Value::Object(map));
+        }
 
         set_reasoning_payload(payload.as_object_mut().unwrap(), reasoning_effort)?;
+        if lite {
+            apply_responses_lite_payload(payload.as_object_mut().unwrap(), &tools_array);
+        }
 
         Ok(payload)
     }
@@ -1208,6 +1249,42 @@ fn tool_schema_to_response_dict(tool: &ToolSchema) -> Value {
     })
 }
 
+fn apply_responses_lite_payload(
+    payload: &mut serde_json::Map<String, Value>,
+    tools_payload: &[Value],
+) {
+    let instructions = payload
+        .remove("instructions")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    payload.remove("tools");
+    payload.remove("tool_choice");
+    payload.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+    let input = payload
+        .remove("input")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut items = vec![json!({"type": "developer_message", "content": instructions})];
+    if !tools_payload.is_empty() {
+        items.push(json!({"type": "developer_message", "additional_tools": tools_payload}));
+    }
+    items.extend(input);
+    payload.insert(
+        "input".to_string(),
+        strip_image_detail_fields(Value::Array(items)),
+    );
+    if let Some(reasoning) = payload.get_mut("reasoning").and_then(|v| v.as_object_mut()) {
+        reasoning.insert(
+            "context".to_string(),
+            Value::String("all_turns".to_string()),
+        );
+    }
+    payload.insert(
+        "_codex_as_api_responses_lite".to_string(),
+        Value::Bool(true),
+    );
+}
+
 fn compact_raw_events(events: &[Value]) -> Vec<Value> {
     let mut keep: Vec<Value> = events
         .iter()
@@ -1359,6 +1436,19 @@ fn set_reasoning_payload(
     }
 
     payload.insert("reasoning".to_string(), json!({"effort": lower}));
+    let include = payload
+        .entry("include".to_string())
+        .or_insert_with(|| json!([]));
+    if !include.is_array() {
+        *include = json!([]);
+    }
+    let include_items = include.as_array_mut().unwrap();
+    if !include_items
+        .iter()
+        .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
+    {
+        include_items.push(json!("reasoning.encrypted_content"));
+    }
 
     Ok(())
 }
@@ -1523,6 +1613,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -1580,6 +1673,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -1592,6 +1688,298 @@ mod tests {
             payload["include"],
             json!(["web_search_call.action.sources"])
         );
+    }
+
+    #[test]
+    fn test_responses_payload_reasoning_includes_encrypted_content() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                Some("high"),
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(payload["reasoning"], json!({"effort": "high"}));
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn test_responses_payload_forces_responses_lite_shape() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+        let tools = vec![ToolSchema {
+            name: "lookup".to_string(),
+            description: "Lookup".to_string(),
+            parameters: json!({"type": "object"}),
+        }];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                Some(&tools),
+                Some("low"),
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!(true)),
+                None,
+            )
+            .unwrap();
+
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
+        assert_eq!(payload["reasoning"]["context"], json!("all_turns"));
+        assert_eq!(
+            payload["input"][0],
+            json!({"type": "developer_message", "content": "You are helpful."})
+        );
+        assert_eq!(
+            payload["input"][1],
+            json!({"type": "developer_message", "additional_tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object"},
+                "strict": false
+            }]})
+        );
+    }
+
+    #[test]
+    fn test_responses_payload_responses_lite_auto_uses_capability_table() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                None,
+                Some("priority"),
+                None,
+                None,
+                None,
+                Some(&json!("auto")),
+                None,
+            )
+            .unwrap();
+        let unknown_payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("unknown-model"),
+                None,
+                Some("priority"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(payload.get("tools").is_some());
+        assert_eq!(payload["text"], json!({"verbosity": "low"}));
+        assert_eq!(payload["service_tier"], json!("priority"));
+        assert!(unknown_payload.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn test_responses_payload_parallel_tool_calls_uses_capability_table() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        );
+        let messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: "You are helpful.".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                images: vec![],
+            },
+        ];
+
+        let payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let spark_payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.3-codex-spark"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let lite_payload = provider
+            .responses_payload(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("gpt-5.5"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!(true)),
+                Some(true),
+            )
+            .unwrap();
+
+        assert_eq!(payload["parallel_tool_calls"], json!(true));
+        assert_eq!(spark_payload["parallel_tool_calls"], json!(false));
+        assert_eq!(lite_payload["parallel_tool_calls"], json!(false));
     }
 
     #[test]
@@ -1673,7 +2061,8 @@ mod tests {
     fn test_set_reasoning_payload_valid() {
         let mut payload = serde_json::Map::new();
         set_reasoning_payload(&mut payload, Some("high")).unwrap();
-        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["reasoning"], json!({"effort": "high"}));
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[test]

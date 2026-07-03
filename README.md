@@ -38,6 +38,8 @@ codex login
 
 The server reads that file to obtain and refresh ChatGPT OAuth tokens automatically.
 
+`tokens` and latest root-level `access_token` / `refresh_token` / `id_token` auth files are supported. `personal_access_token`-only, `agent_identity`-only, and `bedrock_api_key`-only auth files are not supported for the ChatGPT OAuth backend; rerun `codex login` if you hit that diagnostic.
+
 ## Install & Run
 
 ### Python
@@ -130,6 +132,8 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
 | `CODEX_AS_API_CODEX_CLI_VERSION` | latest `@openai/codex` from npm | Override the Codex CLI version used in backend request `User-Agent` headers |
+| `CODEX_AS_API_RESPONSES_LITE` | `auto` | Responses Lite mode: `auto`, `on`, or `off` |
+| `CODEX_AS_API_CODEX_METADATA` | `off` | Add Codex-style per-turn `client_metadata` and related backend headers |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
 
 The server also reads root-level Codex CLI settings from `~/.codex/config.toml`:
@@ -152,6 +156,8 @@ model_auto_compact_token_limit = 160000
 | `gpt-5.3-codex` | Coding-optimized model |
 | `gpt-5.3-codex-spark` | Ultra-fast coding model |
 | `gpt-5.2` | Previous generation model |
+
+Model capability behavior is driven by `config/model-capabilities.json` across Python, TypeScript, and Rust. Unknown models use conservative defaults: classic Responses payloads, no assumed parallel tool support, and no automatic verbosity or service-tier assumptions.
 
 To use a different port:
 
@@ -363,6 +369,8 @@ curl http://localhost:18080/v1/chat/completions \
 
 Controls how much compute the model spends on reasoning. Valid values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 
+When reasoning is enabled, backend requests include `reasoning.encrypted_content` so Codex can preserve encrypted reasoning state when the backend supports it.
+
 ```bash
 curl http://localhost:18080/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -375,6 +383,22 @@ curl http://localhost:18080/v1/chat/completions \
     "reasoning_effort": "high"
   }'
 ```
+
+### `responses_lite`
+
+Controls the Codex Responses Lite request shape. Accepted values are `true`, `false`, and `"auto"`. Request value takes precedence over `CODEX_AS_API_RESPONSES_LITE`; default is `"auto"`.
+
+In `"auto"` mode, this package only uses Lite when the shared model capability table says the selected model should use it. Current bundled model entries default to classic Responses payloads. Setting `responses_lite: true` forces Lite and moves tools/instructions into Lite-compatible developer input items.
+
+### `parallel_tool_calls`
+
+Set `parallel_tool_calls: true` to request parallel tool calls when the selected model capability allows it. The shared capability table gates this field, and Responses Lite always keeps `parallel_tool_calls` disabled.
+
+### `client_metadata` and `codex_metadata`
+
+`client_metadata` is forwarded to the Codex backend. Set `codex_metadata: true` or `CODEX_AS_API_CODEX_METADATA=on` to overlay Codex-style turn metadata keys such as `turn_id`, `session_id`, `thread_id`, and `x-codex-turn-metadata`.
+
+Do not rely on user-supplied values for those reserved Codex metadata keys when metadata mode is enabled; this package regenerates them per turn.
 
 ### `previous_response_id`
 
@@ -543,7 +567,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.5.1` from the matching commit.
+- Publish a GitHub Release such as `v0.5.2` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 ## Tests
@@ -573,6 +597,12 @@ npm test
 
 
 ## Release Notes
+
+### v0.5.2
+
+- Support latest Codex root-level OAuth token files while keeping PAT-only, agent-identity-only, and Bedrock-only auth files explicitly unsupported.
+- Add shared model capability gating for Responses Lite, parallel tool calls, verbosity, and service-tier behavior across Python, TypeScript, and Rust.
+- Preserve encrypted reasoning state via top-level `reasoning.encrypted_content` include and add Codex metadata forwarding controls.
 
 ### v0.5.1
 

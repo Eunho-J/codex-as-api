@@ -9,6 +9,7 @@ import {
   redactText,
   loadTokenData,
   isAuthLocallyAvailable,
+  refreshToken,
   ChatGPTOAuthError,
   ChatGPTOAuthMissingError,
 } from "../auth.js";
@@ -118,6 +119,91 @@ describe("loadTokenData", () => {
       () => loadTokenData(filePath),
       ChatGPTOAuthError,
     );
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("loads latest root token fields", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-test-"));
+    const idToken = makeJwt({
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "acct-root",
+        chatgpt_plan_type: "plus",
+        chatgpt_user_id: "user-root",
+      },
+    });
+    const accessToken = makeJwt({ exp: 9999999999 });
+    const filePath = writeAuthJson(dir, {
+      access_token: accessToken,
+      refresh_token: "refresh-root",
+      id_token: idToken,
+      personal_access_token: "pat-present-but-not-primary",
+      agent_identity: { id: "agent" },
+    });
+
+    const data = loadTokenData(filePath);
+
+    assert.equal(data.access_token, accessToken);
+    assert.equal(data.refresh_token, "refresh-root");
+    assert.equal(data.account_id, "acct-root");
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("refresh persists tokens object for latest root token files", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-test-"));
+    const oldToken = makeJwt({
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-old" },
+      exp: 9999999999,
+    });
+    const newToken = makeJwt({
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-new" },
+      exp: 9999999999,
+    });
+    const filePath = writeAuthJson(dir, {
+      access_token: oldToken,
+      refresh_token: "refresh-old",
+      id_token: oldToken,
+    });
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      access_token: newToken,
+      refresh_token: "refresh-new",
+      id_token: newToken,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      const data = await refreshToken(filePath);
+      const stored = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, Record<string, string>>;
+
+      assert.equal(data.account_id, "acct-new");
+      assert.equal(stored.tokens.access_token, newToken);
+      assert.equal(stored.tokens.refresh_token, "refresh-new");
+      assert.equal(stored.tokens.id_token, newToken);
+    } finally {
+      globalThis.fetch = previousFetch;
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("reports unsupported PAT-only auth", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-test-"));
+    const filePath = writeAuthJson(dir, { personal_access_token: "pat-only" });
+
+    assert.throws(() => loadTokenData(filePath), /personal_access_token-only auth is not supported/);
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("reports unsupported agent-only auth", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-test-"));
+    const filePath = writeAuthJson(dir, { agent_identity: { id: "agent-only" } });
+
+    assert.throws(() => loadTokenData(filePath), /agent_identity-only auth is not supported/);
+    fs.rmSync(dir, { recursive: true });
+  });
+
+  it("reports unsupported Bedrock-only auth", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-test-"));
+    const filePath = writeAuthJson(dir, { bedrock_api_key: "bedrock-only" });
+
+    assert.throws(() => loadTokenData(filePath), /bedrock_api_key-only auth is not supported/);
     fs.rmSync(dir, { recursive: true });
   });
 

@@ -71,14 +71,138 @@ def test_responses_payload_includes_web_search_sources():
         tools=[web_search_tool],
         tool_choice={"type": "web_search"},
         temperature=None,
-        reasoning_effort=None,
+        reasoning_effort="low",
         stop=None,
         prompt_cache_key=None,
     )
 
     assert payload["tools"] == [{"type": "web_search", "external_web_access": True}]
     assert payload["tool_choice"] == {"type": "web_search"}
-    assert payload["include"] == ["web_search_call.action.sources"]
+    assert payload["include"] == ["web_search_call.action.sources", "reasoning.encrypted_content"]
+
+
+def test_responses_payload_reasoning_includes_encrypted_content():
+    provider = ChatGPTOAuthProvider()
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        reasoning_effort="high",
+    )
+
+    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["include"] == ["reasoning.encrypted_content"]
+
+
+def test_responses_payload_forces_responses_lite_shape():
+    provider = ChatGPTOAuthProvider()
+    tool = ToolSchema(name="lookup", description="Lookup", parameters={"type": "object"})
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        tools=[tool],
+        reasoning_effort="low",
+        responses_lite=True,
+    )
+
+    assert "tools" not in payload
+    assert payload["parallel_tool_calls"] is False
+    assert payload["reasoning"]["context"] == "all_turns"
+    assert payload["include"] == ["reasoning.encrypted_content"]
+    assert payload["input"][0] == {"type": "developer_message", "content": "You are helpful."}
+    assert payload["input"][1] == {
+        "type": "developer_message",
+        "additional_tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object"},
+                "strict": False,
+            }
+        ],
+    }
+
+
+def test_responses_payload_responses_lite_auto_uses_capability_table():
+    provider = ChatGPTOAuthProvider()
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        service_tier="priority",
+        responses_lite="auto",
+    )
+    unknown_payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="unknown-model",
+        service_tier="priority",
+    )
+
+    assert "tools" in payload
+    assert payload["text"] == {"verbosity": "low"}
+    assert payload["service_tier"] == "priority"
+    assert "service_tier" not in unknown_payload
+
+
+def test_responses_payload_parallel_tool_calls_uses_capability_table():
+    provider = ChatGPTOAuthProvider()
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        parallel_tool_calls=True,
+    )
+    spark_payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.3-codex-spark",
+        parallel_tool_calls=True,
+    )
+    lite_payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        parallel_tool_calls=True,
+        responses_lite=True,
+    )
+
+    assert payload["parallel_tool_calls"] is True
+    assert spark_payload["parallel_tool_calls"] is False
+    assert lite_payload["parallel_tool_calls"] is False
+
+
+def test_responses_payload_client_metadata_mode_overlays_reserved_keys(auth_json_factory):
+    path = auth_json_factory()
+    provider = ChatGPTOAuthProvider(auth_json_path=str(path))
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        client_metadata={"app": "kept", "turn_id": "user-value"},
+        codex_metadata=True,
+    )
+
+    metadata = payload["client_metadata"]
+    assert metadata["app"] == "kept"
+    assert metadata["turn_id"] != "user-value"
+    assert metadata["x-codex-installation-id"]
+    assert json.loads(metadata["x-codex-turn-metadata"])["source"] == "codex-as-api"
+
+
+def test_chat_stream_adds_responses_lite_header(monkeypatch):
+    provider = ChatGPTOAuthProvider()
+    captured: dict[str, object] = {}
+
+    def fake_post_sse(path, payload, extra_headers=None):  # noqa: ANN001
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["headers"] = extra_headers
+        return iter([{"type": "response.completed", "response": {"output": []}}])
+
+    monkeypatch.setattr(provider, "_post_sse", fake_post_sse)
+    list(provider.chat_stream(_provider_messages(), model="gpt-5.5", responses_lite=True))
+
+    assert captured["headers"]["x-openai-internal-codex-responses-lite"] == "true"
 
 
 def test_codex_cli_headers_include_official_originator_and_versioned_user_agent():
@@ -116,6 +240,7 @@ def test_set_reasoning_payload_valid_effort():
     payload: dict = {}
     _set_reasoning_payload(payload, "high")
     assert payload["reasoning"] == {"effort": "high"}
+    assert payload["include"] == ["reasoning.encrypted_content"]
 
 
 def test_set_reasoning_payload_none_is_noop():

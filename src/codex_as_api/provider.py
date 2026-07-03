@@ -20,6 +20,16 @@ from .auth import (
     register_token_secrets,
 )
 from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
+from .model_capabilities import (
+    LITE_HEADER_NAME,
+    LITE_HEADER_VALUE,
+    apply_model_capability_fields,
+    build_codex_client_metadata,
+    resolve_codex_metadata_enabled,
+    should_enable_parallel_tool_calls,
+    strip_image_detail_fields,
+    use_responses_lite,
+)
 from .protocol import (
     reasoning_from_response_items,
     response_failure_message,
@@ -157,6 +167,9 @@ class ChatGPTOAuthProvider:
         service_tier: str | None = None,
         text: dict | None = None,
         client_metadata: dict[str, str] | None = None,
+        codex_metadata: bool | None = None,
+        responses_lite: bool | str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> AssistantResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -180,6 +193,9 @@ class ChatGPTOAuthProvider:
             service_tier=service_tier,
             text=text,
             client_metadata=client_metadata,
+            codex_metadata=codex_metadata,
+            responses_lite=responses_lite,
+            parallel_tool_calls=parallel_tool_calls,
         ):
             raw_events.append(dict(event))
             if event.get("type") == "content":
@@ -220,6 +236,9 @@ class ChatGPTOAuthProvider:
         service_tier: str | None = None,
         text: dict | None = None,
         client_metadata: dict[str, str] | None = None,
+        codex_metadata: bool | None = None,
+        responses_lite: bool | str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         payload = self._responses_payload(
             messages,
@@ -235,8 +254,13 @@ class ChatGPTOAuthProvider:
             service_tier=service_tier,
             text=text,
             client_metadata=client_metadata,
+            codex_metadata=codex_metadata,
+            responses_lite=responses_lite,
+            parallel_tool_calls=parallel_tool_calls,
         )
         extra_headers: dict[str, str] = {}
+        if payload.pop("_codex_as_api_responses_lite", False) is True:
+            extra_headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE
         if subagent is not None:
             extra_headers["x-openai-subagent"] = subagent
         if memgen_request is not None:
@@ -472,19 +496,29 @@ class ChatGPTOAuthProvider:
         service_tier: str | None = None,
         text: dict | None = None,
         client_metadata: dict[str, str] | None = None,
+        codex_metadata: bool | None = None,
+        responses_lite: bool | str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict[str, Any]:
         del temperature  # ChatGPT Codex backend rejects explicit temperature for this endpoint.
         del max_tokens  # ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         instructions, input_items = _split_instructions_and_input(messages)
         if instructions == "":
             raise ChatGPTOAuthError("ChatGPT OAuth Responses request requires system instructions")
+        request_model = model or self.model
+        tools_payload = [] if tools is None else [_tool_schema_to_response_dict(tool) for tool in tools]
+        lite = use_responses_lite(request_model, responses_lite)
         payload: dict[str, Any] = {
-            "model": model or self.model,
+            "model": request_model,
             "instructions": instructions,
             "input": input_items,
-            "tools": [] if tools is None else [_tool_schema_to_response_dict(tool) for tool in tools],
+            "tools": tools_payload,
             "tool_choice": tool_choice or "auto",
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": should_enable_parallel_tool_calls(
+                model=request_model,
+                requested=parallel_tool_calls,
+                responses_lite=lite,
+            ),
             "stream": True,
             "store": False,
             "include": [],
@@ -497,13 +531,17 @@ class ChatGPTOAuthProvider:
             payload["stop"] = list(stop)
         if previous_response_id is not None:
             payload["previous_response_id"] = previous_response_id
-        if service_tier is not None:
-            payload["service_tier"] = service_tier
-        if text is not None:
-            payload["text"] = text
+        apply_model_capability_fields(payload, model=request_model, text=text, service_tier=service_tier)
         if client_metadata is not None:
             payload["client_metadata"] = client_metadata
+        if resolve_codex_metadata_enabled(codex_metadata):
+            payload["client_metadata"] = build_codex_client_metadata(
+                auth_json_path=self.auth_json_path,
+                existing=payload.get("client_metadata") if isinstance(payload.get("client_metadata"), dict) else None,
+            )
         _set_reasoning_payload(payload, reasoning_effort)
+        if lite:
+            _apply_responses_lite_payload(payload, tools_payload)
         return payload
 
     def _headers(self) -> dict[str, str]:
@@ -712,7 +750,29 @@ def _tool_schema_to_response_dict(tool: ToolSchema) -> dict[str, Any]:
         if isinstance(openai_tool, dict):
             return dict(openai_tool)
         return {"type": "web_search", "external_web_access": True}
-    return {"type": "function", "name": tool.name, "description": tool.description, "parameters": tool.parameters, "strict": False}
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": False,
+    }
+
+
+def _apply_responses_lite_payload(payload: dict[str, Any], tools_payload: Sequence[dict[str, Any]]) -> None:
+    instructions = str(payload.pop("instructions"))
+    payload.pop("tools", None)
+    payload.pop("tool_choice", None)
+    payload["parallel_tool_calls"] = False
+    input_items = list(payload.get("input") or [])
+    developer_items: list[dict[str, Any]] = [{"type": "developer_message", "content": instructions}]
+    if tools_payload:
+        developer_items.append({"type": "developer_message", "additional_tools": list(tools_payload)})
+    payload["input"] = strip_image_detail_fields([*developer_items, *input_items])
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning["context"] = "all_turns"
+    payload["_codex_as_api_responses_lite"] = True
 
 
 def _compact_raw_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -814,6 +874,9 @@ def _set_reasoning_payload(payload: dict[str, Any], reasoning_effort: str | None
             "reasoning_effort must be one of: " + ", ".join(sorted(REASONING_EFFORT_VALUES))
         )
     payload["reasoning"] = {"effort": effort}
+    include = payload.setdefault("include", [])
+    if isinstance(include, list) and "reasoning.encrypted_content" not in include:
+        include.append("reasoning.encrypted_content")
 
 
 def _tool_call_from_response_item(item: dict[str, Any]) -> ToolCall | None:

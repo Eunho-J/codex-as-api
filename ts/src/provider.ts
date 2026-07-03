@@ -19,6 +19,16 @@ import {
   reasoningFromResponseItems,
   responseFailureMessage,
 } from "./protocol.js";
+import {
+  LITE_HEADER_NAME,
+  LITE_HEADER_VALUE,
+  applyModelCapabilityFields,
+  buildCodexClientMetadata,
+  resolveCodexMetadataEnabled,
+  shouldEnableParallelToolCalls,
+  stripImageDetailFields,
+  useResponsesLite,
+} from "./model-capabilities.js";
 
 export const CHATGPT_OAUTH_DEFAULT_BASE_URL =
   "https://chatgpt.com/backend-api/codex";
@@ -133,6 +143,9 @@ export interface ChatOptions {
   serviceTier?: string;
   text?: Record<string, unknown>;
   clientMetadata?: Record<string, string>;
+  codexMetadata?: boolean;
+  responsesLite?: boolean | string;
+  parallelToolCalls?: boolean;
 }
 
 export interface StreamEvent {
@@ -216,6 +229,10 @@ export class ChatGPTOAuthProvider {
   ): AsyncGenerator<StreamEvent> {
     const payload = this.responsesPayload(messages, opts);
     const extraHeaders: Record<string, string> = {};
+    if (payload._codex_as_api_responses_lite === true) {
+      delete payload._codex_as_api_responses_lite;
+      extraHeaders[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
+    }
     if (opts.subagent != null) {
       extraHeaders["x-openai-subagent"] = opts.subagent;
     }
@@ -531,15 +548,22 @@ export class ChatGPTOAuthProvider {
         "ChatGPT OAuth Responses request requires system instructions",
       );
     }
+    const requestModel = opts.model || this.model;
+    const toolsPayload = opts.tools
+      ? opts.tools.map(toolSchemaToResponseDict)
+      : [];
+    const lite = useResponsesLite(requestModel, opts.responsesLite);
     const payload: Record<string, unknown> = {
-      model: opts.model || this.model,
+      model: requestModel,
       instructions,
       input: inputItems,
-      tools: opts.tools
-        ? opts.tools.map(toolSchemaToResponseDict)
-        : [],
+      tools: toolsPayload,
       tool_choice: opts.toolChoice || "auto",
-      parallel_tool_calls: false,
+      parallel_tool_calls: shouldEnableParallelToolCalls({
+        model: requestModel,
+        requested: opts.parallelToolCalls,
+        responsesLite: lite,
+      }),
       stream: true,
       store: false,
       include: [],
@@ -556,12 +580,21 @@ export class ChatGPTOAuthProvider {
         : [opts.stop];
     if (opts.previousResponseId != null)
       payload.previous_response_id = opts.previousResponseId;
-    if (opts.serviceTier != null)
-      payload.service_tier = opts.serviceTier;
-    if (opts.text != null) payload.text = opts.text;
+    applyModelCapabilityFields(payload, requestModel, opts.text, opts.serviceTier);
     if (opts.clientMetadata != null)
       payload.client_metadata = opts.clientMetadata;
+    if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
+      payload.client_metadata = buildCodexClientMetadata({
+        authJsonPath: this.authJsonPath,
+        existing: typeof payload.client_metadata === "object" && payload.client_metadata !== null
+          ? payload.client_metadata as Record<string, string>
+          : undefined,
+      });
+    }
     setReasoningPayload(payload, opts.reasoningEffort);
+    if (lite) {
+      applyResponsesLitePayload(payload, toolsPayload);
+    }
     return payload;
   }
 
@@ -873,6 +906,29 @@ export function toolSchemaToResponseDict(
   };
 }
 
+function applyResponsesLitePayload(
+  payload: Record<string, unknown>,
+  toolsPayload: Record<string, unknown>[],
+): void {
+  const instructions = String(payload.instructions ?? "");
+  delete payload.instructions;
+  delete payload.tools;
+  delete payload.tool_choice;
+  payload.parallel_tool_calls = false;
+  const input = Array.isArray(payload.input) ? payload.input : [];
+  const developerItems: Record<string, unknown>[] = [
+    { type: "developer_message", content: instructions },
+  ];
+  if (toolsPayload.length > 0) {
+    developerItems.push({ type: "developer_message", additional_tools: toolsPayload });
+  }
+  payload.input = stripImageDetailFields([...developerItems, ...input]);
+  if (typeof payload.reasoning === "object" && payload.reasoning !== null) {
+    (payload.reasoning as Record<string, unknown>).context = "all_turns";
+  }
+  payload._codex_as_api_responses_lite = true;
+}
+
 function compactRawEvents(events: Record<string, unknown>[]): Record<string, unknown>[] {
   const keep = events.filter((event) => event.type === "web_search_call");
   for (const event of events.slice(-20)) {
@@ -980,6 +1036,11 @@ export function setReasoningPayload(
     );
   }
   payload.reasoning = { effort };
+  const include = Array.isArray(payload.include) ? payload.include : [];
+  if (!include.includes("reasoning.encrypted_content")) {
+    include.push("reasoning.encrypted_content");
+  }
+  payload.include = include;
 }
 
 export function toolCallFromResponseItem(

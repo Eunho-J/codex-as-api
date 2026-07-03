@@ -123,6 +123,9 @@ try:
         service_tier: str | None = None
         text: dict[str, Any] | None = None
         client_metadata: dict[str, str] | None = None
+        codex_metadata: bool | None = None
+        responses_lite: bool | str | None = None
+        parallel_tool_calls: bool | None = None
 
     class ImageGenerationRequest(BaseModel):
         model: str
@@ -356,6 +359,9 @@ try:
                     service_tier=request.service_tier,
                     text=request.text,
                     client_metadata=request.client_metadata,
+                    codex_metadata=request.codex_metadata,
+                    responses_lite=request.responses_lite,
+                    parallel_tool_calls=request.parallel_tool_calls,
                 ):
                     typ = event.get("type")
                     if typ == "content":
@@ -481,6 +487,9 @@ try:
             service_tier=request.service_tier,
             text=request.text,
             client_metadata=request.client_metadata,
+            codex_metadata=request.codex_metadata,
+            responses_lite=request.responses_lite,
+            parallel_tool_calls=request.parallel_tool_calls,
         )
 
         choices: list[dict[str, Any]] = [{

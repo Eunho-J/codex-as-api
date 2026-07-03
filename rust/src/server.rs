@@ -63,6 +63,9 @@ pub struct ChatCompletionRequest {
     pub service_tier: Option<String>,
     pub text: Option<Value>,
     pub client_metadata: Option<HashMap<String, String>>,
+    pub codex_metadata: Option<bool>,
+    pub responses_lite: Option<Value>,
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +414,9 @@ async fn chat_completions(
         let service_tier = request.service_tier.clone();
         let text = request.text.clone();
         let client_metadata = request.client_metadata.clone();
+        let codex_metadata = request.codex_metadata;
+        let responses_lite = request.responses_lite.clone();
+        let parallel_tool_calls = request.parallel_tool_calls;
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -433,6 +439,9 @@ async fn chat_completions(
                 service_tier.as_deref(),
                 text.as_ref(),
                 client_metadata.as_ref(),
+                codex_metadata,
+                responses_lite.as_ref(),
+                parallel_tool_calls,
             )
         })
         .await
@@ -607,6 +616,9 @@ async fn chat_completions(
         let service_tier = request.service_tier.clone();
         let text = request.text.clone();
         let client_metadata = request.client_metadata.clone();
+        let codex_metadata = request.codex_metadata;
+        let responses_lite = request.responses_lite.clone();
+        let parallel_tool_calls = request.parallel_tool_calls;
 
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
@@ -629,6 +641,9 @@ async fn chat_completions(
                 service_tier.as_deref(),
                 text.as_ref(),
                 client_metadata.as_ref(),
+                codex_metadata,
+                responses_lite.as_ref(),
+                parallel_tool_calls,
             )
         })
         .await
@@ -889,6 +904,9 @@ async fn anthropic_messages(
                 None,
                 text_ref,
                 None,
+                None,
+                None,
+                None,
             )
         })
         .await
@@ -959,6 +977,9 @@ async fn anthropic_messages(
                 None,
                 text_ref,
                 None,
+                None,
+                None,
+                None,
             )
         })
         .await
@@ -1009,7 +1030,8 @@ mod tests {
     #[test]
     fn estimate_input_tokens_includes_raw_payload_tools() {
         let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
-        let tools = json!([{"name":"lookup","description":"Search docs","input_schema":{"type":"object"}}]);
+        let tools =
+            json!([{"name":"lookup","description":"Search docs","input_schema":{"type":"object"}}]);
         let payload = json!({"messages":[{"role":"user","content":"hello"}],"tools": tools});
         let estimate = estimate_input_tokens(&[msg], Some(&payload));
         assert!(estimate >= serde_json::to_string(&tools).unwrap().as_bytes().len() as i64);
