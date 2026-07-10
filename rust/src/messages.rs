@@ -26,6 +26,10 @@ pub struct Message {
     pub name: Option<String>,
     pub reasoning_content: Option<String>,
     pub images: Vec<String>,
+    /// Normalized Responses API content blocks when the caller supplied
+    /// structured Chat Completions content. `None` retains the legacy
+    /// `content` + `images` representation.
+    pub structured_content: Option<Vec<serde_json::Value>>,
 }
 
 impl Message {
@@ -60,6 +64,7 @@ impl Message {
             name,
             reasoning_content: None,
             images: vec![],
+            structured_content: None,
         })
     }
 }
@@ -76,6 +81,7 @@ pub struct Usage {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cached_tokens: i64,
+    pub cache_write_tokens: i64,
 }
 
 impl Usage {
@@ -91,6 +97,7 @@ impl Usage {
             completion_tokens,
             total_tokens: total,
             cached_tokens,
+            cache_write_tokens: 0,
         }
     }
 
@@ -110,6 +117,7 @@ pub struct AssistantResponse {
     pub usage: Option<Usage>,
     pub reasoning_content: Option<String>,
     pub raw: Option<serde_json::Value>,
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,27 +133,14 @@ mod tests {
 
     #[test]
     fn test_message_user() {
-        let msg = Message::new(
-            MessageRole::User,
-            "hello".to_string(),
-            vec![],
-            None,
-            None,
-        )
-        .unwrap();
+        let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
         assert_eq!(msg.role, MessageRole::User);
         assert_eq!(msg.content, "hello");
     }
 
     #[test]
     fn test_message_tool_requires_fields() {
-        let result = Message::new(
-            MessageRole::Tool,
-            "output".to_string(),
-            vec![],
-            None,
-            None,
-        );
+        let result = Message::new(MessageRole::Tool, "output".to_string(), vec![], None, None);
         assert!(result.is_err());
     }
 
@@ -181,13 +176,7 @@ mod tests {
             name: "fn".to_string(),
             arguments: HashMap::new(),
         };
-        let result = Message::new(
-            MessageRole::User,
-            "hi".to_string(),
-            vec![tc],
-            None,
-            None,
-        );
+        let result = Message::new(MessageRole::User, "hi".to_string(), vec![tc], None, None);
         assert!(result.is_err());
     }
 
@@ -198,14 +187,8 @@ mod tests {
             name: "fn".to_string(),
             arguments: HashMap::new(),
         };
-        let msg = Message::new(
-            MessageRole::Assistant,
-            "".to_string(),
-            vec![tc],
-            None,
-            None,
-        )
-        .unwrap();
+        let msg =
+            Message::new(MessageRole::Assistant, "".to_string(), vec![tc], None, None).unwrap();
         assert_eq!(msg.tool_calls.len(), 1);
     }
 

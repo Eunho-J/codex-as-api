@@ -27,10 +27,13 @@ class Message:
     name: str | None = None
     reasoning_content: str | None = None
     images: tuple[str, ...] = ()
+    content_parts: tuple[dict[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_calls, tuple):
             object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+        if not isinstance(self.content_parts, tuple):
+            object.__setattr__(self, "content_parts", tuple(self.content_parts))
         if self.role is MessageRole.TOOL:
             if self.tool_call_id is None or self.name is None:
                 raise ValueError("tool messages require tool_call_id and name")
@@ -46,6 +49,7 @@ class Usage:
     completion_tokens: int
     total_tokens: int | None = None
     cached_tokens: int = 0
+    cache_write_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.total_tokens is None:
@@ -70,6 +74,7 @@ class AssistantResponse:
     usage: Usage | None = None
     reasoning_content: str | None = None
     raw: dict | None = None
+    response_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.tool_calls, tuple):

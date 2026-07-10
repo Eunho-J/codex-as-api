@@ -1,5 +1,44 @@
 # Release Notes
 
+## v0.6.0
+
+### GPT-5.6 Codex compatibility
+
+- Audit official `openai/codex` `main` at `6ad0e943cc727dc836d7c671f3377db30107f4d9` and keep public GPT-5.6 API extensions separate from the private Codex OAuth request contract.
+- Add the public `gpt-5.6` alias (resolved outbound to Sol) plus official Codex capability metadata for `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`.
+- Refresh context maxima and default reasoning effort for the existing GPT-5.5, GPT-5.4, GPT-5.4 Mini, and GPT-5.2 entries.
+- Use the current Responses Lite input-item and header contract for chat, compact, and inspection requests; reject Lite image generation explicitly because this proxy has no standalone image-tool executor.
+- Support `max`, map Codex's virtual `ultra` setting to backend `max`, and preserve non-empty model-defined effort values.
+- Read `model_reasoning_effort` from Codex config and apply request, config, then model-default precedence.
+- Preserve Anthropic `thinking.disabled` as explicit `none` so catalog defaults cannot re-enable reasoning.
+- Use catalog context maxima for GPT-5.6 models and clamp configured context/compact limits to the official 372,000 / 334,800 bounds.
+
+### GPT-5.6 request and response wiring
+
+- Accept public Responses-shaped `reasoning.effort`, `reasoning.mode: "standard"`, and `reasoning.context` (`auto` / `current_turn` / `all_turns`) while retaining `reasoning_effort` compatibility and rejecting conflicting values. Omit `standard` from the private wire and reject Pro because official Codex has no equivalent request field or alias.
+- Use the documented `medium` effort when a GPT-5.6 mode is explicit and neither the request nor Codex config selects an effort; keep mode and effort independent.
+- Expose the upstream Responses ID as `response_id`, preserve encrypted reasoning state, and translate a known `previous_response_id` into bounded process-local full-history replay over the existing private HTTP transport. Capture replay state from the official `response.output_item.done` events; `response.completed` supplies the ID/usage and its private-rollout `output` array is empty.
+- Preserve `prompt_cache_key`, `cache_write_tokens`, and standard Chat verbosity mapping. Treat explicit `null` as omitted and reject non-null values for public `prompt_cache_options`, explicit breakpoints, and `safety_identifier` before upstream because the private Codex HTTP/WS contracts provide no equivalent fields.
+- Omit null or empty stop controls and reject non-empty OpenAI `stop` / Anthropic `stop_sequences` before upstream because the official Codex HTTP request has no stop field.
+- Preserve multimodal Chat content and `auto` / `low` / `high` image detail on classic Responses, plus capability-gated `original` for GPT-5.6, GPT-5.5, GPT-5.4, and GPT-5.4 Mini; reject `original` for GPT-5.2 and conservative legacy entries, and keep the official Codex Lite behavior that removes only `detail` after capability validation.
+- Resolve a known compact `previous_response_id` to full input locally; never forward that field or public cache options. Forward supported `prompt_cache_key`, service-tier, and text controls while retaining the official Lite private-wire `context: all_turns` default.
+- Treat null optional controls as omitted; reject non-null values for compact `safety_identifier`, encrypted-reasoning `include`, and deprecated `prompt_cache_retention` instead of silently dropping unsupported fields.
+- Reject hosted Multi-agent and Programmatic Tool Calling fields on Chat/Anthropic facades because their agent/program/caller lifecycle cannot be represented losslessly by those protocols.
+- Canonicalize Codex `service_tier: "fast"` to the private wire value `priority`, omit explicit `default`, and reject tiers not advertised by the selected model.
+
+### Validation
+
+- Cover handler → provider → recording-upstream continuation with structured assertions in Python, TypeScript, and Rust, including encrypted reasoning history, branching, unknown IDs, Compact translation, and unsupported-field failures.
+- Live Codex OAuth: `gpt-5.6-sol` completed both a direct private WebSocket continuation using the exact prior `response.id` and a private HTTP continuation using full input/output replay. Direct HTTP forwarding of Pro/cache/safety controls and `previous_response_id` remains rejected and is not used by the proxy.
+
+## v0.5.2
+
+### Codex upstream parity
+
+- Support latest Codex root-level OAuth token files while keeping PAT-only, agent-identity-only, and Bedrock-only auth files explicitly unsupported.
+- Add shared model capability gating for Responses Lite, parallel tool calls, verbosity, and service-tier behavior across Python, TypeScript, and Rust.
+- Preserve encrypted reasoning state via `reasoning.encrypted_content` and add Codex metadata forwarding controls.
+
 ## v0.5.1
 
 ### Codex backend version-header compatibility

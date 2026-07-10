@@ -1,6 +1,6 @@
 {
   "name": "codex-as-api",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth",
   "license": "Apache-2.0",
   "repository": {
@@ -43,7 +43,8 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "smol-toml": "^1.7.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.2",

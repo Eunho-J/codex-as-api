@@ -28,14 +28,19 @@ _THREAD_ID = str(uuid.uuid4())
 _WINDOW_ID = str(uuid.uuid4())
 
 ResponsesLiteMode = Literal["off", "on", "auto"]
+MODEL_ALIASES = {"gpt-5.6": "gpt-5.6-sol"}
 
 
 @dataclass(frozen=True, slots=True)
 class ModelCapability:
     use_responses_lite: bool
     supports_parallel_tool_calls: bool
+    supports_image_detail_original: bool
     support_verbosity: bool
     default_verbosity: str | None
+    default_reasoning_effort: str | None
+    context_window: int | None
+    max_context_window: int | None
     service_tiers: tuple[str, ...]
     default_service_tier: str | None
     source: str
@@ -44,8 +49,12 @@ class ModelCapability:
 UNKNOWN_CAPABILITY = ModelCapability(
     use_responses_lite=False,
     supports_parallel_tool_calls=False,
+    supports_image_detail_original=False,
     support_verbosity=False,
     default_verbosity=None,
+    default_reasoning_effort=None,
+    context_window=None,
+    max_context_window=None,
     service_tiers=(),
     default_service_tier=None,
     source="unknown",
@@ -65,6 +74,10 @@ def capability_for_model(model: str | None) -> ModelCapability:
     if not model:
         return UNKNOWN_CAPABILITY
     return load_model_capabilities().get(model, UNKNOWN_CAPABILITY)
+
+
+def resolve_model_for_backend(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
 
 
 def resolve_responses_lite_mode(value: bool | str | None = None) -> ResponsesLiteMode:
@@ -119,8 +132,12 @@ def apply_model_capability_fields(
     elif text is not None:
         payload["text"] = dict(text)
 
-    if service_tier is not None and service_tier != "default" and service_tier in capability.service_tiers:
-        payload["service_tier"] = service_tier
+    if service_tier is None or service_tier == "default":
+        return
+    wire_service_tier = "priority" if service_tier == "fast" else service_tier
+    if wire_service_tier not in capability.service_tiers:
+        raise ValueError(f"service_tier {service_tier!r} is not supported for model {model!r}")
+    payload["service_tier"] = wire_service_tier
 
 
 def should_enable_parallel_tool_calls(
@@ -182,23 +199,45 @@ def _capability_from_mapping(value: object) -> ModelCapability:
         raise RuntimeError("model capability entry must be an object")
     use_responses_lite = value.get("use_responses_lite")
     supports_parallel_tool_calls = value.get("supports_parallel_tool_calls")
+    supports_image_detail_original = value.get("supports_image_detail_original")
     support_verbosity = value.get("support_verbosity")
     if not isinstance(use_responses_lite, bool):
         raise RuntimeError("model capability use_responses_lite must be a boolean")
     if not isinstance(supports_parallel_tool_calls, bool):
         raise RuntimeError("model capability supports_parallel_tool_calls must be a boolean")
+    if not isinstance(supports_image_detail_original, bool):
+        raise RuntimeError("model capability supports_image_detail_original must be a boolean")
     if not isinstance(support_verbosity, bool):
         raise RuntimeError("model capability support_verbosity must be a boolean")
     service_tiers = value.get("service_tiers")
     tiers = tuple(str(item) for item in service_tiers) if isinstance(service_tiers, list) else ()
     default_verbosity = value.get("default_verbosity")
+    default_reasoning_effort = value.get("default_reasoning_effort")
+    context_window = value.get("context_window")
+    max_context_window = value.get("max_context_window")
+    if default_reasoning_effort is not None and (
+        not isinstance(default_reasoning_effort, str) or default_reasoning_effort == ""
+    ):
+        raise RuntimeError("model capability default_reasoning_effort must be a non-empty string or null")
+    if context_window is not None and (
+        not isinstance(context_window, int) or isinstance(context_window, bool) or context_window <= 0
+    ):
+        raise RuntimeError("model capability context_window must be a positive integer or null")
+    if max_context_window is not None and (
+        not isinstance(max_context_window, int) or isinstance(max_context_window, bool) or max_context_window <= 0
+    ):
+        raise RuntimeError("model capability max_context_window must be a positive integer or null")
     default_service_tier = value.get("default_service_tier")
     source = value.get("source")
     return ModelCapability(
         use_responses_lite=use_responses_lite,
         supports_parallel_tool_calls=supports_parallel_tool_calls,
+        supports_image_detail_original=supports_image_detail_original,
         support_verbosity=support_verbosity,
         default_verbosity=default_verbosity if isinstance(default_verbosity, str) else None,
+        default_reasoning_effort=default_reasoning_effort,
+        context_window=context_window,
+        max_context_window=max_context_window,
         service_tiers=tiers,
         default_service_tier=default_service_tier if isinstance(default_service_tier, str) else None,
         source=source if isinstance(source, str) else "unknown",

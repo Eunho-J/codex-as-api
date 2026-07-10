@@ -209,8 +209,19 @@ function convertAssistantMessage(
 
 function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
   const result: ToolSchema[] = [];
-  for (const tool of tools) {
+  for (const [index, tool] of tools.entries()) {
     if (typeof tool !== "object" || tool === null) continue;
+    if (tool.type === "programmatic_tool_calling") {
+      throw new Error(
+        "programmatic_tool_calling tools are not supported by this compatibility API",
+      );
+    }
+    if (Object.hasOwn(tool, "allowed_callers")) {
+      throw new Error(`tool ${index} allowed_callers is not supported`);
+    }
+    if (Object.hasOwn(tool, "output_schema")) {
+      throw new Error(`tool ${index} output_schema is not supported`);
+    }
     const name = tool.name;
     if (!name) continue;
     if (isAnthropicWebSearchTool(tool)) {
@@ -297,6 +308,7 @@ function convertThinking(thinking: Record<string, unknown> | null): string | nul
   if (thinking === null) return null;
   if (thinking.type === "enabled") return "high";
   if (thinking.type === "adaptive") return "medium";
+  if (thinking.type === "disabled") return "none";
   return null;
 }
 
@@ -449,7 +461,7 @@ export function internalResponseToAnthropic(
     usageDict = {
       input_tokens: response.usage.prompt_tokens,
       output_tokens: response.usage.completion_tokens,
-      cache_creation_input_tokens: 0,
+      cache_creation_input_tokens: response.usage.cache_write_tokens ?? 0,
       cache_read_input_tokens: response.usage.cached_tokens,
     };
   }
@@ -572,19 +584,25 @@ function usageFromProviderEvent(usageEvent: unknown): Record<string, unknown> {
   const outputTokens = numeric(u.output_tokens ?? u.completion_tokens);
   const tokenDetails = u.input_tokens_details ?? u.prompt_tokens_details;
   let cacheRead = numeric(u.cache_read_input_tokens ?? u.cached_input_tokens);
+  let cacheWrite = numeric(
+    u.cache_creation_input_tokens
+    ?? u.cache_write_tokens
+    ?? u.cache_write_input_tokens,
+  );
   if (
-    cacheRead === 0 &&
-    typeof tokenDetails === "object" &&
-    tokenDetails !== null &&
-    !Array.isArray(tokenDetails)
+    typeof tokenDetails === "object"
+    && tokenDetails !== null
+    && !Array.isArray(tokenDetails)
   ) {
-    cacheRead = numeric((tokenDetails as Record<string, unknown>).cached_tokens);
+    const details = tokenDetails as Record<string, unknown>;
+    if (cacheRead === 0) cacheRead = numeric(details.cached_tokens);
+    if (cacheWrite === 0) cacheWrite = numeric(details.cache_write_tokens);
   }
 
   const result: Record<string, unknown> = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
-    cache_creation_input_tokens: numeric(u.cache_creation_input_tokens),
+    cache_creation_input_tokens: cacheWrite,
     cache_read_input_tokens: cacheRead,
   };
   for (const key of ["cache_creation", "server_tool_use", "service_tier"] as const) {

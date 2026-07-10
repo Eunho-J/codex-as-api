@@ -26,6 +26,7 @@ pub fn anthropic_request_to_internal(
                 name: None,
                 reasoning_content: None,
                 images: vec![],
+                structured_content: None,
             });
         }
     }
@@ -61,7 +62,8 @@ pub fn anthropic_request_to_internal(
         });
 
     let reasoning_effort = body.get("thinking").map(|t| convert_thinking(t)).flatten();
-    let text = anthropic_output_format_from_body(body).and_then(anthropic_output_format_to_openai_text);
+    let text =
+        anthropic_output_format_from_body(body).and_then(anthropic_output_format_to_openai_text);
 
     (messages, tools, tool_choice, stop, reasoning_effort, text)
 }
@@ -101,6 +103,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                 name: None,
                 reasoning_content: None,
                 images: vec![],
+                structured_content: None,
             });
         }
         Value::Array(arr) => {
@@ -124,6 +127,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                                 name: None,
                                 reasoning_content: None,
                                 images: std::mem::take(&mut image_urls),
+                                structured_content: None,
                             });
                             text_parts = Vec::new();
                         }
@@ -144,6 +148,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             name: Some(tool_use_id),
                             reasoning_content: None,
                             images: vec![],
+                            structured_content: None,
                         });
                         if !tool_result_images.is_empty() {
                             out.push(Message {
@@ -154,6 +159,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                                 name: None,
                                 reasoning_content: None,
                                 images: tool_result_images,
+                                structured_content: None,
                             });
                         }
                     }
@@ -187,6 +193,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                     name: None,
                     reasoning_content: None,
                     images: image_urls,
+                    structured_content: None,
                 });
             }
         }
@@ -242,6 +249,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                 name: None,
                 reasoning_content: None,
                 images: vec![],
+                structured_content: None,
             });
         }
         Value::Array(arr) => {
@@ -316,6 +324,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) {
                 name: None,
                 reasoning_content,
                 images: vec![],
+                structured_content: None,
             });
         }
         _ => {}
@@ -370,7 +379,11 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
         .iter()
         .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()))
         .collect();
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn anthropic_web_search_parameters(tool: &Value) -> Value {
@@ -421,6 +434,7 @@ fn convert_thinking(thinking: &Value) -> Option<String> {
     match thinking.get("type").and_then(|v| v.as_str()) {
         Some("enabled") => Some("high".to_string()),
         Some("adaptive") => Some("medium".to_string()),
+        Some("disabled") => Some("none".to_string()),
         _ => None,
     }
 }
@@ -463,7 +477,13 @@ pub fn anthropic_output_format_to_openai_text(output_format: &Value) -> Option<V
 fn sanitize_json_schema_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect();
     if cleaned.is_empty() {
@@ -474,7 +494,10 @@ fn sanitize_json_schema_name(name: &str) -> String {
 }
 
 fn render_anthropic_content_block(block: &Value) -> String {
-    let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let typ = block
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     match typ {
         "document" => render_document_block(block),
         "search_result" => render_search_result_block(block),
@@ -492,9 +515,17 @@ fn render_document_block(block: &Value) -> String {
     let mut body = String::new();
     if let Some(source) = block.get("source").and_then(|v| v.as_object()) {
         if source.get("type").and_then(|v| v.as_str()) == Some("text") {
-            body = source.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            body = source
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
         } else if source.get("type").and_then(|v| v.as_str()) == Some("url") {
-            body = source.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            body = source
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
         } else if let Some(media_type) = source.get("media_type").and_then(|v| v.as_str()) {
             body = format!("[{}]", media_type);
         }
@@ -507,25 +538,42 @@ fn render_document_block(block: &Value) -> String {
 }
 
 fn render_search_result_block(block: &Value) -> String {
-    let title = block.get("title").and_then(|v| v.as_str()).unwrap_or("search result");
+    let title = block
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("search result");
     let url = block.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
     format!(
         "\n\n[search_result] {}{}{}\n",
         title,
-        if url.is_empty() { String::new() } else { format!(" ({})", url) },
-        if content.is_empty() { String::new() } else { format!("\n{}", content) },
+        if url.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", url)
+        },
+        if content.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", content)
+        },
     )
 }
 
 fn render_server_tool_use_block(block: &Value) -> String {
-    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("server_tool");
+    let name = block
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("server_tool");
     let input = block.get("input").unwrap_or(&Value::Null);
     format!("\n\n[server_tool_use: {}] {}\n", name, safe_json(input))
 }
 
 fn render_generic_tool_result_block(block: &Value) -> String {
-    let typ = block.get("type").and_then(|v| v.as_str()).unwrap_or("tool_result");
+    let typ = block
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tool_result");
     let Some(content) = block.get("content") else {
         return format!("\n\n[{}]\n", typ);
     };
@@ -545,8 +593,16 @@ fn render_generic_tool_result_block(block: &Value) -> String {
                         format!(
                             "- {}{}{}",
                             title.unwrap_or("result"),
-                            if url.is_empty() { String::new() } else { format!(" ({})", url) },
-                            if text.is_empty() { String::new() } else { format!(": {}", text) },
+                            if url.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", url)
+                            },
+                            if text.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", text)
+                            },
                         )
                     } else {
                         safe_json(item)
@@ -609,12 +665,16 @@ pub fn internal_response_to_anthropic(
         Some(u) => json!({
             "input_tokens": u.prompt_tokens,
             "output_tokens": u.completion_tokens,
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": u.cache_write_tokens,
             "cache_read_input_tokens": u.cached_tokens,
         }),
         None => json!({"input_tokens": 0, "output_tokens": 0}),
     };
-    usage_dict = merge_server_tool_usage(usage_dict, response.raw.as_ref(), web_search_blocks.len() / 2);
+    usage_dict = merge_server_tool_usage(
+        usage_dict,
+        response.raw.as_ref(),
+        web_search_blocks.len() / 2,
+    );
 
     if content.is_empty() {
         content.push(json!({"type": "text", "text": ""}));
@@ -634,9 +694,7 @@ pub fn internal_response_to_anthropic(
 
 fn web_search_blocks_from_raw(raw: Option<&Value>) -> Vec<Value> {
     let mut blocks = Vec::new();
-    let Some(events) = raw
-        .and_then(|r| r.get("events"))
-        .and_then(|v| v.as_array()) else {
+    let Some(events) = raw.and_then(|r| r.get("events")).and_then(|v| v.as_array()) else {
         return blocks;
     };
     for event in events {
@@ -648,19 +706,32 @@ fn web_search_blocks_from_raw(raw: Option<&Value>) -> Vec<Value> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("srvtoolu_{}", blocks.len() / 2));
-        let input = event.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({"query": ""}));
-        let content = event.get("content").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]));
-        blocks.push(json!({"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": input}));
-        blocks.push(json!({"type": "web_search_tool_result", "tool_use_id": tool_id, "content": content}));
+        let input = event
+            .get("input")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({"query": ""}));
+        let content = event
+            .get("content")
+            .filter(|v| v.is_array())
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        blocks.push(
+            json!({"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": input}),
+        );
+        blocks.push(
+            json!({"type": "web_search_tool_result", "tool_use_id": tool_id, "content": content}),
+        );
     }
     blocks
 }
 
-fn merge_server_tool_usage(mut usage: Value, raw: Option<&Value>, web_search_requests: usize) -> Value {
-    if let Some(events) = raw
-        .and_then(|r| r.get("events"))
-        .and_then(|v| v.as_array())
-    {
+fn merge_server_tool_usage(
+    mut usage: Value,
+    raw: Option<&Value>,
+    web_search_requests: usize,
+) -> Value {
+    if let Some(events) = raw.and_then(|r| r.get("events")).and_then(|v| v.as_array()) {
         for event in events {
             if event.get("type").and_then(|v| v.as_str()) != Some("finish") {
                 continue;
@@ -712,6 +783,7 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
     let mut block_index: u32 = 0;
     let mut current_block: Option<&'static str> = None;
     let mut has_any_content = false;
+    let mut has_tool_calls = false;
     let mut web_search_requests: usize = 0;
 
     for event in events {
@@ -806,6 +878,7 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
 
             "tool_call" => {
                 has_any_content = true;
+                has_tool_calls = true;
                 if let Some(cb) = current_block {
                     if cb == "thinking" {
                         out.push(sse(
@@ -882,8 +955,16 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                     block_index += 1;
                 }
                 let tool_id = event.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let tool_input = event.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({"query": ""}));
-                let result_content = event.get("content").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]));
+                let tool_input = event
+                    .get("input")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"query": ""}));
+                let result_content = event
+                    .get("content")
+                    .filter(|v| v.is_array())
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
                 out.push(sse(
                     "content_block_start",
                     &json!({
@@ -966,7 +1047,7 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
                     .get("finish_reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("stop");
-                let stop_reason = map_stop_reason(finish_reason, false);
+                let stop_reason = map_stop_reason(finish_reason, has_tool_calls);
 
                 out.push(sse(
                     "message_delta",
@@ -1040,6 +1121,15 @@ fn anthropic_usage_from_provider(usage: &Value) -> Value {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
     }
+    let mut cache_creation = usage_i64(usage, "cache_creation_input_tokens", None);
+    if cache_creation == 0 {
+        cache_creation = usage
+            .get("input_tokens_details")
+            .or_else(|| usage.get("prompt_tokens_details"))
+            .and_then(|details| details.get("cache_write_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+    }
     let mut out = serde_json::Map::new();
     out.insert(
         "input_tokens".to_string(),
@@ -1051,7 +1141,7 @@ fn anthropic_usage_from_provider(usage: &Value) -> Value {
     );
     out.insert(
         "cache_creation_input_tokens".to_string(),
-        json!(usage_i64(usage, "cache_creation_input_tokens", None)),
+        json!(cache_creation),
     );
     out.insert("cache_read_input_tokens".to_string(), json!(cache_read));
     for key in ["cache_creation", "server_tool_use", "service_tier"] {
@@ -1355,10 +1445,7 @@ mod tests {
     fn test_tool_choice_tool() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "my_fn"}});
         let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
-        assert_eq!(
-            tc,
-            Some(json!({"type": "function", "name": "my_fn"}))
-        );
+        assert_eq!(tc, Some(json!({"type": "function", "name": "my_fn"})));
     }
 
     #[test]
@@ -1414,6 +1501,13 @@ mod tests {
     fn test_thinking_disabled() {
         let body = json!({"messages": [], "thinking": {"type": "disabled"}});
         let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
+        assert_eq!(effort, Some("none".to_string()));
+    }
+
+    #[test]
+    fn test_thinking_unspecified_has_no_request_override() {
+        let body = json!({"messages": []});
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
         assert_eq!(effort, None);
     }
 
@@ -1465,6 +1559,7 @@ mod tests {
             usage,
             reasoning_content,
             raw: None,
+            response_id: None,
         }
     }
 
@@ -1522,13 +1617,14 @@ mod tests {
 
     #[test]
     fn test_response_usage_present() {
-        let usage = crate::messages::Usage::new(100, 50, None, 20);
+        let mut usage = crate::messages::Usage::new(100, 50, None, 20);
+        usage.cache_write_tokens = 9;
         let resp = make_response("Hi", vec![], "stop", Some(usage), None);
         let out = internal_response_to_anthropic(&resp, "claude-3", "msg_u");
         assert_eq!(out["usage"]["input_tokens"], 100);
         assert_eq!(out["usage"]["output_tokens"], 50);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 20);
-        assert_eq!(out["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 9);
     }
 
     #[test]
@@ -1646,6 +1742,11 @@ mod tests {
             .iter()
             .find(|(e, d)| e == "content_block_start" && d["content_block"]["type"] == "tool_use");
         assert!(tool_start.is_some());
+        let message_delta = parsed
+            .iter()
+            .find(|(event, _)| event == "message_delta")
+            .unwrap();
+        assert_eq!(message_delta.1["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
@@ -1679,6 +1780,30 @@ mod tests {
         let parsed = get_sse_events(&chunks);
         let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(msg_delta.1["usage"]["output_tokens"], 42);
+    }
+
+    #[test]
+    fn test_stream_maps_provider_cache_token_details() {
+        let events = vec![json!({
+            "type": "finish",
+            "finish_reason": "stop",
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 3,
+                "input_tokens_details": {
+                    "cached_tokens": 7,
+                    "cache_write_tokens": 11
+                }
+            },
+        })];
+        let chunks = anthropic_stream_adapter(&events, "m", "id");
+        let parsed = get_sse_events(&chunks);
+        let msg_delta = parsed
+            .iter()
+            .find(|(event, _)| event == "message_delta")
+            .unwrap();
+        assert_eq!(msg_delta.1["usage"]["cache_read_input_tokens"], 7);
+        assert_eq!(msg_delta.1["usage"]["cache_creation_input_tokens"], 11);
     }
 
     #[test]

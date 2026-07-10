@@ -1,13 +1,17 @@
 export {
   ChatGPTOAuthProvider,
   type ChatOptions,
+  type ReasoningOptions,
+  type PromptCacheOptions,
+  type ImageReference,
   type StreamEvent,
   CHATGPT_OAUTH_DEFAULT_BASE_URL,
   CHATGPT_OAUTH_DEFAULT_MODEL,
 } from "./provider.js";
-export { createApp, main } from "./server.js";
+export { createApp, main, type CreateAppOptions } from "./server.js";
 export {
   ChatGPTOAuthError,
+  ChatGPTOAuthInvalidRequestError,
   ChatGPTOAuthMissingError,
   ChatGPTOAuthRefreshError,
   type ChatGPTTokenData,
@@ -21,6 +25,8 @@ export {
 export {
   MessageRole,
   type Message,
+  type MessageContentPart,
+  type PromptCacheBreakpoint,
   type ToolCall,
   type ToolSchema,
   type Usage,

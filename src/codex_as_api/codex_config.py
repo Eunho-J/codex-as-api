@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib  # type: ignore[import-not-found]
+
+
+_MAX_SIGNED_64_BIT_INTEGER = (1 << 63) - 1
 
 
 @dataclass(frozen=True)
@@ -11,6 +19,7 @@ class CodexConfig:
     codex_home: str
     config_path: str
     model: str | None = None
+    model_reasoning_effort: str | None = None
     model_context_window: int | None = None
     model_auto_compact_token_limit: int | None = None
 
@@ -32,26 +41,54 @@ def load_codex_config(raw_codex_home: str | None = None) -> CodexConfig:
     config_path = str(Path(codex_home) / "config.toml")
     try:
         text = Path(config_path).read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return CodexConfig(codex_home=codex_home, config_path=config_path)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"failed to read Codex config {config_path}: {exc}") from exc
 
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid Codex config {config_path}: {exc}") from exc
     return CodexConfig(
         codex_home=codex_home,
         config_path=config_path,
-        model=_parse_toml_string(text, "model"),
-        model_context_window=_parse_toml_integer(text, "model_context_window"),
-        model_auto_compact_token_limit=_parse_toml_integer(text, "model_auto_compact_token_limit"),
+        model=_optional_root_string(parsed, "model", empty_as_none=True),
+        model_reasoning_effort=_optional_root_string(parsed, "model_reasoning_effort"),
+        model_context_window=_optional_root_integer(parsed, "model_context_window"),
+        model_auto_compact_token_limit=_optional_root_integer(
+            parsed,
+            "model_auto_compact_token_limit",
+        ),
     )
 
 
-def _parse_toml_string(text: str, key: str) -> str | None:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*[\"']([^\"']+)[\"']\s*(?:#.*)?$", text, re.MULTILINE)
-    return match.group(1) if match else None
-
-
-def _parse_toml_integer(text: str, key: str) -> int | None:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*([0-9][0-9_]*)\s*(?:#.*)?$", text, re.MULTILINE)
-    if not match:
+def _optional_root_string(
+    parsed: dict[str, Any],
+    key: str,
+    *,
+    empty_as_none: bool = False,
+) -> str | None:
+    if key not in parsed:
         return None
-    value = int(match.group(1).replace("_", ""))
-    return value if value > 0 else None
+    value = parsed[key]
+    if not isinstance(value, str):
+        raise ValueError(f"Codex config {key} must be a string")
+    if value == "":
+        if empty_as_none:
+            return None
+        raise ValueError(f"Codex config {key} must be a non-empty string")
+    return value
+
+
+def _optional_root_integer(parsed: dict[str, Any], key: str) -> int | None:
+    if key not in parsed:
+        return None
+    value = parsed[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Codex config {key} must be an integer")
+    if value <= 0:
+        raise ValueError(f"Codex config {key} must be greater than zero")
+    if value > _MAX_SIGNED_64_BIT_INTEGER:
+        raise ValueError(f"Codex config {key} must fit in a signed 64-bit integer")
+    return value

@@ -25,6 +25,13 @@ export class ChatGPTOAuthError extends Error {
   }
 }
 
+export class ChatGPTOAuthInvalidRequestError extends ChatGPTOAuthError {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChatGPTOAuthInvalidRequestError";
+  }
+}
+
 export class ChatGPTOAuthMissingError extends ChatGPTOAuthError {
   constructor(message: string) {
     super(message);

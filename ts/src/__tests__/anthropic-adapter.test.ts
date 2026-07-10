@@ -226,6 +226,33 @@ describe("anthropicRequestToInternal", () => {
     assert.deepEqual(tools![0].parameters, { type: "object", properties: { city: { type: "string" } } });
   });
 
+  it("rejects programmatic tool-only fields", () => {
+    const base = {
+      model: "test",
+      messages: [],
+    };
+    assert.throws(() => anthropicRequestToInternal({
+      ...base,
+      tools: [{ type: "programmatic_tool_calling" }],
+    }));
+    assert.throws(() => anthropicRequestToInternal({
+      ...base,
+      tools: [{
+        name: "lookup",
+        input_schema: { type: "object" },
+        allowed_callers: ["programmatic"],
+      }],
+    }));
+    assert.throws(() => anthropicRequestToInternal({
+      ...base,
+      tools: [{
+        name: "lookup",
+        input_schema: { type: "object" },
+        output_schema: { type: "object" },
+      }],
+    }));
+  });
+
   it("tool_choice auto", () => {
     const { toolChoice } = anthropicRequestToInternal({
       model: "test",
@@ -338,7 +365,7 @@ describe("anthropicRequestToInternal", () => {
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "disabled" },
     });
-    assert.equal(reasoningEffort, null);
+    assert.equal(reasoningEffort, "none");
   });
 
   it("maps Anthropic output_format to OpenAI Responses text.format", () => {
@@ -459,11 +486,17 @@ describe("internalResponseToAnthropic", () => {
     const resp = makeResponse({
       content: "hi",
       finish_reason: "stop",
-      usage: makeUsage({ prompt_tokens: 100, completion_tokens: 10, cached_tokens: 50 }),
+      usage: makeUsage({
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        cached_tokens: 50,
+        cache_write_tokens: 25,
+      }),
     });
     const result = internalResponseToAnthropic(resp, "m", "msg_1");
     const usage = result.usage as Record<string, unknown>;
     assert.equal(usage.cache_read_input_tokens, 50);
+    assert.equal(usage.cache_creation_input_tokens, 25);
   });
 
   it("adds web_search server tool blocks before text", () => {
@@ -537,7 +570,7 @@ describe("anthropicStreamAdapter", () => {
   it("tool call stream", async () => {
     const events = [
       { type: "tool_call", id: "tc-1", name: "get_weather", arguments: { city: "Seoul" } },
-      { type: "finish", finish_reason: "stop" },
+      { type: "finish", finish_reason: "tool_calls" },
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
@@ -553,6 +586,11 @@ describe("anthropicStreamAdapter", () => {
     assert.deepEqual(
       JSON.parse((jsonDeltas[0].delta as Record<string, unknown>).partial_json as string),
       { city: "Seoul" },
+    );
+    const messageDelta = result.find((event) => event.type === "message_delta");
+    assert.equal(
+      ((messageDelta?.delta as Record<string, unknown>) ?? {}).stop_reason,
+      "tool_use",
     );
   });
 

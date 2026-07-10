@@ -1,6 +1,10 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import capabilityData from "../../config/model-capabilities.json";
+import {
+  ChatGPTOAuthError,
+  ChatGPTOAuthInvalidRequestError,
+} from "./auth.js";
 
 export const RESPONSES_LITE_ENV = "CODEX_AS_API_RESPONSES_LITE";
 export const CODEX_METADATA_ENV = "CODEX_AS_API_CODEX_METADATA";
@@ -18,8 +22,12 @@ type ResponsesLiteMode = "off" | "on" | "auto";
 export interface ModelCapability {
   useResponsesLite: boolean;
   supportsParallelToolCalls: boolean;
+  supportsImageDetailOriginal: boolean;
   supportVerbosity: boolean;
   defaultVerbosity: string | null;
+  defaultReasoningEffort?: string;
+  contextWindow?: number;
+  maxContextWindow?: number;
   serviceTiers: string[];
   defaultServiceTier: string | null;
   source: string;
@@ -28,6 +36,7 @@ export interface ModelCapability {
 const UNKNOWN_CAPABILITY: ModelCapability = {
   useResponsesLite: false,
   supportsParallelToolCalls: false,
+  supportsImageDetailOriginal: false,
   supportVerbosity: false,
   defaultVerbosity: null,
   serviceTiers: [],
@@ -50,11 +59,14 @@ export function capabilityForModel(model?: string): ModelCapability {
 export function resolveResponsesLiteMode(value?: boolean | string): ResponsesLiteMode {
   const raw = value ?? process.env[RESPONSES_LITE_ENV] ?? "auto";
   if (typeof raw === "boolean") return raw ? "on" : "off";
+  if (typeof raw !== "string") {
+    throw new ChatGPTOAuthError("responses_lite must be one of: off, on, auto");
+  }
   const normalized = raw.trim().toLowerCase();
   if (["true", "1", "yes", "on"].includes(normalized)) return "on";
   if (["false", "0", "no", "off"].includes(normalized)) return "off";
   if (normalized === "auto") return "auto";
-  throw new Error("responses_lite must be one of: off, on, auto");
+  throw new ChatGPTOAuthError("responses_lite must be one of: off, on, auto");
 }
 
 export function useResponsesLite(model: string, value?: boolean | string): boolean {
@@ -89,8 +101,18 @@ export function applyModelCapabilityFields(
     payload.text = { ...text };
   }
 
-  if (serviceTier != null && serviceTier !== "default" && capability.serviceTiers.includes(serviceTier)) {
-    payload.service_tier = serviceTier;
+  if (serviceTier != null) {
+    if (serviceTier === "default") {
+      delete payload.service_tier;
+      return;
+    }
+    const wireServiceTier = serviceTier === "fast" ? "priority" : serviceTier;
+    if (!capability.serviceTiers.includes(wireServiceTier)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `service_tier ${JSON.stringify(serviceTier)} is not supported by model ${JSON.stringify(model)}`,
+      );
+    }
+    payload.service_tier = wireServiceTier;
   }
 }
 
@@ -155,15 +177,26 @@ function loadModelCapabilities(): Record<string, ModelCapability> {
 }
 
 function capabilityFromRecord(value: Record<string, unknown>): ModelCapability {
-  return {
+  const capability: ModelCapability = {
     useResponsesLite: value.use_responses_lite === true,
     supportsParallelToolCalls: value.supports_parallel_tool_calls === true,
+    supportsImageDetailOriginal: value.supports_image_detail_original === true,
     supportVerbosity: value.support_verbosity === true,
     defaultVerbosity: typeof value.default_verbosity === "string" ? value.default_verbosity : null,
     serviceTiers: Array.isArray(value.service_tiers) ? value.service_tiers.filter((v): v is string => typeof v === "string") : [],
     defaultServiceTier: typeof value.default_service_tier === "string" ? value.default_service_tier : null,
     source: typeof value.source === "string" ? value.source : "unknown",
   };
+  if (typeof value.default_reasoning_effort === "string" && value.default_reasoning_effort.length > 0) {
+    capability.defaultReasoningEffort = value.default_reasoning_effort;
+  }
+  if (typeof value.context_window === "number" && Number.isSafeInteger(value.context_window) && value.context_window > 0) {
+    capability.contextWindow = value.context_window;
+  }
+  if (typeof value.max_context_window === "number" && Number.isSafeInteger(value.max_context_window) && value.max_context_window > 0) {
+    capability.maxContextWindow = value.max_context_window;
+  }
+  return capability;
 }
 
 function uuidV5(name: string, namespace: string): string {

@@ -1,11 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { TextDecoder } from "node:util";
+import { parse, type TomlTable } from "smol-toml";
 
 export interface CodexConfig {
   codexHome: string;
   configPath: string;
   model?: string;
+  modelReasoningEffort?: string;
   modelContextWindow?: number;
   modelAutoCompactTokenLimit?: number;
 }
@@ -25,20 +28,34 @@ export function loadCodexConfig(rawCodexHome?: string | null): CodexConfig {
   const configPath = path.join(codexHome, "config.toml");
   const config: CodexConfig = { codexHome, configPath };
 
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = fs.readFileSync(configPath, "utf-8");
-  } catch {
-    return config;
+    bytes = fs.readFileSync(configPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return config;
+    throw err;
   }
 
-  const model = parseTomlString(text, "model");
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const document = parse(text, { integersAsBigInt: true });
+  const model = optionalRootString(document, "model");
   if (model) config.model = model;
 
-  const modelContextWindow = parseTomlInteger(text, "model_context_window");
+  const modelReasoningEffort = optionalRootString(document, "model_reasoning_effort");
+  if (modelReasoningEffort !== undefined) {
+    if (modelReasoningEffort.length === 0) {
+      throw new Error("model_reasoning_effort must be a non-empty TOML string");
+    }
+    config.modelReasoningEffort = modelReasoningEffort;
+  }
+
+  const modelContextWindow = optionalPositiveRootInteger(document, "model_context_window");
   if (modelContextWindow != null) config.modelContextWindow = modelContextWindow;
 
-  const modelAutoCompactTokenLimit = parseTomlInteger(text, "model_auto_compact_token_limit");
+  const modelAutoCompactTokenLimit = optionalPositiveRootInteger(
+    document,
+    "model_auto_compact_token_limit",
+  );
   if (modelAutoCompactTokenLimit != null) {
     config.modelAutoCompactTokenLimit = modelAutoCompactTokenLimit;
   }
@@ -46,18 +63,20 @@ export function loadCodexConfig(rawCodexHome?: string | null): CodexConfig {
   return config;
 }
 
-function parseTomlString(text: string, key: string): string | undefined {
-  const match = text.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*["']([^"']+)["']\\s*(?:#.*)?$`, "m"));
-  return match?.[1];
+function optionalRootString(document: TomlTable, key: string): string | undefined {
+  if (!Object.hasOwn(document, key)) return undefined;
+  const value = document[key];
+  if (typeof value !== "string") {
+    throw new Error(`${key} must be a TOML string`);
+  }
+  return value;
 }
 
-function parseTomlInteger(text: string, key: string): number | undefined {
-  const match = text.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*([0-9][0-9_]*)\\s*(?:#.*)?$`, "m"));
-  if (!match) return undefined;
-  const value = Number(match[1].replace(/_/g, ""));
-  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function optionalPositiveRootInteger(document: TomlTable, key: string): number | undefined {
+  if (!Object.hasOwn(document, key)) return undefined;
+  const value = document[key];
+  if (typeof value !== "bigint" || value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${key} must be a positive TOML integer`);
+  }
+  return Number(value);
 }

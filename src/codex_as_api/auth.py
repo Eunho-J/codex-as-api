@@ -34,6 +34,10 @@ class ChatGPTOAuthError(RuntimeError):
     pass
 
 
+class ChatGPTOAuthInvalidRequestError(ChatGPTOAuthError):
+    pass
+
+
 class ChatGPTOAuthMissingError(ChatGPTOAuthError):
     pass
 

@@ -11,6 +11,23 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
+export interface PromptCacheBreakpoint {
+  mode: "explicit";
+}
+
+export type MessageContentPart =
+  | {
+      type: "text";
+      text: string;
+      prompt_cache_breakpoint?: PromptCacheBreakpoint;
+    }
+  | {
+      type: "image_url";
+      image_url: string;
+      detail?: "auto" | "low" | "high" | "original";
+      prompt_cache_breakpoint?: PromptCacheBreakpoint;
+    };
+
 export interface Message {
   role: MessageRole;
   content: string;
@@ -19,6 +36,7 @@ export interface Message {
   name?: string;
   reasoning_content?: string;
   images?: string[];
+  structured_content?: MessageContentPart[];
 }
 
 export interface Usage {
@@ -26,6 +44,7 @@ export interface Usage {
   completion_tokens: number;
   total_tokens: number;
   cached_tokens: number;
+  cache_write_tokens?: number;
 }
 
 export interface AssistantResponse {
@@ -35,10 +54,13 @@ export interface AssistantResponse {
   usage: Usage | null;
   reasoning_content: string | null;
   raw: Record<string, unknown> | null;
+  response_id?: string | null;
 }
 
 export interface ToolSchema {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  allowed_callers?: unknown;
+  output_schema?: unknown;
 }

@@ -11,6 +11,7 @@ from .messages import Message, MessageRole, ToolCall, ToolSchema, Usage, Assista
 # Request conversion: Anthropic → internal
 # ---------------------------------------------------------------------------
 
+
 def anthropic_request_to_internal(
     *,
     model: str,
@@ -22,7 +23,9 @@ def anthropic_request_to_internal(
     stop_sequences: list[str] | None = None,
     thinking: dict[str, Any] | None = None,
     output_format: dict[str, Any] | None = None,
-) -> tuple[list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None]:
+) -> tuple[
+    list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
+]:
     """Convert Anthropic Messages request fields to internal types.
 
     Returns (messages, tools, tool_choice, stop, reasoning_effort, text).
@@ -85,11 +88,13 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 text_parts.append(text)
         elif block_type == "tool_result":
             if text_parts or image_urls:
-                out.append(Message(
-                    role=MessageRole.USER,
-                    content="".join(text_parts),
-                    images=tuple(image_urls),
-                ))
+                out.append(
+                    Message(
+                        role=MessageRole.USER,
+                        content="".join(text_parts),
+                        images=tuple(image_urls),
+                    )
+                )
                 text_parts = []
                 image_urls = []
             tool_use_id = block.get("tool_use_id") or "tool-call"
@@ -115,18 +120,22 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
                 result_content = str(result_content) if result_content else ""
-            out.append(Message(
-                role=MessageRole.TOOL,
-                content=result_content,
-                tool_call_id=tool_use_id,
-                name=tool_use_id,
-            ))
+            out.append(
+                Message(
+                    role=MessageRole.TOOL,
+                    content=result_content,
+                    tool_call_id=tool_use_id,
+                    name=tool_use_id,
+                )
+            )
             if tool_result_images:
-                out.append(Message(
-                    role=MessageRole.USER,
-                    content="",
-                    images=tuple(tool_result_images),
-                ))
+                out.append(
+                    Message(
+                        role=MessageRole.USER,
+                        content="",
+                        images=tuple(tool_result_images),
+                    )
+                )
         elif block_type == "image":
             source = block.get("source", {})
             if isinstance(source, dict) and source.get("type") == "base64":
@@ -138,11 +147,13 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
             if rendered:
                 text_parts.append(rendered)
     if text_parts or image_urls:
-        out.append(Message(
-            role=MessageRole.USER,
-            content="".join(text_parts),
-            images=tuple(image_urls),
-        ))
+        out.append(
+            Message(
+                role=MessageRole.USER,
+                content="".join(text_parts),
+                images=tuple(image_urls),
+            )
+        )
 
 
 def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Message]) -> None:
@@ -161,11 +172,13 @@ def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Me
             if isinstance(text, str):
                 text_parts.append(text)
         elif block_type == "tool_use":
-            tool_calls.append(ToolCall(
-                id=block.get("id") or uuid.uuid4().hex,
-                name=block.get("name") or "",
-                arguments=block.get("input") or {},
-            ))
+            tool_calls.append(
+                ToolCall(
+                    id=block.get("id") or uuid.uuid4().hex,
+                    name=block.get("name") or "",
+                    arguments=block.get("input") or {},
+                )
+            )
         elif block_type == "thinking":
             thinking_text = block.get("thinking")
             if isinstance(thinking_text, str) and thinking_text:
@@ -181,34 +194,49 @@ def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Me
             rendered = _render_anthropic_content_block(block)
             if rendered:
                 text_parts.append(rendered)
-    out.append(Message(
-        role=MessageRole.ASSISTANT,
-        content="".join(text_parts),
-        tool_calls=tuple(tool_calls) if tool_calls else (),
-        reasoning_content=reasoning_content,
-    ))
+    out.append(
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="".join(text_parts),
+            tool_calls=tuple(tool_calls) if tool_calls else (),
+            reasoning_content=reasoning_content,
+        )
+    )
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[ToolSchema]:
     result: list[ToolSchema] = []
-    for tool in tools:
+    for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             continue
+        if tool.get("type") == "programmatic_tool_calling":
+            raise ValueError(
+                "programmatic_tool_calling requires native Responses program/caller replay "
+                "and is not supported by the Anthropic facade"
+            )
+        if any(key in tool for key in ("allowed_callers", "output_schema")):
+            raise ValueError(
+                f"Anthropic tool {index} uses Programmatic Tool Calling fields that cannot be preserved"
+            )
         name = tool.get("name")
         if not name:
             continue
         if _is_anthropic_web_search_tool(tool):
-            result.append(ToolSchema(
-                name="web_search",
-                description="Anthropic hosted web search",
-                parameters=_anthropic_web_search_parameters(tool),
-            ))
+            result.append(
+                ToolSchema(
+                    name="web_search",
+                    description="Anthropic hosted web search",
+                    parameters=_anthropic_web_search_parameters(tool),
+                )
+            )
             continue
-        result.append(ToolSchema(
-            name=str(name),
-            description=str(tool.get("description") or ""),
-            parameters=tool.get("input_schema") or {},
-        ))
+        result.append(
+            ToolSchema(
+                name=str(name),
+                description=str(tool.get("description") or ""),
+                parameters=tool.get("input_schema") or {},
+            )
+        )
     return result
 
 
@@ -275,6 +303,8 @@ def _convert_thinking(thinking: dict[str, Any] | None) -> str | None:
         return "high"
     if thinking.get("type") == "adaptive":
         return "medium"
+    if thinking.get("type") == "disabled":
+        return "none"
     return None
 
 
@@ -319,7 +349,13 @@ def _render_anthropic_content_block(block: dict[str, Any]) -> str:
 
 
 def _render_document_block(block: dict[str, Any]) -> str:
-    title = block.get("title") if isinstance(block.get("title"), str) else block.get("name") if isinstance(block.get("name"), str) else "document"
+    title = (
+        block.get("title")
+        if isinstance(block.get("title"), str)
+        else block.get("name")
+        if isinstance(block.get("name"), str)
+        else "document"
+    )
     source = block.get("source")
     body = ""
     if isinstance(source, dict):
@@ -353,9 +389,17 @@ def _render_generic_tool_result_block(block: dict[str, Any]) -> str:
             if isinstance(item, dict):
                 title = item.get("title") if isinstance(item.get("title"), str) else None
                 url = item.get("url") if isinstance(item.get("url"), str) else ""
-                text = item.get("text") if isinstance(item.get("text"), str) else item.get("content") if isinstance(item.get("content"), str) else ""
+                text = (
+                    item.get("text")
+                    if isinstance(item.get("text"), str)
+                    else item.get("content")
+                    if isinstance(item.get("content"), str)
+                    else ""
+                )
                 if title or url or text:
-                    lines.append(f"- {title or 'result'}" + (f" ({url})" if url else "") + (f": {text}" if text else ""))
+                    lines.append(
+                        f"- {title or 'result'}" + (f" ({url})" if url else "") + (f": {text}" if text else "")
+                    )
                 else:
                     lines.append(_safe_json(item))
             else:
@@ -379,6 +423,7 @@ def _safe_json(value: Any) -> str:
 # Non-streaming response: internal → Anthropic
 # ---------------------------------------------------------------------------
 
+
 def internal_response_to_anthropic(
     response: AssistantResponse,
     model: str,
@@ -387,11 +432,13 @@ def internal_response_to_anthropic(
     content: list[dict[str, Any]] = []
 
     if response.reasoning_content:
-        content.append({
-            "type": "thinking",
-            "thinking": response.reasoning_content,
-            "signature": "sig-placeholder",
-        })
+        content.append(
+            {
+                "type": "thinking",
+                "thinking": response.reasoning_content,
+                "signature": "sig-placeholder",
+            }
+        )
 
     web_search_blocks = _web_search_blocks_from_raw(response.raw)
     content.extend(web_search_blocks)
@@ -400,12 +447,14 @@ def internal_response_to_anthropic(
         content.append({"type": "text", "text": response.content})
 
     for tc in response.tool_calls:
-        content.append({
-            "type": "tool_use",
-            "id": tc.id,
-            "name": tc.name,
-            "input": tc.arguments,
-        })
+        content.append(
+            {
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.name,
+                "input": tc.arguments,
+            }
+        )
 
     stop_reason = _map_stop_reason(response.finish_reason, bool(response.tool_calls))
 
@@ -414,7 +463,7 @@ def internal_response_to_anthropic(
         usage_dict = {
             "input_tokens": response.usage.prompt_tokens,
             "output_tokens": response.usage.completion_tokens,
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": response.usage.cache_write_tokens,
             "cache_read_input_tokens": response.usage.cached_tokens,
         }
     usage_dict = _merge_server_tool_usage(usage_dict, response.raw, len(web_search_blocks) // 2)
@@ -489,6 +538,7 @@ def _map_stop_reason(finish_reason: str, has_tool_calls: bool) -> str:
 # Streaming adapter: provider events → Anthropic SSE
 # ---------------------------------------------------------------------------
 
+
 def anthropic_stream_adapter(
     event_stream: Iterator[dict[str, Any]],
     model: str,
@@ -500,19 +550,22 @@ def anthropic_stream_adapter(
 
 
 def _message_start_sse(model: str, request_id: str, usage: dict[str, Any]) -> str:
-    return _sse("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": request_id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [],
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": usage,
+    return _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": usage,
+            },
         },
-    })
+    )
 
 
 def _num(value: Any) -> int:
@@ -524,12 +577,20 @@ def _anthropic_usage_from_provider(usage: Any) -> dict[str, Any]:
         return {"input_tokens": 0, "output_tokens": 0}
     token_details = usage.get("input_tokens_details", usage.get("prompt_tokens_details"))
     cache_read = _num(usage.get("cache_read_input_tokens", usage.get("cached_input_tokens")))
+    cache_write = _num(
+        usage.get(
+            "cache_creation_input_tokens",
+            usage.get("cache_write_tokens", usage.get("cache_write_input_tokens")),
+        )
+    )
     if cache_read == 0 and isinstance(token_details, dict):
         cache_read = _num(token_details.get("cached_tokens"))
+    if cache_write == 0 and isinstance(token_details, dict):
+        cache_write = _num(token_details.get("cache_write_tokens"))
     out: dict[str, Any] = {
         "input_tokens": _num(usage.get("input_tokens", usage.get("prompt_tokens"))),
         "output_tokens": _num(usage.get("output_tokens", usage.get("completion_tokens"))),
-        "cache_creation_input_tokens": _num(usage.get("cache_creation_input_tokens")),
+        "cache_creation_input_tokens": cache_write,
         "cache_read_input_tokens": cache_read,
     }
     for key in ("cache_creation", "server_tool_use", "service_tier"):
@@ -554,28 +615,37 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
                 if current_block is not None:
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                     block_index += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-                })
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    },
+                )
                 current_block = "thinking"
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "thinking_delta", "thinking": text},
-            })
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "thinking_delta", "thinking": text},
+                },
+            )
 
         elif typ == "content":
             has_any_content = True
             text = str(event.get("text", ""))
             if current_block == "thinking":
                 # Close thinking block, emit signature
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                })
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                    },
+                )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 block_index += 1
                 current_block = None
@@ -583,42 +653,57 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
                 if current_block is not None:
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                     block_index += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
                 current_block = "text"
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "text_delta", "text": text},
-            })
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            )
 
         elif typ == "tool_call":
             has_any_content = True
             if current_block is not None:
                 if current_block == "thinking":
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                    })
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                        },
+                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 block_index += 1
             tool_id = str(event.get("id", ""))
             tool_name = str(event.get("name", ""))
             tool_args = event.get("arguments") or {}
-            yield _sse("content_block_start", {
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
-            })
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_args, ensure_ascii=False)},
-            })
+            yield _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
+                },
+            )
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_args, ensure_ascii=False)},
+                },
+            )
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
             block_index += 1
             current_block = None
@@ -628,37 +713,49 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             web_search_requests += 1
             if current_block is not None:
                 if current_block == "thinking":
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                    })
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                        },
+                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 block_index += 1
             tool_id = str(event.get("id") or "")
             tool_input = event.get("input") if isinstance(event.get("input"), dict) else {"query": ""}
             result_content = event.get("content") if isinstance(event.get("content"), list) else []
-            yield _sse("content_block_start", {
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}},
-            })
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)},
-            })
+            yield _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}},
+                },
+            )
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)},
+                },
+            )
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
             block_index += 1
-            yield _sse("content_block_start", {
-                "type": "content_block_start",
-                "index": block_index,
-                "content_block": {
-                    "type": "web_search_tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result_content,
+            yield _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result_content,
+                    },
                 },
-            })
+            )
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
             block_index += 1
             current_block = None
@@ -666,33 +763,42 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
         elif typ == "finish":
             if current_block is not None:
                 if current_block == "thinking":
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                    })
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
+                        },
+                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 current_block = None
 
             if not has_any_content:
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
 
             finish_reason = str(event.get("finish_reason") or "stop")
             stop_reason = _map_stop_reason(finish_reason, False)
 
-            yield _sse("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": _usage_with_synthesized_web_search(
-                    _anthropic_usage_from_provider(event.get("usage")),
-                    web_search_requests,
-                ),
-            })
+            yield _sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": _usage_with_synthesized_web_search(
+                        _anthropic_usage_from_provider(event.get("usage")),
+                        web_search_requests,
+                    ),
+                },
+            )
             yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -700,6 +806,8 @@ def _usage_with_synthesized_web_search(usage: dict[str, Any], web_search_request
     if web_search_requests > 0 and "server_tool_use" not in usage:
         usage["server_tool_use"] = {"web_search_requests": web_search_requests}
     return usage
+
+
 def _sse(event_type: str, data: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -707,6 +815,7 @@ def _sse(event_type: str, data: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Error formatting
 # ---------------------------------------------------------------------------
+
 
 def format_anthropic_error(status: int, message: str) -> dict[str, Any]:
     type_map = {

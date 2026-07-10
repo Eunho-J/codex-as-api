@@ -52,10 +52,7 @@ pub fn normalize_openai_chat_completion_chunk(chunk: &Value) -> Vec<HashMap<Stri
                 Value::String("reasoning_delta".to_string()),
             );
             ev.insert("text".to_string(), Value::String(reasoning));
-            ev.insert(
-                "source_key".to_string(),
-                Value::String(key.to_string()),
-            );
+            ev.insert("source_key".to_string(), Value::String(key.to_string()));
             events.push(ev);
         }
     }
@@ -272,10 +269,7 @@ mod tests {
             "error": {"message": "rate limit exceeded"}
         });
         let msg = response_failure_message(&event, "failed");
-        assert_eq!(
-            msg,
-            "OpenAI protocol response failed: rate limit exceeded"
-        );
+        assert_eq!(msg, "OpenAI protocol response failed: rate limit exceeded");
     }
 
     #[test]
@@ -315,10 +309,7 @@ mod tests {
             "type": "reasoning",
             "summary": "thinking about it"
         })];
-        assert_eq!(
-            reasoning_from_response_items(&items),
-            "thinking about it"
-        );
+        assert_eq!(reasoning_from_response_items(&items), "thinking about it");
     }
 
     #[test]
