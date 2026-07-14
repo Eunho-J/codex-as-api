@@ -3,6 +3,7 @@ mod auth;
 mod codex_config;
 mod messages;
 mod model_capabilities;
+mod o200k_tokenizer;
 mod protocol;
 mod provider;
 mod server;

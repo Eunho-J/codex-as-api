@@ -1,6 +1,6 @@
 [package]
 name = "codex-as-api"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 
 [[bin]]
@@ -11,6 +11,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+fancy-regex = "0.16"
 reqwest = { version = "0.12", features = ["stream", "blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -278,7 +278,11 @@ curl -N http://localhost:18080/v1/messages \
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route returns a conservative local estimate plus context-window metadata for the effective backend model. The estimate uses UTF-8 byte length as an upper bound for GPT/Codex BPE text tokens, then adds protocol overhead for roles, message boundaries, tools, raw request metadata, and images.
+Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route counts text locally and returns context-window metadata for the effective backend model. Normalized model-visible messages, tool calls, tool-result metadata, reasoning, and tool schemas are counted once. Request-envelope and generation-control fields are excluded, and image inputs use a separate fixed estimate so inline base64 data is not counted as text.
+
+GPT-5-family text uses a bundled port of official `tiktoken` `o200k_base` `encode_ordinary`: the same Unicode pre-tokenization regex, byte-pair merge algorithm, and merge-rank data are implemented in Python, TypeScript, and Rust. Official `tiktoken` maps `gpt-5` and its `gpt-5-`-prefixed variants to [`o200k_base`](https://github.com/openai/tiktoken/blob/08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa/tiktoken/model.py#L7-L20); this project applies that GPT-5-family encoding to the bundled `gpt-5.*` Codex model IDs. The project does not depend on a `tiktoken` package or download encoding data at runtime. The last upstream synchronization check was **2026-07-14**, against [`tiktoken` 0.13.0 at `08a5f3b`](https://github.com/openai/tiktoken/tree/08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa); the bundled rank file SHA-256 is `446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`.
+
+Official Codex also has a [`ceil(UTF-8 bytes / 4)` truncation helper](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/utils/string/src/truncate.rs#L4-L84), but Codex documents the history estimate using that helper as [a coarse lower bound rather than a tokenizer-accurate count](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/core/src/context_manager/history.rs#L160-L185). This endpoint therefore uses exact `o200k_base` ordinary text tokenization instead. The complete request count remains an estimate because protocol-wrapper overhead and image cost are local constants, but the former byte-as-token and raw-payload double count that could overstate ordinary Claude Code requests by about 8x is removed.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -604,7 +608,7 @@ curl -N http://localhost:18080/v1/chat/completions \
 
 ## Using with Claude Code
 
-The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used by Claude Code. Compatibility was validated with Claude Code `2.1.208`, including streaming, a real `Read` tool loop, request-level GPT model routing, adaptive thinking, `--effort max`, and Fast Mode.
+The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used by Claude Code. Compatibility was validated with Claude Code `2.1.209`, including streaming, real Codex OAuth chat, request-level GPT model routing, adaptive thinking, `--effort max`, and Fast Mode.
 
 Start the proxy first. `CODEX_AS_API_MODEL` is the fallback used when Claude Code sends a built-in Anthropic model name:
 
@@ -624,7 +628,7 @@ CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
 claude
 ```
 
-Run `/model` and select **GPT-5.6 Sol**. The custom entry is appended to the built-in rows rather than replacing them. Claude Code `2.1.208` recognizes this GPT model ID without a custom capability declaration: `/effort low|medium|high|xhigh|max`, the picker effort control, and `claude --effort ...` are translated from Claude Code's `output_config.effort` to the Codex reasoning effort. Claude Code Fast Mode's `speed: "fast"` is translated to the Codex `priority` service tier.
+Run `/model` and select **GPT-5.6 Sol**. The custom entry is appended to the built-in rows rather than replacing them. Claude Code `2.1.209` recognizes this GPT model ID without a custom capability declaration: `/effort low|medium|high|xhigh|max`, the picker effort control, and `claude --effort ...` are translated from Claude Code's `output_config.effort` to the Codex reasoning effort. Claude Code Fast Mode's `speed: "fast"` is translated to the Codex `priority` service tier.
 
 If managed settings define an `availableModels` allowlist, that list must include the exact `ANTHROPIC_CUSTOM_MODEL_OPTION` value, such as `gpt-5.6-sol`; otherwise Claude Code hides or rejects the custom row.
 
@@ -682,7 +686,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `src/codex_as_api/__init__.py`, `src/codex_as_api/server.py`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.6.1` from the matching commit.
+- Publish a GitHub Release such as `v0.6.2` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 Publishing to npmjs requires an authenticated npm session (`npm login` beforehand; `npm whoami` should succeed). From the repository root, the publish itself is one command:
@@ -724,6 +728,16 @@ npm test
 
 
 ## Release Notes
+
+### v0.6.2
+
+- Fix `/v1/messages/count_tokens` overcounting that could trigger Claude Code autocompaction on every turn.
+- Count normalized model-visible messages, tool calls, reasoning, tool-result metadata, and tool schemas once; remove the second full raw-request-body addition.
+- Port official `tiktoken` `o200k_base` ordinary encoding into Python, TypeScript, and Rust without adding a `tiktoken` package dependency or runtime rank download.
+- Match the upstream Unicode text split and BPE merge ranks last checked on 2026-07-14 against `tiktoken` 0.13.0 at `08a5f3b`.
+- Keep image input cost separate and count inline base64 images once rather than adding both a fixed image estimate and the base64 request bytes.
+- Add matching Python, TypeScript, and Rust endpoint regressions: a 4,000-byte ASCII message now returns `1,012` instead of roughly `8,000`, and non-model control fields do not change the count.
+- Validate the release with Claude Code `2.1.209` and real Codex OAuth chat.
 
 ### v0.6.1
 

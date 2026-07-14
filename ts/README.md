@@ -20,6 +20,12 @@ codex-as-api
 
 The server listens on `127.0.0.1:18080` by default.
 
+`/v1/messages/count_tokens` bundles a dependency-free port of official
+`tiktoken` `o200k_base` ordinary encoding, including the Unicode text split,
+BPE merge logic, and rank data. No `tiktoken` package or runtime download is
+required. The last upstream synchronization check was 2026-07-14 against
+`tiktoken` 0.13.0 commit `08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa`.
+
 For configuration, supported endpoints, model behavior, and examples, see the [canonical GitHub documentation](https://github.com/Eunho-J/codex-as-api#readme).
 
 ## Claude Code with GPT

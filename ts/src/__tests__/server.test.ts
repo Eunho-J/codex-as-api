@@ -1085,7 +1085,7 @@ describe("Anthropic compatibility helper routes", () => {
     });
   });
 
-  it("returns conservative count_tokens estimate without calling provider", async () => {
+  it("returns a single-pass count_tokens estimate without calling provider", async () => {
     const provider = {
       async countTokens() {
         throw new Error("count_tokens must not call the Codex backend");
@@ -1118,8 +1118,7 @@ describe("Anthropic compatibility helper routes", () => {
         context_window: number;
         auto_compact_token_limit: number;
       };
-      const floor = Buffer.byteLength(JSON.stringify(tools)) + Buffer.byteLength("You are helpful.") + Buffer.byteLength("hello");
-      assert.ok(body.input_tokens >= floor);
+      assert.equal(body.input_tokens, 48);
       assert.ok(body.context_window >= body.auto_compact_token_limit);
 
       for (const unsupported of [
@@ -1175,20 +1174,78 @@ describe("Anthropic compatibility helper routes", () => {
     }, { model: "gpt-5.5" });
   });
 
-  it("counts UTF-8 bytes conservatively", async () => {
+  it("does not double-count the raw count_tokens payload", async () => {
+    const content = "abcd".repeat(1_000);
     await withServer({}, async (baseUrl) => {
+      const count = async (extra: Record<string, unknown>) => {
+        const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-5",
+            max_tokens: 1024,
+            messages: [{ role: "user", content }],
+            ...extra,
+          }),
+        });
+        assert.equal(res.status, 200);
+        return (await res.json() as { input_tokens: number }).input_tokens;
+      };
+
+      const plain = await count({});
+      const withNonModelFields = await count({
+        stream: false,
+        metadata: { diagnostic: "x".repeat(4_000) },
+      });
+      assert.equal(plain, 1_012);
+      assert.equal(withNonModelFields, plain);
+    });
+  });
+
+  it("counts multilingual UTF-8 text with o200k_base", async () => {
+    await withServer({}, async (baseUrl) => {
+      const content = "hello 안녕 👋";
       const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
           max_tokens: 1024,
-          messages: [{ role: "user", content: "hello 안녕 👋" }],
+          messages: [{ role: "user", content }],
         }),
       });
       assert.equal(res.status, 200);
       const body = await res.json() as { input_tokens: number };
-      assert.ok(body.input_tokens >= Buffer.byteLength("hello 안녕 👋"));
+      assert.equal(body.input_tokens, 17);
+    });
+  });
+
+  it("counts image input once without tokenizing base64 payload bytes", async () => {
+    await withServer({}, async (baseUrl) => {
+      const count = async (source: Record<string, unknown>) => {
+        const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-5",
+            messages: [{
+              role: "user",
+              content: [{ type: "image", source }],
+            }],
+          }),
+        });
+        assert.equal(res.status, 200);
+        return (await res.json() as { input_tokens: number }).input_tokens;
+      };
+
+      const url = await count({ type: "url", url: "https://example.com/image.png" });
+      const base64 = await count({
+        type: "base64",
+        media_type: "image/png",
+        data: "AAAA".repeat(4_000),
+      });
+      assert.equal(url, 8_512);
+      assert.equal(base64, url);
     });
   });
 

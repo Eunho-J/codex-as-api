@@ -16,6 +16,7 @@ from .auth import (
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import capability_for_model, load_model_capabilities
+from .o200k_tokenizer import count_ordinary
 from .provider import ChatGPTOAuthProvider, prime_codex_cli_version_cache
 
 
@@ -139,7 +140,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.6.1",
+        version="0.6.2",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -508,31 +509,46 @@ try:
         raw_tools = body.get("tools") if isinstance(body.get("tools"), list) else None
         return messages, _parse_tools(raw_tools), None, None
 
-    def _token_bytes(value: str) -> int:
-        return len(value.encode("utf-8"))
+    def _json_token_count(value: Any) -> int:
+        serialized = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        return count_ordinary(serialized)
 
-    def _json_bytes(value: Any) -> int:
-        return len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8"))
-
-    def _estimate_input_tokens(messages: list[Message], raw_payload: Any = None) -> int:
-        """Conservative count_tokens estimate for Codex/GPT byte-pair tokenizers.
-
-        GPT-5-class OpenAI models use the o200k_base BPE family. Without a
-        count-only Codex OAuth endpoint, use UTF-8 bytes as an upper bound for
-        text tokens, then add protocol overhead for roles, message boundaries,
-        tools, and images.
-        """
-        total = 32
+    def _estimate_input_tokens(messages: list[Message], tools: list[ToolSchema] | None = None) -> int:
+        """Count the model-visible request with bundled o200k_base encode_ordinary."""
+        total = 8
+        image_tokens = 0
         for message in messages:
-            total += 12 + _token_bytes(message.role.value) + _token_bytes(message.content)
-            total += len(message.images) * 8500
+            total += 3 + count_ordinary(message.role.value) + count_ordinary(message.content)
+            image_tokens += len(message.images) * 8500
             if message.tool_calls:
-                total += _json_bytes([tc.__dict__ for tc in message.tool_calls])
+                total += _json_token_count(
+                    [
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        }
+                        for tool_call in message.tool_calls
+                    ]
+                )
+            if message.tool_call_id:
+                total += count_ordinary(message.tool_call_id)
+            if message.name:
+                total += count_ordinary(message.name)
             if message.reasoning_content:
-                total += _token_bytes(message.reasoning_content)
-        if raw_payload is not None:
-            total += _json_bytes(raw_payload)
-        return max(1, total)
+                total += count_ordinary(message.reasoning_content)
+        if tools:
+            total += _json_token_count(
+                [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                    for tool in tools
+                ]
+            )
+        return total + image_tokens
 
     # ------------------------------------------------------------------
     # Endpoints
@@ -937,7 +953,7 @@ try:
                 )
         try:
             _validate_anthropic_context_management(body.get("context_management"))
-            messages, _tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
+            messages, tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
                 model=body.get("model"),
                 messages=body.get("messages") or [],
                 system=body.get("system"),
@@ -949,7 +965,7 @@ try:
                 output_format=_anthropic_output_format_from_body(body),
                 output_config=body.get("output_config"),
             )
-            input_tokens = _estimate_input_tokens(messages, body)
+            input_tokens = _estimate_input_tokens(messages, tools)
             request_model = _anthropic_backend_model(body.get("model"))
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))

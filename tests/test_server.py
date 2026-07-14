@@ -1537,14 +1537,13 @@ def test_chat_completions_missing_auth_returns_auth_error(
     assert body["error"]["type"] == "chatgpt_oauth_error"
 
 
-def test_messages_count_tokens_returns_conservative_estimate_without_provider_call(client, monkeypatch):
+def test_messages_count_tokens_counts_normalized_tools_without_provider_call(client, monkeypatch):
     import codex_as_api.server as server_mod
 
-    class DummyProvider:
-        def count_tokens(self, *args, **kwargs):
-            raise AssertionError("count_tokens must not call the Codex backend")
+    def fail_provider_call():
+        raise AssertionError("count_tokens must not call the Codex backend")
 
-    monkeypatch.setattr(server_mod, "_provider", DummyProvider())
+    monkeypatch.setattr(server_mod, "_get_provider", fail_provider_call)
     tools = [
         {
             "name": "lookup",
@@ -1566,9 +1565,46 @@ def test_messages_count_tokens_returns_conservative_estimate_without_provider_ca
     )
     assert resp.status_code == 200
     body = resp.json()
-    serialized_floor = len(json.dumps(tools).encode("utf-8")) + len(b"You are helpful.") + len(b"hello")
-    assert body["input_tokens"] >= serialized_floor
+    assert body["input_tokens"] == 48
     assert body["context_window"] >= body["auto_compact_token_limit"]
+
+
+def test_messages_count_tokens_large_ascii_payload_is_not_double_counted(client):
+    resp = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "x" * 4000}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["input_tokens"] == 512
+
+
+def test_messages_count_tokens_ignores_non_model_control_fields(client):
+    base_payload = {
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "same"}],
+    }
+    control_payload = {
+        **base_payload,
+        "max_tokens": 8192,
+        "stream": True,
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "metadata": {"opaque": "not model visible" * 100},
+        "stop_sequences": ["done"],
+    }
+
+    base = client.post("/v1/messages/count_tokens", json=base_payload)
+    with_controls = client.post("/v1/messages/count_tokens", json=control_payload)
+
+    assert base.status_code == 200
+    assert with_controls.status_code == 200
+    assert base.json()["input_tokens"] == 13
+    assert with_controls.json()["input_tokens"] == 13
 
 
 @pytest.mark.parametrize(
@@ -1607,16 +1643,74 @@ def test_messages_count_tokens_rejects_native_responses_lifecycles_without_provi
     assert recording_backend.requests.empty()
 
 
-def test_messages_count_tokens_counts_utf8_bytes_conservatively(client):
+def test_messages_count_tokens_uses_o200k_for_multilingual_text(client):
     payload = {
         "model": "claude-sonnet-4-5",
         "max_tokens": 1024,
-        "messages": [{"role": "user", "content": "hello 안녕 👋"}],
+        "messages": [{"role": "user", "content": "안녕 👋"}],
     }
     resp = client.post("/v1/messages/count_tokens", json=payload)
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["input_tokens"] >= len("hello 안녕 👋".encode())
+    assert resp.json()["input_tokens"] == 16
+
+
+def test_messages_count_tokens_counts_each_image_once(client):
+    payload = {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {
+                        "type": "image",
+                        "source": {"type": "url", "url": "https://example.com/image.png"},
+                    },
+                ],
+            }
+        ],
+    }
+
+    resp = client.post("/v1/messages/count_tokens", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json()["input_tokens"] == 8513
+
+
+def test_messages_count_tokens_includes_tool_and_reasoning_metadata_once(client):
+    payload = {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "plan"},
+                    {"type": "text", "text": "checking"},
+                    {
+                        "type": "tool_use",
+                        "id": "call_123",
+                        "name": "lookup",
+                        "input": {"query": "docs"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_123",
+                        "content": "result",
+                    }
+                ],
+            },
+        ],
+    }
+
+    resp = client.post("/v1/messages/count_tokens", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json()["input_tokens"] == 44
 
 
 def test_messages_count_tokens_reports_effective_request_model_context(client, monkeypatch):

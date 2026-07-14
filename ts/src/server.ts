@@ -29,6 +29,7 @@ import {
 } from "./anthropic-adapter.js";
 import { loadCodexConfig, type CodexConfig } from "./codex-config.js";
 import { capabilityForModel } from "./model-capabilities.js";
+import { countO200kOrdinaryTokens } from "./o200k-tokenizer.js";
 
 const HOST = process.env.CODEX_AS_API_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
@@ -583,7 +584,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
       const body = req.body;
       rejectUnsupportedGenerationFeatures(body);
       validateAnthropicContextManagement(body.context_management);
-      const { messages } = anthropicRequestToInternal({
+      const { messages, tools } = anthropicRequestToInternal({
         model: body.model,
         messages: body.messages || [],
         system: body.system,
@@ -595,7 +596,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         outputFormat: anthropicOutputFormatFromBody(body),
         outputConfig: body.output_config,
       });
-      const inputTokens = estimateInputTokens(messages, body);
+      const inputTokens = estimateInputTokens(messages, tools);
       const requestModel = resolveAnthropicBackendModel(body.model, model);
       res.json({
         input_tokens: inputTokens,
@@ -1094,25 +1095,40 @@ function resolveAnthropicServiceTier(
 }
 
 
-function byteLength(value: string): number {
-  return Buffer.byteLength(value, "utf8");
+const BASE_PROMPT_TOKENS = 8;
+const MESSAGE_BOUNDARY_TOKENS = 3;
+const IMAGE_TOKEN_ESTIMATE = 8_500;
+
+function jsonTokenCount(value: unknown): number {
+  return countO200kOrdinaryTokens(JSON.stringify(value) ?? "");
 }
 
-function jsonByteLength(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
-}
-
-function estimateInputTokens(messages: Message[], rawPayload?: unknown): number {
-  let total = 32;
+function estimateInputTokens(
+  messages: Message[],
+  tools: ToolSchema[] | null = null,
+): number {
+  let inputTokens = BASE_PROMPT_TOKENS;
   for (const message of messages) {
-    total += 12 + byteLength(message.role) + byteLength(message.content);
-    total += (message.images?.length || 0) * 8500;
-    total += (message.structured_content?.filter((part) => part.type === "image_url").length || 0) * 8500;
-    if (message.tool_calls?.length) total += jsonByteLength(message.tool_calls);
-    if (message.reasoning_content) total += byteLength(message.reasoning_content);
+    inputTokens += MESSAGE_BOUNDARY_TOKENS
+      + countO200kOrdinaryTokens(message.role)
+      + countO200kOrdinaryTokens(message.content);
+    inputTokens += (message.images?.length || 0) * IMAGE_TOKEN_ESTIMATE;
+    inputTokens += (
+      message.structured_content?.filter((part) => part.type === "image_url").length || 0
+    ) * IMAGE_TOKEN_ESTIMATE;
+    if (message.tool_calls?.length) {
+      inputTokens += jsonTokenCount(message.tool_calls);
+    }
+    if (message.tool_call_id) {
+      inputTokens += countO200kOrdinaryTokens(message.tool_call_id);
+    }
+    if (message.name) inputTokens += countO200kOrdinaryTokens(message.name);
+    if (message.reasoning_content) {
+      inputTokens += countO200kOrdinaryTokens(message.reasoning_content);
+    }
   }
-  if (rawPayload != null) total += jsonByteLength(rawPayload);
-  return Math.max(1, total);
+  if (tools?.length) inputTokens += jsonTokenCount(tools);
+  return Math.max(1, inputTokens);
 }
 
 

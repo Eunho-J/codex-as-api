@@ -1,5 +1,23 @@
 # Release Notes
 
+## v0.6.2
+
+### Claude Code count_tokens autocompact fix
+
+- Fix the Anthropic `/v1/messages/count_tokens` estimator treating every UTF-8 byte as a token and then adding the full raw request body a second time.
+- Port official `tiktoken` `o200k_base` ordinary encoding into Python, TypeScript, and Rust: the same Unicode pre-tokenization regex, byte-pair merge algorithm, and merge ranks now count GPT-5-family text.
+- Count tool calls, tool-result identifiers, reasoning content, and normalized tool schemas once while excluding model IDs, output limits, stream flags, metadata, and other non-model request controls.
+- Keep the existing image estimate separate so URL and inline base64 images are counted once without tokenizing the base64 payload as text.
+- Keep token counting local and OAuth-free. No `tiktoken` package dependency or first-run encoding download is introduced.
+- Record the upstream synchronization point as `tiktoken` 0.13.0 commit `08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa`, checked on 2026-07-14, with the official rank-file SHA-256 verified during release validation.
+
+### Validation
+
+- A 4,000-byte ASCII message returns `1,012` input tokens in all three implementations instead of roughly `8,000`.
+- Endpoint tests cover UTF-8 text, normalized tools, tool/reasoning history, URL and base64 images, ignored request controls, effective model limits, and zero upstream provider calls.
+- Official `tiktoken` 0.13.0 token IDs match the bundled ports across reference vectors, randomized multilingual text, code, whitespace, contractions, special-token-shaped literals, and long single-piece input.
+- Python, TypeScript, and Rust return identical counts across 204 cross-runtime endpoint cases; Claude Code 2.1.209 real Codex OAuth chat remains compatible.
+
 ## v0.6.1
 
 ### Claude Code 2.1.208 compatibility

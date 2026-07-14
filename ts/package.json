@@ -1,6 +1,6 @@
 {
   "name": "codex-as-api",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth",
   "license": "Apache-2.0",
   "repository": {
@@ -19,7 +19,8 @@
   ],
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "bin": {
     "codex-as-api": "dist/cli.js"

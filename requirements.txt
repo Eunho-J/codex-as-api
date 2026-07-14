@@ -1,3 +1,5 @@
+regex
+
 # Python 3.10 compatibility for the stdlib tomllib parser.
 tomli>=2; python_version < "3.11"
 

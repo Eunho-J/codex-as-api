@@ -19,6 +19,7 @@ use crate::auth;
 use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::model_capabilities::capability_for_model;
+use crate::o200k_tokenizer::count_ordinary;
 use crate::provider::{ChatGPTOAuthProvider, CompactControls, GenerationControls, ProviderError};
 
 const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
@@ -779,19 +780,31 @@ fn reject_unsupported_generation_tool_features(
     Ok(())
 }
 
-fn json_byte_len(value: &Value) -> usize {
-    serde_json::to_string(value)
-        .unwrap_or_default()
-        .as_bytes()
-        .len()
+const BASE_PROMPT_TOKENS: usize = 8;
+const MESSAGE_BOUNDARY_TOKENS: usize = 3;
+const IMAGE_TOKEN_ESTIMATE: usize = 8_500;
+
+fn json_token_count<T: Serialize + ?Sized>(value: &T) -> usize {
+    let json =
+        serde_json::to_string(value).expect("internal messages and tools must serialize as JSON");
+    count_ordinary(&json)
 }
 
-fn estimate_input_tokens(messages: &[Message], raw_payload: Option<&Value>) -> i64 {
-    let mut total: usize = 32;
+fn estimate_input_tokens(messages: &[Message], tools: Option<&[ToolSchema]>) -> i64 {
+    let mut text_tokens = BASE_PROMPT_TOKENS;
+    let mut image_tokens = 0;
     for message in messages {
-        total += format!("{:?}", message.role).len() + message.content.as_bytes().len() + 12;
-        total += message.images.len() * 8500;
-        total += message
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        text_tokens += MESSAGE_BOUNDARY_TOKENS;
+        text_tokens += count_ordinary(role);
+        text_tokens += count_ordinary(&message.content);
+        image_tokens += message.images.len() * IMAGE_TOKEN_ESTIMATE;
+        image_tokens += message
             .structured_content
             .as_ref()
             .map(|parts| {
@@ -799,23 +812,26 @@ fn estimate_input_tokens(messages: &[Message], raw_payload: Option<&Value>) -> i
                     .iter()
                     .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
                     .count()
-                    * 8500
+                    * IMAGE_TOKEN_ESTIMATE
             })
             .unwrap_or(0);
         if !message.tool_calls.is_empty() {
-            total += serde_json::to_string(&message.tool_calls)
-                .unwrap_or_default()
-                .as_bytes()
-                .len();
+            text_tokens += json_token_count(&message.tool_calls);
+        }
+        if let Some(tool_call_id) = &message.tool_call_id {
+            text_tokens += count_ordinary(tool_call_id);
+        }
+        if let Some(name) = &message.name {
+            text_tokens += count_ordinary(name);
         }
         if let Some(reasoning) = &message.reasoning_content {
-            total += reasoning.as_bytes().len();
+            text_tokens += count_ordinary(reasoning);
         }
     }
-    if let Some(payload) = raw_payload {
-        total += json_byte_len(payload);
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        text_tokens += json_token_count(tools);
     }
-    std::cmp::max(1, total as i64)
+    std::cmp::max(1, (text_tokens + image_tokens) as i64)
 }
 
 fn messages_from_compact_body(
@@ -1650,7 +1666,7 @@ async fn anthropic_count_tokens(
         )
             .into_response());
     }
-    let (messages, _tools, _tool_choice, _stop, _reasoning_effort, _text) =
+    let (messages, tools, _tool_choice, _stop, _reasoning_effort, _text) =
         anthropic_request_to_internal(&body).map_err(|message| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1658,7 +1674,7 @@ async fn anthropic_count_tokens(
             )
                 .into_response()
         })?;
-    let input_tokens = estimate_input_tokens(&messages, Some(&body));
+    let input_tokens = estimate_input_tokens(&messages, tools.as_deref());
     let request_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -2483,37 +2499,100 @@ mod tests {
     }
 
     #[test]
-    fn estimate_input_tokens_counts_utf8_bytes_conservatively() {
-        let msg = Message::new(
-            MessageRole::User,
-            "hello 안녕 👋".to_string(),
-            vec![],
+    fn estimate_input_tokens_uses_o200k_for_long_ascii() {
+        let content = "abcd".repeat(1_000);
+        let msg = Message::new(MessageRole::User, content, vec![], None, None).unwrap();
+        let estimate = estimate_input_tokens(&[msg], None);
+        let expected = BASE_PROMPT_TOKENS + MESSAGE_BOUNDARY_TOKENS + 1 + 1_000;
+        assert_eq!(estimate, expected as i64);
+        assert_eq!(estimate, 1_012);
+    }
+
+    #[test]
+    fn estimate_input_tokens_uses_o200k_for_unicode() {
+        let content = "hello 안녕 👋";
+        let msg = Message::new(MessageRole::User, content.to_string(), vec![], None, None).unwrap();
+        assert_eq!(count_ordinary(content), 5);
+        assert_eq!(estimate_input_tokens(&[msg], None), 17);
+    }
+
+    #[test]
+    fn estimate_input_tokens_includes_normalized_tools_once() {
+        let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
+        let tools = vec![ToolSchema {
+            name: "lookup".to_string(),
+            description: "Search docs".to_string(),
+            parameters: json!({"type": "object"}),
+        }];
+        let expected_tokens = BASE_PROMPT_TOKENS
+            + MESSAGE_BOUNDARY_TOKENS
+            + count_ordinary("user")
+            + count_ordinary("hello")
+            + json_token_count(&tools);
+        assert_eq!(
+            estimate_input_tokens(&[msg], Some(&tools)),
+            expected_tokens as i64
+        );
+    }
+
+    #[test]
+    fn estimate_input_tokens_includes_tool_metadata_and_reasoning() {
+        let tool_call = ToolCall {
+            id: "call_123".to_string(),
+            name: "lookup".to_string(),
+            arguments: HashMap::from([("query".to_string(), json!("문서"))]),
+        };
+        let mut assistant = Message::new(
+            MessageRole::Assistant,
+            "checking".to_string(),
+            vec![tool_call],
             None,
             None,
         )
         .unwrap();
-        let estimate = estimate_input_tokens(&[msg], None);
-        assert!(estimate >= "hello 안녕 👋".as_bytes().len() as i64);
+        assistant.reasoning_content = Some("reason carefully".to_string());
+        let tool_result = Message::new(
+            MessageRole::Tool,
+            "result".to_string(),
+            vec![],
+            Some("call_123".to_string()),
+            Some("lookup".to_string()),
+        )
+        .unwrap();
+
+        let expected_tokens = BASE_PROMPT_TOKENS
+            + MESSAGE_BOUNDARY_TOKENS
+            + count_ordinary("assistant")
+            + count_ordinary("checking")
+            + json_token_count(&assistant.tool_calls)
+            + count_ordinary("reason carefully")
+            + MESSAGE_BOUNDARY_TOKENS
+            + count_ordinary("tool")
+            + count_ordinary("result")
+            + count_ordinary("call_123")
+            + count_ordinary("lookup");
+        assert_eq!(
+            estimate_input_tokens(&[assistant, tool_result], None),
+            expected_tokens as i64
+        );
     }
 
     #[test]
-    fn estimate_input_tokens_includes_raw_payload_tools() {
-        let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
-        let tools =
-            json!([{"name":"lookup","description":"Search docs","input_schema":{"type":"object"}}]);
-        let payload = json!({"messages":[{"role":"user","content":"hello"}],"tools": tools});
-        let estimate = estimate_input_tokens(&[msg], Some(&payload));
-        assert!(estimate >= serde_json::to_string(&tools).unwrap().as_bytes().len() as i64);
-    }
-
-    #[test]
-    fn estimate_input_tokens_counts_structured_images() {
-        let mut msg = Message::new(MessageRole::User, String::new(), vec![], None, None).unwrap();
-        msg.structured_content = Some(vec![json!({
+    fn estimate_input_tokens_counts_each_image_once() {
+        let mut legacy =
+            Message::new(MessageRole::User, String::new(), vec![], None, None).unwrap();
+        legacy.images = vec!["data:image/png;base64,AAAA".to_string()];
+        let mut structured =
+            Message::new(MessageRole::User, String::new(), vec![], None, None).unwrap();
+        structured.structured_content = Some(vec![json!({
             "type": "input_image",
             "image_url": "data:image/png;base64,AAAA"
         })]);
-        assert!(estimate_input_tokens(&[msg], None) >= 8500);
+        let text_tokens =
+            (BASE_PROMPT_TOKENS + MESSAGE_BOUNDARY_TOKENS + count_ordinary("user")) as i64;
+        let expected = text_tokens + IMAGE_TOKEN_ESTIMATE as i64;
+        assert_eq!(estimate_input_tokens(&[legacy], None), expected);
+        assert_eq!(estimate_input_tokens(&[structured], None), expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2592,6 +2671,80 @@ mod tests {
             assert_eq!(error["type"], json!("error"));
             assert_eq!(error["error"]["type"], json!("invalid_request_error"));
         }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_count_tokens_uses_normalized_input_and_ignores_control_fields() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let base_body = json!({
+            "model": "claude-sonnet-4-5",
+            "system": "Be precise.",
+            "messages": [{"role": "user", "content": "Count this."}],
+            "tools": [{
+                "name": "lookup",
+                "description": "Search documentation",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}}
+                }
+            }]
+        });
+        let (messages, tools, _, _, _, _) = anthropic_request_to_internal(&base_body).unwrap();
+        let expected = estimate_input_tokens(&messages, tools.as_deref());
+
+        let base_response = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&base_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(base_response.status(), reqwest::StatusCode::OK);
+        let base_result: Value = base_response.json().await.unwrap();
+        assert_eq!(base_result["input_tokens"], json!(expected));
+
+        let mut controlled_body = base_body.clone();
+        let controlled = controlled_body.as_object_mut().unwrap();
+        controlled.insert("max_tokens".to_string(), json!(128_000));
+        controlled.insert("stream".to_string(), json!(true));
+        controlled.insert("temperature".to_string(), json!(0.1));
+        controlled.insert(
+            "metadata".to_string(),
+            json!({"padding": "x".repeat(4_000)}),
+        );
+        controlled.insert("output_config".to_string(), json!({"effort": "max"}));
+        let tool = controlled
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.first_mut())
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        tool.insert("strict".to_string(), json!(false));
+        tool.insert("defer_loading".to_string(), json!(false));
+
+        let controlled_response = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&controlled_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(controlled_response.status(), reqwest::StatusCode::OK);
+        let controlled_result: Value = controlled_response.json().await.unwrap();
+        assert_eq!(
+            controlled_result["input_tokens"],
+            base_result["input_tokens"]
+        );
         assert!(recording.requests().is_empty());
 
         api_handle.abort();
