@@ -523,13 +523,14 @@ fn convert_reasoning_effort(body: &Value) -> Result<Option<String>, String> {
         Some(Value::String(effort)) if effort.trim().is_empty() => {
             Err("output_config.effort must be a non-empty string when provided".to_string())
         }
-        Some(Value::String(_)) if thinking_effort.as_deref() == Some("none") => {
-            Err("output_config.effort cannot be used when thinking.type is disabled".to_string())
-        }
         Some(Value::String(effort))
             if matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") =>
         {
-            Ok(Some(effort.clone()))
+            if thinking_effort.as_deref() == Some("none") {
+                Ok(Some("none".to_string()))
+            } else {
+                Ok(Some(effort.clone()))
+            }
         }
         Some(Value::String(_)) => {
             Err("output_config.effort must be one of: low, medium, high, xhigh, max".to_string())
@@ -1895,16 +1896,45 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_effort_rejects_disabled_thinking() {
-        let body = json!({
-            "messages": [],
-            "thinking": {"type": "disabled"},
-            "output_config": {"effort": "high"},
-        });
-        assert_eq!(
-            anthropic_request_to_internal(&body).unwrap_err(),
-            "output_config.effort cannot be used when thinking.type is disabled"
-        );
+    fn test_disabled_thinking_precedes_output_config_effort() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let body = json!({
+                "messages": [],
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": effort},
+            });
+            let (_, _, _, _, converted, _) = anthropic_request_to_internal(&body).unwrap();
+            assert_eq!(converted, Some("none".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_output_config_effort_is_validated_before_disabled_thinking_precedence() {
+        let invalid_efforts = [
+            (
+                json!(""),
+                "output_config.effort must be a non-empty string when provided",
+            ),
+            (
+                json!(42),
+                "output_config.effort must be a non-empty string when provided",
+            ),
+            (
+                json!("ultra"),
+                "output_config.effort must be one of: low, medium, high, xhigh, max",
+            ),
+        ];
+        for (effort, expected_error) in invalid_efforts {
+            let body = json!({
+                "messages": [],
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": effort},
+            });
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                expected_error
+            );
+        }
     }
 
     #[test]

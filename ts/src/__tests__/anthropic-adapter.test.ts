@@ -504,13 +504,27 @@ describe("anthropicRequestToInternal", () => {
     }
   });
 
-  it("rejects output_config effort with disabled thinking", () => {
-    assert.throws(() => anthropicRequestToInternal({
-      model: "test",
-      messages: [{ role: "user", content: "hi" }],
-      thinking: { type: "disabled" },
-      outputConfig: { effort: "high" },
-    }));
+  it("uses call-level disabled thinking ahead of output_config effort", () => {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const { reasoningEffort } = anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        thinking: { type: "disabled" },
+        outputConfig: { effort },
+      });
+      assert.equal(reasoningEffort, "none");
+    }
+  });
+
+  it("validates output_config effort before disabled-thinking precedence", () => {
+    for (const effort of ["", 42, "ultra"]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        thinking: { type: "disabled" },
+        outputConfig: { effort },
+      }));
+    }
   });
 
   it("rejects invalid output_config effort and non-null task budgets", () => {

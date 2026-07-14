@@ -140,7 +140,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.6.2",
+        version="0.6.3",
     )
 
     @app.exception_handler(ChatGPTOAuthError)

@@ -2868,6 +2868,110 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_web_search_uses_disabled_thinking_over_ambient_effort() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        recording.set_response_output(vec![
+            json!({
+                "type": "web_search_call",
+                "id": "search-1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "Codex release notes",
+                    "sources": [{
+                        "type": "url",
+                        "url": "https://example.com/codex",
+                        "title": "Codex release notes"
+                    }]
+                }
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Search complete."}]
+            }),
+        ]);
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(Some("high"), None, None),
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "system": "Use the available tools.",
+                "messages": [{"role": "user", "content": "Search the web."}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "stream": true,
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "high"},
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/event-stream"
+        );
+        let mut pending = response.text().await.unwrap();
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events.first().unwrap().0, "message_start");
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        assert_eq!(events.last().unwrap().1["type"], json!("message_stop"));
+
+        let server_tool_use = events
+            .iter()
+            .find(|(event, data)| {
+                event == "content_block_start"
+                    && data["content_block"]["type"] == json!("server_tool_use")
+            })
+            .unwrap();
+        assert_eq!(server_tool_use.1["content_block"]["name"], "web_search");
+        let search_result = events
+            .iter()
+            .find(|(event, data)| {
+                event == "content_block_start"
+                    && data["content_block"]["type"] == json!("web_search_tool_result")
+            })
+            .unwrap();
+        assert_eq!(
+            search_result.1["content_block"]["tool_use_id"],
+            server_tool_use.1["content_block"]["id"]
+        );
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].endpoint, RecordedEndpoint::Responses);
+        assert_eq!(requests[0].body["model"], json!("gpt-5.6-sol"));
+        assert_eq!(requests[0].body["reasoning"]["effort"], json!("none"));
+        assert_eq!(
+            requests[0].body["tools"],
+            json!([{"type": "web_search", "external_web_access": true}])
+        );
+        assert!(requests[0]
+            .headers
+            .get(crate::model_capabilities::LITE_HEADER_NAME)
+            .is_none());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn anthropic_route_preserves_url_images_and_tool_error_results_on_provider_wire() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
@@ -3025,10 +3129,6 @@ mod tests {
             json!({"output_config": {"effort": "ultra"}}),
             json!({"output_config": {"effort": "low", "experimental": true}}),
             json!({"output_config": {"task_budget": {"type": "tokens", "total": 20_000}}}),
-            json!({
-                "thinking": {"type": "disabled"},
-                "output_config": {"effort": "high"}
-            }),
             json!({
                 "reasoning_effort": "high",
                 "output_config": {"effort": "low"}
@@ -3672,7 +3772,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anthropic_stream_rejects_lite_hosted_web_search_before_sse_headers() {
+    async fn anthropic_stream_rejects_auto_and_on_lite_hosted_web_search_before_sse_headers() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -3681,34 +3781,36 @@ mod tests {
         )
         .await;
 
-        let response = reqwest::Client::new()
-            .post(format!("{api_url}/v1/messages"))
-            .json(&json!({
-                "model": "claude-sonnet-4-5",
-                "system": "Use the available tools.",
-                "messages": [{"role": "user", "content": "Search the web."}],
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "stream": true,
-                "responses_lite": "auto",
-                "max_tokens": 100
-            }))
-            .send()
-            .await
-            .unwrap();
+        for responses_lite in ["auto", "on"] {
+            let response = reqwest::Client::new()
+                .post(format!("{api_url}/v1/messages"))
+                .json(&json!({
+                    "model": "claude-sonnet-4-5",
+                    "system": "Use the available tools.",
+                    "messages": [{"role": "user", "content": "Search the web."}],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "stream": true,
+                    "responses_lite": responses_lite,
+                    "max_tokens": 100
+                }))
+                .send()
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "application/json"
-        );
-        let body: Value = response.json().await.unwrap();
-        assert_eq!(body["type"], json!("error"));
-        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "application/json"
+            );
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["type"], json!("error"));
+            assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+        }
         assert!(recording.requests().is_empty());
 
         api_handle.abort();

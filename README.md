@@ -410,7 +410,7 @@ GPT-5.6 requests can instead use the public Responses-shaped object:
 - Responses Lite uses `all_turns` as the Codex wire default. An explicitly different context is rejected instead of silently overwritten; use `responses_lite: false` when the backend route supports classic Responses and another context is required.
 - Remote compact keeps its existing private Codex `reasoning_effort` field but does not accept public `reasoning.mode` or `reasoning.context`.
 
-Anthropic `thinking` values map as `enabled → high`, `adaptive → medium`, and `disabled → none`. Claude Code's `output_config.effort` takes precedence over the adaptive default and supports `low`, `medium`, `high`, `xhigh`, and `max`. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro and non-null public cache policy/breakpoints or `safety_identifier` fail explicitly on the private Codex provider.
+Anthropic `thinking` values map as `enabled → high`, `adaptive → medium`, and `disabled → none`. Claude Code's `output_config.effort` takes precedence over adaptive or enabled thinking and supports `low`, `medium`, `high`, `xhigh`, and `max`. Call-level `thinking.disabled` takes precedence over ambient `output_config.effort`, so Claude Code WebSearch/WebFetch auxiliary calls use `none` instead of failing the compatibility check with HTTP 400. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro and non-null public cache policy/breakpoints or `safety_identifier` fail explicitly on the private Codex provider.
 
 The pinned official Codex HTTP request has no `stop` field. Omitted, `null`, and empty stop values are omitted from the private request; any non-empty OpenAI `stop` or Anthropic `stop_sequences` value returns HTTP 400 before the private transport starts.
 
@@ -613,8 +613,12 @@ The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used
 Start the proxy first. `CODEX_AS_API_MODEL` is the fallback used when Claude Code sends a built-in Anthropic model name:
 
 ```bash
-CODEX_AS_API_MODEL=gpt-5.6-terra codex-as-api
+CODEX_AS_API_MODEL=gpt-5.6-terra \
+CODEX_AS_API_RESPONSES_LITE=off \
+codex-as-api
 ```
+
+`CODEX_AS_API_RESPONSES_LITE=off` is required for Claude Code hosted WebSearch on GPT-5.6. Official Codex Responses Lite uses a client-side standalone `web.run` tool, while this gateway receives Anthropic's hosted `web_search` declaration and has no standalone executor; classic Responses preserves that hosted tool. WebFetch does not use a hosted Responses tool, but still needs the disabled-thinking precedence fix when process-level effort is enabled.
 
 To keep the built-in Fable, Opus, Sonnet, and Haiku rows and append one GPT row, launch the GPT-routed Claude Code process with these variables:
 
@@ -686,7 +690,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `src/codex_as_api/__init__.py`, `src/codex_as_api/server.py`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.6.2` from the matching commit.
+- Publish a GitHub Release such as `v0.6.3` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 Publishing to npmjs requires an authenticated npm session (`npm login` beforehand; `npm whoami` should succeed). From the repository root, the publish itself is one command:
@@ -728,6 +732,14 @@ npm test
 
 
 ## Release Notes
+
+### v0.6.3
+
+- Accept Claude Code auxiliary requests that combine ambient `output_config.effort` with call-level `thinking.disabled`.
+- Give explicit disabled thinking precedence and send Codex reasoning effort `none` instead of returning HTTP 400.
+- Document and test `CODEX_AS_API_RESPONSES_LITE=off` for Claude Code hosted WebSearch on GPT-5.6; WebFetch needs no Responses Lite override.
+- Preserve fail-loudly validation for invalid effort values and unsupported `output_config` fields.
+- Add Python, TypeScript, and Rust adapter regressions, streamed `/v1/messages` coverage, and a `/count_tokens` regression for the WebSearch/WebFetch request shape.
 
 ### v0.6.2
 

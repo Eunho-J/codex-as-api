@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.6.3
+
+### Claude Code WebSearch/WebFetch auxiliary calls
+
+- Fix HTTP 400 responses when a Claude Code session with ambient effort sends a WebSearch/WebFetch auxiliary request containing both `output_config.effort` and call-level `thinking: {"type":"disabled"}`.
+- Give explicit disabled thinking precedence over valid ambient effort and forward Codex reasoning effort `none` across Python, TypeScript, and Rust.
+- Require and document `CODEX_AS_API_RESPONSES_LITE=off` for Claude Code hosted WebSearch on GPT-5.6 because official Responses Lite relies on a standalone `web.run` executor; WebFetch does not require this override.
+- Continue rejecting empty, non-string, or unsupported effort values and unsupported `output_config` fields rather than silently discarding malformed requests.
+
+### Validation
+
+- Adapter tests cover every valid Claude Code effort value paired with disabled thinking while retaining invalid-value failures.
+- Streamed `/v1/messages` tests across all three runtimes and a local `/count_tokens` test reproduce the Claude Code 2.1.209 request shape and prove provider-backed requests reach the classic Codex wire with reasoning effort `none`.
+- A real GPT-5.6 Sol Codex OAuth WebSearch completed with HTTP 200 and structured `server_tool_use`, `web_search_tool_result`, and terminal SSE events.
+
 ## v0.6.2
 
 ### Claude Code count_tokens autocompact fix

@@ -392,13 +392,34 @@ class TestAnthropicRequestToInternal:
         )
         assert converted == effort
 
-    def test_output_config_effort_conflicts_with_disabled_thinking(self):
-        with pytest.raises(ValueError, match="thinking.disabled"):
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_disabled_thinking_overrides_output_config_effort(self, effort):
+        _, _, _, _, converted, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "disabled"},
+            output_config={"effort": effort},
+        )
+        assert converted == "none"
+
+    def test_disabled_thinking_preserves_output_config_format(self):
+        _, _, _, _, converted, text = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "disabled"},
+            output_config={"effort": "high", "format": {"type": "json_object"}},
+        )
+        assert converted == "none"
+        assert text == {"format": {"type": "json_object"}}
+
+    @pytest.mark.parametrize("effort", ["", 1, [], {}, "ultra"])
+    def test_disabled_thinking_does_not_bypass_output_config_effort_validation(self, effort):
+        with pytest.raises(ValueError, match="output_config.effort"):
             anthropic_request_to_internal(
                 model="test",
                 messages=[{"role": "user", "content": "hi"}],
                 thinking={"type": "disabled"},
-                output_config={"effort": "high"},
+                output_config={"effort": effort},
             )
 
     def test_output_config_task_budget_fails_loudly(self):

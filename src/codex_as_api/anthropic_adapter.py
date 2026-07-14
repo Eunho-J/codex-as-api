@@ -341,13 +341,19 @@ def _convert_reasoning_effort(thinking: dict[str, Any] | None, output_config: ob
             raise ValueError("output_config.task_budget is not supported by the Codex OAuth backend")
         raw_effort = output_config.get("effort")
         if raw_effort is not None:
-            if raw_effort not in {"low", "medium", "high", "xhigh", "max"}:
+            if not isinstance(raw_effort, str) or raw_effort not in {
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
                 raise ValueError("output_config.effort must be one of: low, medium, high, xhigh, max")
             output_effort = raw_effort
 
     thinking_effort = _convert_thinking(thinking)
-    if thinking_effort == "none" and output_effort is not None:
-        raise ValueError("output_config.effort cannot be represented together with thinking.disabled")
+    if thinking_effort == "none":
+        return "none"
     return output_effort or thinking_effort
 
 

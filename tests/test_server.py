@@ -1569,6 +1569,30 @@ def test_messages_count_tokens_counts_normalized_tools_without_provider_call(cli
     assert body["context_window"] >= body["auto_compact_token_limit"]
 
 
+def test_messages_count_tokens_accepts_disabled_thinking_with_ambient_effort(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    def fail_provider_call():
+        raise AssertionError("count_tokens must not call the Codex backend")
+
+    monkeypatch.setattr(server_mod, "_get_provider", fail_provider_call)
+    response = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "stream": True,
+            "messages": [{"role": "user", "content": "search the web"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["input_tokens"] > 0
+
+
 def test_messages_count_tokens_large_ascii_payload_is_not_double_counted(client):
     resp = client.post(
         "/v1/messages/count_tokens",
@@ -2088,6 +2112,40 @@ def test_anthropic_latest_claude_code_shape_routes_known_gpt_effort_and_fast_mod
     assert "speed" not in outbound
 
 
+def test_anthropic_disabled_thinking_overrides_ambient_effort_for_web_auxiliary_stream(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    monkeypatch.setenv(RESPONSES_LITE_ENV, "off")
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "stream": True,
+            "system": "system",
+            "messages": [{"role": "user", "content": "search the web"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert outbound["reasoning"]["effort"] == "none"
+    assert "context" not in outbound["reasoning"]
+    assert outbound["tools"] == [{"type": "web_search", "external_web_access": True}]
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert events[0]["type"] == "message_start"
+    assert events[-1]["type"] == "message_stop"
+
+
 def test_anthropic_output_config_format_reaches_codex_text_format(
     client,
     recording_backend: RecordingBackend,
@@ -2251,6 +2309,7 @@ def test_anthropic_unrepresentable_latest_controls_fail_before_upstream(
 @pytest.mark.parametrize(
     "unsupported",
     [
+        {"thinking": {"type": "disabled"}, "output_config": {"effort": []}},
         {"output_config": {"format": "json"}},
         {"output_config": {"format": {"type": "json_object", "extra": True}}},
         {
@@ -2267,7 +2326,7 @@ def test_anthropic_unrepresentable_latest_controls_fail_before_upstream(
         },
     ],
 )
-def test_anthropic_routes_reject_invalid_formats_and_unknown_image_sources(
+def test_anthropic_routes_reject_invalid_controls_and_unknown_image_sources(
     client,
     recording_backend: RecordingBackend,
     route,

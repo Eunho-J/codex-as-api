@@ -395,9 +395,7 @@ function convertReasoningEffort(
     );
   }
   if (thinkingEffort === "none") {
-    throw new Error(
-      "output_config.effort cannot be represented together with thinking.disabled",
-    );
+    return "none";
   }
   return outputConfig.effort;
 }

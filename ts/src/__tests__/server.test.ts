@@ -440,31 +440,32 @@ describe("server error handling", () => {
     });
   });
 
-  it("rejects deterministic Anthropic Lite tool failures before SSE headers", async () => {
+  it("rejects Anthropic hosted WebSearch in auto and on Lite modes before SSE headers", async () => {
     const previous = process.env.CODEX_AS_API_RESPONSES_LITE;
-    process.env.CODEX_AS_API_RESPONSES_LITE = "on";
     try {
-      const provider = new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" });
-      await withServer(provider, async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/v1/messages`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-5",
-            max_tokens: 1024,
-            stream: true,
-            system: "You are helpful.",
-            tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }],
-            messages: [{ role: "user", content: "hello" }],
-          }),
-        });
+      for (const mode of ["auto", "on"]) {
+        process.env.CODEX_AS_API_RESPONSES_LITE = mode;
+        const provider = new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" });
+        await withServer(provider, async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-5",
+              max_tokens: 1024,
+              stream: true,
+              system: "You are helpful.",
+              tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }],
+              messages: [{ role: "user", content: "hello" }],
+            }),
+          });
 
-        assert.equal(response.status, 400);
-        assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
-        const body = await response.json() as { error: { type: string; message: string } };
-        assert.equal(body.error.type, "invalid_request_error");
-        assert.match(body.error.message, /Responses Lite cannot use hosted web_search/);
-      }, { model: "gpt-5.6-sol" });
+          assert.equal(response.status, 400);
+          assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
+          const body = await response.json() as { error: { type: string } };
+          assert.equal(body.error.type, "invalid_request_error");
+        }, { model: "gpt-5.6-sol" });
+      }
     } finally {
       if (previous == null) delete process.env.CODEX_AS_API_RESPONSES_LITE;
       else process.env.CODEX_AS_API_RESPONSES_LITE = previous;
@@ -635,44 +636,89 @@ describe("server model defaults", () => {
 });
 
 describe("Anthropic compatibility helper routes", () => {
-  it("keeps explicit disabled thinking ahead of configured reasoning", async () => {
-    const provider = {
-      async chat(_messages: unknown, opts: { reasoningEffort?: string }) {
-        assert.equal(opts.reasoningEffort, "none");
-        return {
-          content: "done",
-          tool_calls: [],
-          finish_reason: "stop",
-          usage: null,
-          reasoning_content: null,
-          raw: null,
-        };
-      },
-    };
+  it("streams Claude Code WebSearch when disabled thinking overrides ambient effort", async () => {
+    const previous = process.env.CODEX_AS_API_RESPONSES_LITE;
+    process.env.CODEX_AS_API_RESPONSES_LITE = "off";
+    const auth = writeAuthFile();
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const provider = new ChatGPTOAuthProvider({
+          model: "gpt-5.6-sol",
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+        await withServer(provider, async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-5",
+              max_tokens: 64,
+              stream: true,
+              system: "You are helpful.",
+              tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }],
+              thinking: { type: "disabled" },
+              output_config: { effort: "high" },
+              messages: [{ role: "user", content: "Search the web." }],
+            }),
+          });
 
-    await withServer(provider, async (baseUrl) => {
-      const response = await fetch(`${baseUrl}/v1/messages`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-5",
-          max_tokens: 64,
-          thinking: { type: "disabled" },
-          messages: [{ role: "user", content: "hello" }],
-        }),
+          assert.equal(response.status, 200);
+          assert.equal(response.headers.get("content-type"), "text/event-stream");
+          const events = (await response.text())
+            .trim()
+            .split("\n\n")
+            .map((block) => {
+              const lines = block.split("\n");
+              const eventLine = lines.find((line) => line.startsWith("event: "));
+              const dataLine = lines.find((line) => line.startsWith("data: "));
+              assert.ok(eventLine);
+              assert.ok(dataLine);
+              return {
+                event: eventLine.slice(7),
+                data: JSON.parse(dataLine.slice(6)) as Record<string, unknown>,
+              };
+            });
+          assert.deepEqual(events.map(({ event, data }) => [event, data.type]), [
+            ["message_start", "message_start"],
+            ["content_block_start", "content_block_start"],
+            ["content_block_delta", "content_block_delta"],
+            ["content_block_stop", "content_block_stop"],
+            ["message_delta", "message_delta"],
+            ["message_stop", "message_stop"],
+          ]);
+          const messageDelta = events[4].data;
+          assert.deepEqual(messageDelta.delta, {
+            stop_reason: "end_turn",
+            stop_sequence: null,
+          });
+
+          assert.equal(requests.length, 1);
+          assert.equal(requests[0].path, "/responses");
+          const upstream = requests[0].body;
+          assert.deepEqual(upstream.reasoning, { effort: "none" });
+          assert.deepEqual(upstream.tools, [{
+            type: "web_search",
+            external_web_access: true,
+          }]);
+        }, {
+          model: "gpt-5.6-sol",
+          authPath: auth.authPath,
+          codexConfig: {
+            ...TEST_CONFIG,
+            model: "gpt-5.6-sol",
+            modelReasoningEffort: "high",
+          },
+        });
       });
-      assert.equal(response.status, 200);
-    }, {
-      model: "gpt-5.6-sol",
-      codexConfig: {
-        ...TEST_CONFIG,
-        model: "gpt-5.6-sol",
-        modelReasoningEffort: "high",
-      },
-    });
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+      if (previous == null) delete process.env.CODEX_AS_API_RESPONSES_LITE;
+      else process.env.CODEX_AS_API_RESPONSES_LITE = previous;
+    }
   });
 
-  it("wires the Claude Code 2.1.208 request shape to a known GPT model", async () => {
+  it("wires the Claude Code 2.1.209 request shape to a known GPT model", async () => {
     const auth = writeAuthFile();
     try {
       await withRecordingUpstream(async (upstreamUrl, requests) => {
@@ -701,7 +747,7 @@ describe("Anthropic compatibility helper routes", () => {
                 cache_control: { type: "ephemeral" },
               }],
               tools: [],
-              metadata: { user_id: "claude-code-2.1.208" },
+              metadata: { user_id: "claude-code-2.1.209" },
               max_tokens: 32_000,
               thinking: { type: "adaptive", display: "omitted" },
               context_management: {
@@ -927,7 +973,6 @@ describe("Anthropic compatibility helper routes", () => {
       { output_config: { effort: "" } },
       { output_config: { effort: "ultra" } },
       { output_config: { unknown_control: true } },
-      { thinking: { type: "disabled" }, output_config: { effort: "high" } },
       { reasoning_effort: "low", output_config: { effort: "high" } },
       { tools: [{ name: "lookup", input_schema: {}, strict: true }] },
       { tools: [{ name: "lookup", input_schema: {}, defer_loading: true }] },
