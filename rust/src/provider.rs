@@ -14,6 +14,9 @@ use std::sync::{Mutex, OnceLock};
 
 pub const CHATGPT_OAUTH_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CHATGPT_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
+// This matches reqwest::blocking's existing default operation timeout. Response reads apply the
+// duration per read, so long-lived active SSE streams do not acquire a new total-time cutoff.
+pub const CHATGPT_OAUTH_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub const REMOTE_COMPACTION_MARKER: &str = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_CLI_VERSION_ENV: &str = "CODEX_AS_API_CODEX_CLI_VERSION";
@@ -167,6 +170,8 @@ pub enum ProviderError {
     InvalidRequest(String),
     #[error("{0}")]
     Request(String),
+    #[error("{message}")]
+    UpstreamHttp { status: u16, message: String },
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +185,23 @@ struct FinalizedResponsesRequest {
     payload: Value,
     use_responses_lite: bool,
     conversation_input: Vec<Value>,
+}
+
+pub struct PreparedChatStream {
+    request: FinalizedResponsesRequest,
+    extra_headers: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct ChatStreamState {
+    final_output: Vec<Value>,
+    reasoning_parts: Vec<String>,
+    emitted_tool_call: bool,
+    saw_text_delta: bool,
+    saw_reasoning_delta: bool,
+    saw_completed: bool,
+    completed_response_id: Option<String>,
+    pending_finish: Option<Value>,
 }
 
 #[derive(Default)]
@@ -288,7 +310,7 @@ impl ChatGPTOAuthProvider {
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_json_path,
-            timeout,
+            timeout: Some(timeout.unwrap_or(CHATGPT_OAUTH_DEFAULT_TIMEOUT)),
             response_chains: ResponseChainStore::new(RESPONSE_CHAIN_CAPACITY),
         }
     }
@@ -535,6 +557,58 @@ impl ChatGPTOAuthProvider {
         parallel_tool_calls: Option<bool>,
         controls: &GenerationControls,
     ) -> Result<Vec<Value>, ProviderError> {
+        let prepared = self.prepare_chat_stream_with_controls(
+            messages,
+            tools,
+            temperature,
+            reasoning_effort,
+            max_tokens,
+            stop,
+            prompt_cache_key,
+            subagent,
+            memgen_request,
+            previous_response_id,
+            model,
+            tool_choice,
+            service_tier,
+            text,
+            client_metadata,
+            codex_metadata,
+            responses_lite,
+            parallel_tool_calls,
+            controls,
+        )?;
+        let mut result_events = Vec::new();
+        self.stream_prepared_chat(prepared, |event| {
+            result_events.push(event);
+            Ok(())
+        })?;
+        Ok(result_events)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_chat_stream_with_controls(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolSchema]>,
+        temperature: Option<f64>,
+        reasoning_effort: Option<&str>,
+        max_tokens: Option<i64>,
+        stop: Option<&[String]>,
+        prompt_cache_key: Option<&str>,
+        subagent: Option<&str>,
+        memgen_request: Option<bool>,
+        previous_response_id: Option<&str>,
+        model: Option<&str>,
+        tool_choice: Option<&Value>,
+        service_tier: Option<&str>,
+        text: Option<&Value>,
+        client_metadata: Option<&HashMap<String, String>>,
+        codex_metadata: Option<bool>,
+        responses_lite: Option<&Value>,
+        parallel_tool_calls: Option<bool>,
+        controls: &GenerationControls,
+    ) -> Result<PreparedChatStream, ProviderError> {
         let _ = temperature;
         let request = self.responses_payload_with_controls(
             messages,
@@ -554,7 +628,6 @@ impl ChatGPTOAuthProvider {
             parallel_tool_calls,
             controls,
         )?;
-        let conversation_input = request.conversation_input.clone();
 
         let mut extra_headers: HashMap<String, String> = HashMap::new();
         if request.use_responses_lite {
@@ -569,154 +642,172 @@ impl ChatGPTOAuthProvider {
                 if mg { "true" } else { "false" }.to_string(),
             );
         }
+        let _ = self.headers()?;
 
-        let sse_events = self.post_sse("/responses", &request.payload, Some(&extra_headers))?;
+        Ok(PreparedChatStream {
+            request,
+            extra_headers,
+        })
+    }
 
-        let mut result_events: Vec<Value> = Vec::new();
-        let mut final_output: Vec<Value> = Vec::new();
-        let mut reasoning_parts: Vec<String> = Vec::new();
-        let mut emitted_tool_call = false;
-        let mut saw_text_delta = false;
-        let mut saw_reasoning_delta = false;
-        let mut saw_completed = false;
-        let mut completed_response_id: Option<String> = None;
+    pub fn stream_prepared_chat<F>(
+        &self,
+        prepared: PreparedChatStream,
+        mut emit: F,
+    ) -> Result<(), ProviderError>
+    where
+        F: FnMut(Value) -> Result<(), ProviderError>,
+    {
+        let conversation_input = prepared.request.conversation_input.clone();
+        let mut state = ChatStreamState::default();
 
-        for event in &sse_events {
-            let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match typ {
-                "response.output_text.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        if !delta.is_empty() {
-                            saw_text_delta = true;
-                            result_events.push(json!({"type": "content", "text": delta}));
+        self.request_sse_each(
+            "/responses",
+            &prepared.request.payload,
+            Some(&prepared.extra_headers),
+            |event| {
+                let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match typ {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                            if !delta.is_empty() {
+                                state.saw_text_delta = true;
+                                emit(json!({"type": "content", "text": delta}))?;
+                            }
                         }
                     }
-                }
-                "response.output_item.done" => {
-                    let item = event.get("item").ok_or_else(|| {
-                        ProviderError::Request(
-                            "response.output_item.done must contain an object item".to_string(),
-                        )
-                    })?;
-                    final_output.push(item.clone());
-                    if let Some(tc) = tool_call_from_response_item(item) {
-                        emitted_tool_call = true;
-                        result_events.push(json!({
-                            "type": "tool_call",
-                            "id": tc.id,
-                            "name": tc.name,
-                            "arguments": tc.arguments,
+                    "response.output_item.done" => {
+                        let item = event.get("item").ok_or_else(|| {
+                            ProviderError::Request(
+                                "response.output_item.done must contain an object item".to_string(),
+                            )
+                        })?;
+                        state.final_output.push(item.clone());
+                        if let Some(tc) = tool_call_from_response_item(item) {
+                            state.emitted_tool_call = true;
+                            emit(json!({
+                                "type": "tool_call",
+                                "id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }))?;
+                        }
+                        if let Some(web_search) = web_search_event_from_response_item(item, &[]) {
+                            emit(web_search)?;
+                        }
+                    }
+                    "response.reasoning_summary_part.added" => {
+                        emit(json!({
+                            "type": "reasoning_section_break",
+                            "summary_index": event.get("summary_index"),
+                            "part_index": event.get("part_index"),
+                        }))?;
+                    }
+                    "response.reasoning_summary_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                            if !delta.is_empty() {
+                                state.saw_reasoning_delta = true;
+                                state.reasoning_parts.push(delta.to_string());
+                                emit(json!({
+                                    "type": "reasoning_delta",
+                                    "text": delta,
+                                    "summary_index": event.get("summary_index"),
+                                }))?;
+                            }
+                        }
+                    }
+                    "response.reasoning_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                            if !delta.is_empty() {
+                                state.saw_reasoning_delta = true;
+                                state.reasoning_parts.push(delta.to_string());
+                                emit(json!({
+                                    "type": "reasoning_raw_delta",
+                                    "text": delta,
+                                    "summary_index": event.get("summary_index"),
+                                }))?;
+                            }
+                        }
+                    }
+                    "response.failed" => {
+                        return Err(ProviderError::Request(response_failure_message(
+                            &event, "failed",
+                        )));
+                    }
+                    "response.incomplete" => {
+                        return Err(ProviderError::Request(response_failure_message(
+                            &event,
+                            "incomplete",
+                        )));
+                    }
+                    "response.completed" => {
+                        state.saw_completed = true;
+                        let mut usage_val = Value::Null;
+                        let mut response_id = Value::Null;
+                        if let Some(response) = event.get("response").and_then(|v| v.as_object()) {
+                            response_id = response.get("id").cloned().unwrap_or(Value::Null);
+                            state.completed_response_id = response
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_string);
+                            usage_val = response.get("usage").cloned().unwrap_or(Value::Null);
+                            if !state.saw_text_delta {
+                                let final_text = text_from_response_items(&state.final_output);
+                                if !final_text.is_empty() {
+                                    state.saw_text_delta = true;
+                                    emit(json!({"type": "content", "text": final_text}))?;
+                                }
+                            }
+                            if !state.saw_reasoning_delta {
+                                let completed_reasoning = reasoning_from_response_items(
+                                    &state
+                                        .final_output
+                                        .iter()
+                                        .filter(|item| item.is_object())
+                                        .cloned()
+                                        .collect::<Vec<_>>(),
+                                );
+                                if !completed_reasoning.is_empty() {
+                                    state.saw_reasoning_delta = true;
+                                    state.reasoning_parts.push(completed_reasoning.clone());
+                                    emit(json!({
+                                        "type": "reasoning_delta",
+                                        "text": completed_reasoning,
+                                    }))?;
+                                }
+                            }
+                        }
+                        let reasoning_joined = state.reasoning_parts.join("");
+                        state.pending_finish = Some(json!({
+                            "type": "finish",
+                            "finish_reason": if state.emitted_tool_call { "tool_calls" } else { "stop" },
+                            "usage": usage_val,
+                            "reasoning_content": if reasoning_joined.is_empty() { Value::Null } else { Value::String(reasoning_joined) },
+                            "response_id": response_id,
                         }));
                     }
-                    if let Some(web_search) = web_search_event_from_response_item(item, &[]) {
-                        result_events.push(web_search);
-                    }
+                    _ => {}
                 }
-                "response.reasoning_summary_part.added" => {
-                    result_events.push(json!({
-                        "type": "reasoning_section_break",
-                        "summary_index": event.get("summary_index"),
-                        "part_index": event.get("part_index"),
-                    }));
-                }
-                "response.reasoning_summary_text.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        if !delta.is_empty() {
-                            saw_reasoning_delta = true;
-                            reasoning_parts.push(delta.to_string());
-                            result_events.push(json!({
-                                "type": "reasoning_delta",
-                                "text": delta,
-                                "summary_index": event.get("summary_index"),
-                            }));
-                        }
-                    }
-                }
-                "response.reasoning_text.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        if !delta.is_empty() {
-                            saw_reasoning_delta = true;
-                            reasoning_parts.push(delta.to_string());
-                            result_events.push(json!({
-                                "type": "reasoning_raw_delta",
-                                "text": delta,
-                                "summary_index": event.get("summary_index"),
-                            }));
-                        }
-                    }
-                }
-                "response.failed" => {
-                    return Err(ProviderError::Request(response_failure_message(
-                        event, "failed",
-                    )));
-                }
-                "response.incomplete" => {
-                    return Err(ProviderError::Request(response_failure_message(
-                        event,
-                        "incomplete",
-                    )));
-                }
-                "response.completed" => {
-                    saw_completed = true;
-                    let mut usage_val = Value::Null;
-                    let mut response_id = Value::Null;
-                    if let Some(response) = event.get("response").and_then(|v| v.as_object()) {
-                        response_id = response.get("id").cloned().unwrap_or(Value::Null);
-                        completed_response_id = response
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .map(str::to_string);
-                        usage_val = response.get("usage").cloned().unwrap_or(Value::Null);
-                        if !saw_text_delta {
-                            let final_text = text_from_response_items(&final_output);
-                            if !final_text.is_empty() {
-                                saw_text_delta = true;
-                                result_events.push(json!({"type": "content", "text": final_text}));
-                            }
-                        }
-                        if !saw_reasoning_delta {
-                            let completed_reasoning = reasoning_from_response_items(
-                                &final_output
-                                    .iter()
-                                    .filter(|i| i.is_object())
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                            );
-                            if !completed_reasoning.is_empty() {
-                                saw_reasoning_delta = true;
-                                reasoning_parts.push(completed_reasoning.clone());
-                                result_events.push(
-                                    json!({"type": "reasoning_delta", "text": completed_reasoning}),
-                                );
-                            }
-                        }
-                    }
-                    let reasoning_joined = reasoning_parts.join("");
-                    result_events.push(json!({
-                        "type": "finish",
-                        "finish_reason": if emitted_tool_call { "tool_calls" } else { "stop" },
-                        "usage": usage_val,
-                        "reasoning_content": if reasoning_joined.is_empty() { Value::Null } else { Value::String(reasoning_joined) },
-                        "response_id": response_id,
-                    }));
-                }
-                _ => {}
-            }
-        }
+                Ok(())
+            },
+        )?;
 
-        if !saw_completed {
+        if !state.saw_completed {
             return Err(ProviderError::Request(
                 "ChatGPT OAuth response stream ended before response.completed".to_string(),
             ));
         }
 
-        if let Some(response_id) = completed_response_id {
+        if let Some(response_id) = state.completed_response_id {
             self.response_chains
-                .commit(&response_id, &conversation_input, &final_output)?;
+                .commit(&response_id, &conversation_input, &state.final_output)?;
         }
+        emit(state.pending_finish.ok_or_else(|| {
+            ProviderError::Request("response.completed did not produce a finish event".to_string())
+        })?)?;
 
-        Ok(result_events)
+        Ok(())
     }
 
     pub fn generate_image(
@@ -1371,6 +1462,24 @@ impl ChatGPTOAuthProvider {
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Result<Vec<Value>, ProviderError> {
+        let mut events = Vec::new();
+        self.request_sse_each(path, payload, extra_headers, |event| {
+            events.push(event);
+            Ok(())
+        })?;
+        Ok(events)
+    }
+
+    fn request_sse_each<F>(
+        &self,
+        path: &str,
+        payload: &Value,
+        extra_headers: Option<&HashMap<String, String>>,
+        mut on_event: F,
+    ) -> Result<(), ProviderError>
+    where
+        F: FnMut(Value) -> Result<(), ProviderError>,
+    {
         for attempt in 0..2 {
             let (mut headers, token) = self.headers()?;
             headers.insert("Accept".to_string(), "text/event-stream".to_string());
@@ -1402,21 +1511,23 @@ impl ChatGPTOAuthProvider {
                 Ok(response) => {
                     let status = response.status();
                     if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                        let _ = auth::do_refresh_token(self.auth_json_path.as_deref());
+                        auth::do_refresh_token(self.auth_json_path.as_deref())?;
                         continue;
                     }
                     if !status.is_success() {
                         let body_text = response.text().unwrap_or_default();
                         let redacted = auth::redact_text(&body_text, &token_values);
-                        return Err(ProviderError::Request(format!(
-                            "ChatGPT OAuth request failed: HTTP {}: {}",
-                            status.as_u16(),
-                            redacted
-                        )));
+                        return Err(ProviderError::UpstreamHttp {
+                            status: status.as_u16(),
+                            message: format!(
+                                "ChatGPT OAuth request failed: HTTP {}: {}",
+                                status.as_u16(),
+                                redacted
+                            ),
+                        });
                     }
 
                     let reader = std::io::BufReader::new(response);
-                    let mut events: Vec<Value> = Vec::new();
                     let mut block: Vec<String> = Vec::new();
 
                     for line_result in reader.lines() {
@@ -1430,9 +1541,9 @@ impl ChatGPTOAuthProvider {
                             if let Some(event) = decode_sse_block(&block)? {
                                 validate_response_event(&event)?;
                                 let terminal = is_terminal_response_event(&event);
-                                events.push(event);
+                                on_event(event)?;
                                 if terminal {
-                                    return Ok(events);
+                                    return Ok(());
                                 }
                             }
                             block.clear();
@@ -1444,14 +1555,14 @@ impl ChatGPTOAuthProvider {
                         if let Some(event) = decode_sse_block(&block)? {
                             validate_response_event(&event)?;
                             let terminal = is_terminal_response_event(&event);
-                            events.push(event);
+                            on_event(event)?;
                             if terminal {
-                                return Ok(events);
+                                return Ok(());
                             }
                         }
                     }
 
-                    return Ok(events);
+                    return Ok(());
                 }
                 Err(e) => {
                     let msg = auth::redact_text(&e.to_string(), &token_values);
@@ -1502,17 +1613,20 @@ impl ChatGPTOAuthProvider {
                 Ok(response) => {
                     let status = response.status();
                     if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                        let _ = auth::do_refresh_token(self.auth_json_path.as_deref());
+                        auth::do_refresh_token(self.auth_json_path.as_deref())?;
                         continue;
                     }
                     if !status.is_success() {
                         let body_text = response.text().unwrap_or_default();
                         let redacted = auth::redact_text(&body_text, &token_values);
-                        return Err(ProviderError::Request(format!(
-                            "ChatGPT OAuth request failed: HTTP {}: {}",
-                            status.as_u16(),
-                            redacted
-                        )));
+                        return Err(ProviderError::UpstreamHttp {
+                            status: status.as_u16(),
+                            message: format!(
+                                "ChatGPT OAuth request failed: HTTP {}: {}",
+                                status.as_u16(),
+                                redacted
+                            ),
+                        });
                     }
                     let bytes = response.bytes().map_err(|e| {
                         ProviderError::Request(format!(
@@ -2926,6 +3040,17 @@ pub fn usage_from_response(value: &Value) -> Option<Usage> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn provider_without_an_override_uses_a_finite_request_timeout() {
+        let provider = ChatGPTOAuthProvider::new(
+            "gpt-5.5".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(provider.timeout, Some(CHATGPT_OAUTH_DEFAULT_TIMEOUT));
+    }
 
     #[test]
     fn response_chain_store_clones_items_and_supports_branches() {

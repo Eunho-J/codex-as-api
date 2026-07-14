@@ -23,6 +23,7 @@ def anthropic_request_to_internal(
     stop_sequences: list[str] | None = None,
     thinking: dict[str, Any] | None = None,
     output_format: dict[str, Any] | None = None,
+    output_config: object = None,
 ) -> tuple[
     list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
 ]:
@@ -53,9 +54,8 @@ def anthropic_request_to_internal(
     # Convert tool_choice
     internal_tool_choice = _convert_tool_choice(tool_choice)
 
-    # Convert thinking → reasoning_effort
-    reasoning_effort = _convert_thinking(thinking)
-    text = anthropic_output_format_to_openai_text(output_format)
+    reasoning_effort = _convert_reasoning_effort(thinking, output_config)
+    text = _convert_output_format(output_format, output_config)
 
     return internal_messages, internal_tools, internal_tool_choice, stop_sequences, reasoning_effort, text
 
@@ -109,10 +109,8 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                         text_pieces.append(p.get("text", ""))
                     elif p.get("type") == "image":
                         source = p.get("source", {})
-                        if isinstance(source, dict) and source.get("type") == "base64":
-                            media_type = source.get("media_type", "image/png")
-                            data = source.get("data", "")
-                            tool_result_images.append(f"data:{media_type};base64,{data}")
+                        image_url = _anthropic_image_url(source)
+                        tool_result_images.append(image_url)
                     else:
                         rendered = _render_anthropic_content_block(p)
                         if rendered:
@@ -120,6 +118,8 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
                 result_content = str(result_content) if result_content else ""
+            if block.get("is_error") is True:
+                result_content = f"[tool_error]\n{result_content}"
             out.append(
                 Message(
                     role=MessageRole.TOOL,
@@ -138,10 +138,8 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 )
         elif block_type == "image":
             source = block.get("source", {})
-            if isinstance(source, dict) and source.get("type") == "base64":
-                media_type = source.get("media_type", "image/png")
-                data = source.get("data", "")
-                image_urls.append(f"data:{media_type};base64,{data}")
+            image_url = _anthropic_image_url(source)
+            image_urls.append(image_url)
         else:
             rendered = _render_anthropic_content_block(block)
             if rendered:
@@ -218,6 +216,10 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[ToolSchema]:
             raise ValueError(
                 f"Anthropic tool {index} uses Programmatic Tool Calling fields that cannot be preserved"
             )
+        for field in ("strict", "defer_loading", "eager_input_streaming"):
+            value = tool.get(field)
+            if value is not None and value is not False:
+                raise ValueError(f"Anthropic tool {index} field {field} is not supported by the Codex OAuth backend")
         name = tool.get("name")
         if not name:
             continue
@@ -238,6 +240,24 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[ToolSchema]:
             )
         )
     return result
+
+
+def _anthropic_image_url(source: object) -> str:
+    if not isinstance(source, dict):
+        raise ValueError("Anthropic image source must be an object")
+    source_type = source.get("type")
+    if source_type == "base64":
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data")
+        if isinstance(media_type, str) and isinstance(data, str) and data:
+            return f"data:{media_type};base64,{data}"
+        raise ValueError("Anthropic base64 image source requires non-empty data")
+    if source_type == "url":
+        url = source.get("url")
+        if isinstance(url, str) and url:
+            return url
+        raise ValueError("Anthropic URL image source requires a non-empty url")
+    raise ValueError("Anthropic image source type must be base64 or url")
 
 
 def _is_anthropic_web_search_tool(tool: dict[str, Any]) -> bool:
@@ -308,14 +328,61 @@ def _convert_thinking(thinking: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _convert_reasoning_effort(thinking: dict[str, Any] | None, output_config: object) -> str | None:
+    output_effort: str | None = None
+    if output_config is not None:
+        if not isinstance(output_config, dict):
+            raise ValueError("output_config must be an object")
+        unknown = sorted(set(output_config) - {"effort", "format", "task_budget"})
+        if unknown:
+            raise ValueError("output_config contains unsupported fields: " + ", ".join(unknown))
+        task_budget = output_config.get("task_budget")
+        if task_budget is not None:
+            raise ValueError("output_config.task_budget is not supported by the Codex OAuth backend")
+        raw_effort = output_config.get("effort")
+        if raw_effort is not None:
+            if raw_effort not in {"low", "medium", "high", "xhigh", "max"}:
+                raise ValueError("output_config.effort must be one of: low, medium, high, xhigh, max")
+            output_effort = raw_effort
+
+    thinking_effort = _convert_thinking(thinking)
+    if thinking_effort == "none" and output_effort is not None:
+        raise ValueError("output_config.effort cannot be represented together with thinking.disabled")
+    return output_effort or thinking_effort
+
+
+def _convert_output_format(
+    output_format: object,
+    output_config: object,
+) -> dict[str, Any] | None:
+    config_format: object = None
+    if isinstance(output_config, dict):
+        config_format = output_config.get("format")
+
+    converted: list[tuple[object, dict[str, Any]]] = []
+    for field, value in (("output_format", output_format), ("output_config.format", config_format)):
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be an object")
+        _validate_anthropic_output_format(value, field)
+        text = anthropic_output_format_to_openai_text(value)
+        if text is None:  # pragma: no cover - validation above guarantees conversion
+            raise AssertionError("validated Anthropic output format did not convert")
+        converted.append((value, text))
+
+    if len(converted) == 2 and converted[0][0] != converted[1][0]:
+        raise ValueError("output_format conflicts with output_config.format")
+    return converted[0][1] if converted else None
+
+
 def anthropic_output_format_to_openai_text(output_format: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(output_format, dict):
+    if output_format is None:
         return None
+    _validate_anthropic_output_format(output_format, "output_format")
     typ = output_format.get("type")
     if typ == "json_schema":
         schema = output_format.get("schema")
-        if not isinstance(schema, dict):
-            return None
         name = _sanitize_json_schema_name(str(output_format.get("name") or "structured_output"))
         fmt: dict[str, Any] = {
             "type": "json_schema",
@@ -329,7 +396,35 @@ def anthropic_output_format_to_openai_text(output_format: dict[str, Any] | None)
         return {"format": fmt}
     if typ == "json_object":
         return {"format": {"type": "json_object"}}
-    return None
+    raise AssertionError("validated Anthropic output format has an unknown type")
+
+
+def _validate_anthropic_output_format(output_format: dict[str, Any], field: str) -> None:
+    typ = output_format.get("type")
+    if not isinstance(typ, str):
+        raise ValueError(f"{field}.type must be a string")
+    if typ == "json_object":
+        unknown = sorted(set(output_format) - {"type"})
+        if unknown:
+            raise ValueError(f"{field}.{unknown[0]} is not supported")
+        return
+    if typ != "json_schema":
+        raise ValueError(f"{field}.type must be one of: json_object, json_schema")
+
+    unknown = sorted(set(output_format) - {"type", "name", "description", "schema", "strict"})
+    if unknown:
+        raise ValueError(f"{field}.{unknown[0]} is not supported")
+    if not isinstance(output_format.get("schema"), dict):
+        raise ValueError(f"{field}.schema must be an object")
+    name = output_format.get("name")
+    if name is not None and (not isinstance(name, str) or not name):
+        raise ValueError(f"{field}.name must be a non-empty string when provided")
+    description = output_format.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ValueError(f"{field}.description must be a string when provided")
+    strict = output_format.get("strict")
+    if strict is not None and not isinstance(strict, bool):
+        raise ValueError(f"{field}.strict must be a boolean when provided")
 
 
 def _sanitize_json_schema_name(name: str) -> str:

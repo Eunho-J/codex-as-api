@@ -241,7 +241,7 @@ curl http://localhost:18080/v1/chat/completions \
 
 ### `POST /v1/messages`
 
-Anthropic Messages API compatible endpoint. Supports streaming (`stream: true`) and non-streaming. The client's model name is reflected in responses, but the server always uses the configured `CODEX_AS_API_MODEL` for the backend call.
+Anthropic Messages API compatible endpoint. Supports streaming (`stream: true`) and non-streaming. A client model that matches the bundled Codex catalog, such as `gpt-5.6-sol`, is used for the backend call. Anthropic names and other unknown model IDs use the configured `CODEX_AS_API_MODEL` fallback. The response always preserves the client-supplied model name.
 
 ```bash
 curl http://localhost:18080/v1/messages \
@@ -278,7 +278,7 @@ curl -N http://localhost:18080/v1/messages \
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route returns a conservative local estimate plus the configured context-window metadata. The estimate uses UTF-8 byte length as an upper bound for GPT/Codex BPE text tokens, then adds protocol overhead for roles, message boundaries, tools, raw request metadata, and images.
+Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route returns a conservative local estimate plus context-window metadata for the effective backend model. The estimate uses UTF-8 byte length as an upper bound for GPT/Codex BPE text tokens, then adds protocol overhead for roles, message boundaries, tools, raw request metadata, and images.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -293,7 +293,7 @@ curl http://localhost:18080/v1/messages/count_tokens \
 
 ### `POST /v1/messages/compact`
 
-Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content.
+Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content. Bundled GPT model IDs select the matching backend model, and Claude Code effort and Fast Mode controls use the same mappings as `/v1/messages`.
 
 ### `POST /v1/images/generations`
 
@@ -361,7 +361,7 @@ These features are extensions beyond the standard OpenAI API, designed for Codex
 
 `prompt_cache_key` keeps related prefixes in the same backend cache family. Use one stable, privacy-safe key per conversation or application prefix.
 
-Official Codex [defaults this field to its own per-conversation `thread_id`](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/core/src/client.rs#L469-L473). This multi-client facade cannot infer that boundary safely and does not reuse its process-level metadata thread ID as a cache key, which could mix unrelated callers. Set `prompt_cache_key` explicitly when stable cache affinity is required.
+Official Codex [defaults this field to its own per-conversation `thread_id`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/core/src/client.rs#L469-L473). This multi-client facade cannot infer that boundary safely and does not reuse its process-level metadata thread ID as a cache key, which could mix unrelated callers. Set `prompt_cache_key` explicitly when stable cache affinity is required.
 
 The private Codex OAuth HTTP and WebSocket request structures do not contain public GPT-5.6 `prompt_cache_options` or content-block `prompt_cache_breakpoint` fields. This proxy treats explicit `null` as omitted and rejects non-null controls with HTTP 400 instead of forwarding a request that the private route rejects or silently pretending the requested cache policy was applied. Use a public Responses API client when explicit cache policy or breakpoints are required. See OpenAI's [public prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints).
 
@@ -406,7 +406,7 @@ GPT-5.6 requests can instead use the public Responses-shaped object:
 - Responses Lite uses `all_turns` as the Codex wire default. An explicitly different context is rejected instead of silently overwritten; use `responses_lite: false` when the backend route supports classic Responses and another context is required.
 - Remote compact keeps its existing private Codex `reasoning_effort` field but does not accept public `reasoning.mode` or `reasoning.context`.
 
-Anthropic `thinking` values map as `enabled → high`, `adaptive → medium`, and `disabled → none`. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro and non-null public cache policy/breakpoints or `safety_identifier` fail explicitly on the private Codex provider.
+Anthropic `thinking` values map as `enabled → high`, `adaptive → medium`, and `disabled → none`. Claude Code's `output_config.effort` takes precedence over the adaptive default and supports `low`, `medium`, `high`, `xhigh`, and `max`. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro and non-null public cache policy/breakpoints or `safety_identifier` fail explicitly on the private Codex provider.
 
 The pinned official Codex HTTP request has no `stop` field. Omitted, `null`, and empty stop values are omitted from the private request; any non-empty OpenAI `stop` or Anthropic `stop_sequences` value returns HTTP 400 before the private transport starts.
 
@@ -424,7 +424,7 @@ The mapping is intentionally transport-aware:
 | `service_tier: "fast"` | Send `service_tier: "priority"` |
 | `service_tier: "default"` | Omit the field |
 
-Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the official Codex [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/codex-api/src/common.rs#L215-L293).
+Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the official Codex [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/common.rs#L215-L293).
 
 ### `responses_lite`
 
@@ -478,7 +478,7 @@ Do not rely on user-supplied values for those reserved Codex metadata keys when 
 
 Non-streaming responses and the final streaming finish chunk expose the real upstream Responses ID as `response_id`. The provider keeps up to 256 completed chains in a process-local LRU store. Passing a known ID as `previous_response_id` prepends the saved semantic input and exact prior `response.output_item.done` items—including encrypted reasoning and tool items—to the new input, then sends one full private HTTP request. The ID itself is never forwarded and is never converted to `thread_id`.
 
-That event source is intentional: the official Codex SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/codex-api/src/sse/responses.rs#L326-L337), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/6ad0e943cc727dc836d7c671f3377db30107f4d9/codex-rs/codex-api/src/sse/responses.rs#L112-L120), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
+That event source is intentional: the official Codex SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/sse/responses.rs#L326-L337), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/sse/responses.rs#L112-L120), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
 
 Only a real `response.completed` event commits a chain. Branches from an older retained ID are supported. Restarting the server or evicting an old entry removes that local state; an unknown ID returns HTTP 400 before any upstream request.
 
@@ -604,24 +604,54 @@ curl -N http://localhost:18080/v1/chat/completions \
 
 ## Using with Claude Code
 
-The `/v1/messages` endpoint is compatible with [Claude Code](https://claude.ai/code). Claude Code can send its normal Anthropic model names; responses preserve the client-supplied model name, while backend Codex requests use `CODEX_AS_API_MODEL` or the `model` from `~/.codex/config.toml`.
+The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used by Claude Code. Compatibility was validated with Claude Code `2.1.208`, including streaming, a real `Read` tool loop, request-level GPT model routing, adaptive thinking, `--effort max`, and Fast Mode.
+
+Start the proxy first. `CODEX_AS_API_MODEL` is the fallback used when Claude Code sends a built-in Anthropic model name:
 
 ```bash
-# Minimal setup
-ANTHROPIC_BASE_URL=http://localhost:18080 \
-ANTHROPIC_API_KEY=unused \
+CODEX_AS_API_MODEL=gpt-5.6-terra codex-as-api
+```
+
+To keep the built-in Fable, Opus, Sonnet, and Haiku rows and append one GPT row, launch the GPT-routed Claude Code process with these variables:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:18080 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_CUSTOM_MODEL_OPTION=gpt-5.6-sol \
+ANTHROPIC_CUSTOM_MODEL_OPTION_NAME='GPT-5.6 Sol' \
+ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION='GPT-5.6 Sol through codex-as-api' \
+CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
 claude
 ```
 
-```bash
-# Optional: force the backend Codex model for all Claude Code requests
-CODEX_AS_API_MODEL=gpt-5.5 codex-as-api
+Run `/model` and select **GPT-5.6 Sol**. The custom entry is appended to the built-in rows rather than replacing them. Claude Code `2.1.208` recognizes this GPT model ID without a custom capability declaration: `/effort low|medium|high|xhigh|max`, the picker effort control, and `claude --effort ...` are translated from Claude Code's `output_config.effort` to the Codex reasoning effort. Claude Code Fast Mode's `speed: "fast"` is translated to the Codex `priority` service tier.
 
-# In another shell
-ANTHROPIC_BASE_URL=http://localhost:18080 \
-ANTHROPIC_API_KEY=unused \
-claude
+If managed settings define an `availableModels` allowlist, that list must include the exact `ANTHROPIC_CUSTOM_MODEL_OPTION` value, such as `gpt-5.6-sol`; otherwise Claude Code hides or rejects the custom row.
+
+For a persistent gateway configuration, put the same variables in the `env` object in `~/.claude/settings.json`. Do that only when every Claude Code process using that config should route through codex-as-api.
+
+`ANTHROPIC_CUSTOM_MODEL_OPTION` adds one picker row. To make Terra or Luna the visible GPT row, change that value and the display text. Any bundled GPT model can also be selected directly without changing the visible row:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:18080 ANTHROPIC_AUTH_TOKEN=unused \
+  claude --model gpt-5.6-terra --effort high
+ANTHROPIC_BASE_URL=http://127.0.0.1:18080 ANTHROPIC_AUTH_TOKEN=unused \
+  claude --model gpt-5.6-luna --effort medium
 ```
+
+Known bundled GPT IDs are sent to the matching Codex backend model. Built-in Claude/Fable/Opus/Sonnet/Haiku IDs are not Codex models, so this proxy maps those requests to `CODEX_AS_API_MODEL` while preserving the selected name in the Anthropic response.
+
+`ANTHROPIC_BASE_URL` applies to the whole Claude Code process. Therefore the built-in rows remain available in the picker, but they also pass through codex-as-api and use the configured Codex fallback; the rows do not call Anthropic models in that process. To use an actual Anthropic model and GPT in parallel, keep the gateway variables out of global settings, start the GPT process with the inline command above, and start a second process normally:
+
+```bash
+claude --model sonnet
+```
+
+If the gateway variables are already in `~/.claude/settings.json`, shell-level `env -u` does not override that settings file. Remove the persistent variables or use a separate `CLAUDE_CONFIG_DIR` for the direct-Anthropic process.
+
+Claude Code gateway discovery cannot expose raw `gpt-*` IDs because Claude Code filters discovered IDs to `claude*` and `anthropic*`. The official single custom-model option avoids a misleading facade ID. This integration is an Anthropic Messages-compatible bridge; Anthropic explicitly does not support routing Claude Code to non-Claude models through third-party gateways. See the official [model configuration](https://code.claude.com/docs/en/model-config), [gateway connection](https://code.claude.com/docs/en/llm-gateway-connect), and [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol) references.
+
+The current bridge accepts Claude Code's exact no-op thinking cleanup (`clear_thinking_20251015` with `keep: "all"`). Context edits that would change history, task budgets, enabled beta tool fields such as `strict` or `defer_loading`, malformed output formats, and unsupported image source types return HTTP 400 because the Codex OAuth transport has no lossless equivalent. Valid base64 and URL image blocks plus `tool_result.is_error` are preserved during translation.
 
 ## Architecture
 
@@ -651,14 +681,20 @@ The provider handles:
 
 ## Release & package publishing
 
-- Bump versions in `pyproject.toml`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.6.0` from the matching commit.
+- Bump versions in `pyproject.toml`, `src/codex_as_api/__init__.py`, `src/codex_as_api/server.py`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
+- Publish a GitHub Release such as `v0.6.1` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 Publishing to npmjs requires an authenticated npm session (`npm login` beforehand; `npm whoami` should succeed). From the repository root, the publish itself is one command:
 
 ```bash
 npm publish ./ts --access public
+```
+
+Publishing to PyPI requires `UV_PUBLISH_TOKEN` and a freshly built distribution:
+
+```bash
+uv build --clear && uv publish dist/*
 ```
 
 ## Tests
@@ -688,6 +724,17 @@ npm test
 
 
 ## Release Notes
+
+### v0.6.1
+
+- Re-audit official Codex `0.144.4` and `main` at `393f64565ab46f09d99ca4d9bd973537e72a114b`, plus Claude Code `2.1.208`, before publishing.
+- Validate Claude Code `2.1.208` with real Codex OAuth chat and tool loops, and document the official custom GPT picker entry alongside Fable, Opus, Sonnet, and Haiku.
+- Route bundled GPT model IDs from Anthropic requests to the selected Codex backend model while retaining configured fallback behavior for built-in Claude model names.
+- Map `output_config.effort` and Fast Mode to Codex effort and priority service tier, preserve URL images and tool-error state, and handle current context/tool beta fields without silent loss.
+- Keep Messages, token counting, and remote compaction aligned on effective model limits and fail-loudly validation for output formats and image sources.
+- Keep Python streaming work off the ASGI event loop and make Rust Anthropic SSE truly incremental so concurrent Claude Code requests are not stalled or buffered.
+- Preserve Rust streaming authentication, rate-limit, and overload errors after OAuth refresh instead of collapsing them to generic HTTP 500 failures.
+- Restrict the Python source distribution to release inputs so local agent state and unrelated runtime sources cannot enter PyPI artifacts.
 
 ### v0.6.0
 

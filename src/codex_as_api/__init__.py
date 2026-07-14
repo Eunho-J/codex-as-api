@@ -1,3 +1,3 @@
 """codex-as-api: Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."""
 
-__version__ = "0.3.3"
+__version__ = "0.6.1"

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type {
   AssistantResponse,
   Message,
@@ -19,7 +21,8 @@ export function anthropicRequestToInternal(opts: {
   toolChoice?: Record<string, unknown>;
   stopSequences?: string[];
   thinking?: Record<string, unknown>;
-  outputFormat?: Record<string, unknown>;
+  outputFormat?: unknown;
+  outputConfig?: unknown;
 }): {
   messages: Message[];
   tools: ToolSchema[] | null;
@@ -49,8 +52,13 @@ export function anthropicRequestToInternal(opts: {
 
   const internalTools = opts.tools ? convertTools(opts.tools) : null;
   const internalToolChoice = convertToolChoice(opts.toolChoice ?? null);
-  const reasoningEffort = convertThinking(opts.thinking ?? null);
-  const text = anthropicOutputFormatToOpenAIText(opts.outputFormat ?? null);
+  const reasoningEffort = convertReasoningEffort(
+    opts.thinking ?? null,
+    opts.outputConfig ?? null,
+  );
+  const text = anthropicOutputFormatToOpenAIText(
+    resolveAnthropicOutputFormat(opts.outputFormat, opts.outputConfig),
+  );
 
   return {
     messages: internalMessages,
@@ -114,12 +122,8 @@ function convertUserMessage(
           if (p.type === "text") {
             textPieces.push((p.text ?? "") as string);
           } else if (p.type === "image") {
-            const source = p.source as Record<string, unknown> | undefined;
-            if (source && source.type === "base64") {
-              const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
-              const data = typeof source.data === "string" ? source.data : "";
-              toolResultImages.push(`data:${mediaType};base64,${data}`);
-            }
+            const imageUrl = anthropicImageSourceUrl(p.source);
+            if (imageUrl !== null) toolResultImages.push(imageUrl);
           } else {
             const rendered = renderAnthropicContentBlock(p);
             if (rendered) textPieces.push(rendered);
@@ -128,6 +132,9 @@ function convertUserMessage(
         resultContent = textPieces.join("");
       } else if (typeof resultContent !== "string") {
         resultContent = resultContent ? String(resultContent) : "";
+      }
+      if (b.is_error === true) {
+        resultContent = `[tool_error]\n${resultContent}`;
       }
       out.push({
         role: MessageRole.TOOL,
@@ -139,12 +146,8 @@ function convertUserMessage(
         out.push({ role: MessageRole.USER, content: "", images: toolResultImages });
       }
     } else if (blockType === "image") {
-      const source = b.source as Record<string, unknown> | undefined;
-      if (source && source.type === "base64") {
-        const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
-        const data = typeof source.data === "string" ? source.data : "";
-        imageUrls.push(`data:${mediaType};base64,${data}`);
-      }
+      const imageUrl = anthropicImageSourceUrl(b.source);
+      if (imageUrl !== null) imageUrls.push(imageUrl);
     } else {
       const rendered = renderAnthropicContentBlock(b);
       if (rendered) textParts.push(rendered);
@@ -153,6 +156,41 @@ function convertUserMessage(
   if (textParts.length || imageUrls.length) {
     out.push({ role: MessageRole.USER, content: textParts.join(""), images: [...imageUrls] });
   }
+}
+
+function anthropicImageSourceUrl(sourceValue: unknown): string | null {
+  if (
+    typeof sourceValue !== "object"
+    || sourceValue === null
+    || Array.isArray(sourceValue)
+  ) {
+    throw new Error("Anthropic image source must be an object");
+  }
+  const source = sourceValue as Record<string, unknown>;
+  if (source.type === "base64") {
+    const mediaType = typeof source.media_type === "string"
+      ? source.media_type
+      : "image/png";
+    if (
+      typeof source.media_type !== "undefined"
+      && typeof source.media_type !== "string"
+    ) {
+      throw new Error("Anthropic base64 image source requires a string media_type");
+    }
+    if (typeof source.data !== "string" || source.data.length === 0) {
+      throw new Error("Anthropic base64 image source requires non-empty data");
+    }
+    return `data:${mediaType};base64,${source.data}`;
+  }
+  if (source.type === "url") {
+    if (typeof source.url !== "string" || source.url.length === 0) {
+      throw new Error("Anthropic URL image source requires a non-empty url");
+    }
+    return source.url;
+  }
+  throw new Error(
+    "Anthropic image source type must be one of: base64, url",
+  );
 }
 
 function convertAssistantMessage(
@@ -211,6 +249,15 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
   const result: ToolSchema[] = [];
   for (const [index, tool] of tools.entries()) {
     if (typeof tool !== "object" || tool === null) continue;
+    for (const field of ["strict", "defer_loading", "eager_input_streaming"] as const) {
+      const value = tool[field];
+      if (value === true) {
+        throw new Error(`tool ${index} ${field}=true is not supported`);
+      }
+      if (value != null && value !== false) {
+        throw new Error(`tool ${index} ${field} must be a boolean or null`);
+      }
+    }
     if (tool.type === "programmatic_tool_calling") {
       throw new Error(
         "programmatic_tool_calling tools are not supported by this compatibility API",
@@ -312,26 +359,69 @@ function convertThinking(thinking: Record<string, unknown> | null): string | nul
   return null;
 }
 
+function convertReasoningEffort(
+  thinking: Record<string, unknown> | null,
+  outputConfigValue: unknown,
+): string | null {
+  const thinkingEffort = convertThinking(thinking);
+  if (outputConfigValue == null) return thinkingEffort;
+  if (
+    typeof outputConfigValue !== "object"
+    || Array.isArray(outputConfigValue)
+  ) {
+    throw new Error("output_config must be an object");
+  }
+
+  const outputConfig = outputConfigValue as Record<string, unknown>;
+  for (const key of Object.keys(outputConfig)) {
+    if (!["effort", "format", "task_budget"].includes(key)) {
+      throw new Error(`output_config.${key} is not supported`);
+    }
+  }
+  if (outputConfig.task_budget != null) {
+    throw new Error(
+      "output_config.task_budget is not supported by the Codex OAuth backend",
+    );
+  }
+  if (outputConfig.effort == null) return thinkingEffort;
+  if (
+    typeof outputConfig.effort !== "string"
+    || !["low", "medium", "high", "xhigh", "max"].includes(
+      outputConfig.effort,
+    )
+  ) {
+    throw new Error(
+      "output_config.effort must be one of: low, medium, high, xhigh, max",
+    );
+  }
+  if (thinkingEffort === "none") {
+    throw new Error(
+      "output_config.effort cannot be represented together with thinking.disabled",
+    );
+  }
+  return outputConfig.effort;
+}
+
 export function anthropicOutputFormatToOpenAIText(
   outputFormat: Record<string, unknown> | null,
 ): Record<string, unknown> | null {
-  if (outputFormat === null || typeof outputFormat !== "object") return null;
+  if (outputFormat === null) return null;
+  validateAnthropicOutputFormat("output_format", outputFormat);
   const type = outputFormat.type;
   if (type === "json_schema") {
-    const schema = outputFormat.schema;
-    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return null;
+    const schema = outputFormat.schema as Record<string, unknown>;
     const name = sanitizeJsonSchemaName(
-      typeof outputFormat.name === "string" && outputFormat.name ? outputFormat.name : "structured_output",
+      typeof outputFormat.name === "string" ? outputFormat.name : "structured_output",
     );
     const format: Record<string, unknown> = {
       type: "json_schema",
       name,
       schema,
     };
-    if (typeof outputFormat.description === "string") {
+    if (Object.hasOwn(outputFormat, "description")) {
       format.description = outputFormat.description;
     }
-    if (typeof outputFormat.strict === "boolean") {
+    if (Object.hasOwn(outputFormat, "strict")) {
       format.strict = outputFormat.strict;
     }
     return { format };
@@ -339,7 +429,111 @@ export function anthropicOutputFormatToOpenAIText(
   if (type === "json_object") {
     return { format: { type: "json_object" } };
   }
-  return null;
+  throw new Error(
+    "output_format.type must be one of: json_schema, json_object",
+  );
+}
+
+function resolveAnthropicOutputFormat(
+  outputFormatValue: unknown,
+  outputConfigValue: unknown,
+): Record<string, unknown> | null {
+  const outputFormat = outputFormatRecord(outputFormatValue, "output_format");
+  let nestedFormat: Record<string, unknown> | null = null;
+  if (outputConfigValue != null) {
+    if (
+      typeof outputConfigValue !== "object"
+      || Array.isArray(outputConfigValue)
+    ) {
+      throw new Error("output_config must be an object");
+    }
+    nestedFormat = outputFormatRecord(
+      (outputConfigValue as Record<string, unknown>).format,
+      "output_config.format",
+    );
+  }
+  if (
+    outputFormat !== null
+    && nestedFormat !== null
+    && !isDeepStrictEqual(outputFormat, nestedFormat)
+  ) {
+    throw new Error("output_format conflicts with output_config.format");
+  }
+  const selected = outputFormat ?? nestedFormat;
+  if (selected === null) return null;
+  validateAnthropicOutputFormat(
+    outputFormat !== null ? "output_format" : "output_config.format",
+    selected,
+  );
+  return selected;
+}
+
+function outputFormatRecord(
+  value: unknown,
+  field: string,
+): Record<string, unknown> | null {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function validateAnthropicOutputFormat(
+  field: string,
+  outputFormat: Record<string, unknown>,
+): void {
+  const type = outputFormat.type;
+  if (typeof type !== "string") {
+    throw new Error(`${field}.type must be a string`);
+  }
+
+  let allowedFields: ReadonlySet<string>;
+  if (type === "json_object") {
+    allowedFields = new Set(["type"]);
+  } else if (type === "json_schema") {
+    allowedFields = new Set([
+      "type",
+      "schema",
+      "name",
+      "description",
+      "strict",
+    ]);
+  } else {
+    throw new Error(`${field}.type must be one of: json_object, json_schema`);
+  }
+
+  const unknownField = Object.keys(outputFormat).find(
+    (key) => !allowedFields.has(key),
+  );
+  if (unknownField !== undefined) {
+    throw new Error(`${field}.${unknownField} is not supported`);
+  }
+
+  if (type === "json_schema") {
+    const schema = outputFormat.schema;
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+      throw new Error(`${field}.schema must be an object`);
+    }
+  }
+  if (
+    Object.hasOwn(outputFormat, "name")
+    && (typeof outputFormat.name !== "string" || outputFormat.name.length === 0)
+  ) {
+    throw new Error(`${field}.name must be a non-empty string`);
+  }
+  if (
+    Object.hasOwn(outputFormat, "description")
+    && typeof outputFormat.description !== "string"
+  ) {
+    throw new Error(`${field}.description must be a string`);
+  }
+  if (
+    Object.hasOwn(outputFormat, "strict")
+    && typeof outputFormat.strict !== "boolean"
+  ) {
+    throw new Error(`${field}.strict must be a boolean`);
+  }
 }
 
 function sanitizeJsonSchemaName(name: string): string {

@@ -1,5 +1,7 @@
 import * as crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import express, { type Request, type Response } from "express";
+import modelCapabilityData from "../../config/model-capabilities.json";
 import {
   ChatGPTOAuthError,
   ChatGPTOAuthInvalidRequestError,
@@ -32,6 +34,9 @@ const HOST = process.env.CODEX_AS_API_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.CODEX_AS_API_PORT || "18080", 10);
 const DEFAULT_MODEL = "gpt-5.5";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
+const KNOWN_CODEX_MODELS = new Set(Object.keys(
+  (modelCapabilityData as { models?: Record<string, unknown> }).models ?? {},
+));
 
 function errorStatus(err: unknown): number {
   if (err instanceof ChatGPTOAuthMissingError) return 401;
@@ -67,7 +72,7 @@ function isResponsesLiteValidationError(err: unknown): boolean {
 }
 
 function isRequestShapeValidationError(err: unknown): boolean {
-  return /reasoning(?:\.| must|_effort conflicts)|safety_identifier|previous_response_id|prompt_cache_(?:key|options|breakpoint|retention)|service_tier|include|verbosity|text must|unsupported content block|system message content|message \d+ content|image (?:reference|detail)|multi_agent|programmatic_tool_calling|allowed_callers|output_schema|tools? must/.test(
+  return /reasoning(?:\.| must|_effort conflicts)|safety_identifier|previous_response_id|prompt_cache_(?:key|options|breakpoint|retention)|service_tier|include|verbosity|text must|unsupported content block|system message content|message \d+ content|image (?:reference|detail|source)|multi_agent|programmatic_tool_calling|allowed_callers|output_schema|output_format|output_config|context_management|speed|strict|defer_loading|eager_input_streaming|tools? must/.test(
     String(err),
   );
 }
@@ -525,28 +530,44 @@ export function createApp(opts?: CreateAppOptions): express.Express {
       const body = req.body;
       rejectUnsupportedGenerationFeatures(body);
       rejectUnsupportedCompactFields(body);
-      const { messages, reasoningEffort, tools } = messagesFromCompactBody(
+      const isAnthropicCompact = req.path === "/v1/messages/compact";
+      if (isAnthropicCompact) {
+        validateAnthropicContextManagement(body.context_management);
+      }
+      const requestModel = isAnthropicCompact
+        ? resolveAnthropicBackendModel(body.model, model)
+        : model;
+      const { messages, reasoningEffort, tools, text: outputFormatText } = messagesFromCompactBody(
         body,
-        model,
+        requestModel,
         req.path === "/v1/messages/compact",
       );
+      const requestedReasoningEffort = mergeAnthropicReasoningEffort(
+        body.reasoning_effort,
+        reasoningEffort,
+      );
       const checkpoint = await provider.compactMessages(messages, {
-        model,
+        model: requestModel,
         reasoningEffort: resolveReasoningEffort(
           compactReasoningEffort(
             body.reasoning,
-            body.reasoning_effort ?? reasoningEffort ?? undefined,
+            requestedReasoningEffort,
           ),
           codexConfig,
-          model,
+          requestModel,
         ),
         responsesLite: body.responses_lite,
         tools: tools ?? undefined,
         promptCacheOptions: body.prompt_cache_options as PromptCacheOptions | undefined,
         promptCacheKey: resolvePromptCacheKey(body.prompt_cache_key),
         previousResponseId: resolvePreviousResponseId(body.previous_response_id),
-        serviceTier: body.service_tier,
-        text: resolveTextOptions(body.text, body.verbosity),
+        serviceTier: isAnthropicCompact
+          ? resolveAnthropicServiceTier(body)
+          : body.service_tier,
+        text: mergeAnthropicTextOptions(
+          resolveTextOptions(body.text, body.verbosity),
+          outputFormatText,
+        ),
       });
       res.json({ checkpoint });
     } catch (err) {
@@ -561,6 +582,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     try {
       const body = req.body;
       rejectUnsupportedGenerationFeatures(body);
+      validateAnthropicContextManagement(body.context_management);
       const { messages } = anthropicRequestToInternal({
         model: body.model,
         messages: body.messages || [],
@@ -571,12 +593,17 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         stopSequences: body.stop_sequences,
         thinking: body.thinking,
         outputFormat: anthropicOutputFormatFromBody(body),
+        outputConfig: body.output_config,
       });
       const inputTokens = estimateInputTokens(messages, body);
+      const requestModel = resolveAnthropicBackendModel(body.model, model);
       res.json({
         input_tokens: inputTokens,
-        context_window: getContextWindow(model, codexConfig),
-        auto_compact_token_limit: getAutoCompactTokenLimit(model, codexConfig),
+        context_window: getContextWindow(requestModel, codexConfig),
+        auto_compact_token_limit: getAutoCompactTokenLimit(
+          requestModel,
+          codexConfig,
+        ),
       });
     } catch (err) {
       handleAnthropicError(err, res);
@@ -587,6 +614,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     try {
       const body = req.body;
       rejectUnsupportedGenerationFeatures(body);
+      validateAnthropicContextManagement(body.context_management);
       const requestId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 
       const subagent =
@@ -613,13 +641,20 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           stopSequences: body.stop_sequences,
           thinking: body.thinking,
           outputFormat: anthropicOutputFormatFromBody(body),
+          outputConfig: body.output_config,
         });
 
-      const clientModel = body.model || "claude-sonnet-4-5";
-      const requestModel = model;
+      const clientModel = typeof body.model === "string" && body.model
+        ? body.model
+        : "claude-sonnet-4-5";
+      const requestModel = resolveAnthropicBackendModel(clientModel, model);
+      const requestedReasoningEffort = mergeAnthropicReasoningEffort(
+        body.reasoning_effort,
+        reasoningEffort,
+      );
       const resolvedReasoning = resolveReasoning(
         body.reasoning,
-        body.reasoning_effort ?? reasoningEffort ?? undefined,
+        requestedReasoningEffort,
         codexConfig,
         requestModel,
       );
@@ -637,6 +672,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         subagent,
         memgenRequest,
         responsesLite: body.responses_lite,
+        serviceTier: resolveAnthropicServiceTier(body),
       };
 
       if (body.stream) {
@@ -898,6 +934,7 @@ function messagesFromCompactBody(
   messages: Message[];
   reasoningEffort: string | null;
   tools: ToolSchema[] | null;
+  text: Record<string, unknown> | null;
 } {
   if (
     forceAnthropic
@@ -920,11 +957,13 @@ function messagesFromCompactBody(
         ? body.thinking as Record<string, unknown>
         : undefined,
       outputFormat: anthropicOutputFormatFromBody(body),
+      outputConfig: body.output_config,
     });
     return {
       messages: converted.messages,
       reasoningEffort: converted.reasoningEffort,
       tools: converted.tools,
+      text: converted.text,
     };
   }
 
@@ -933,20 +972,125 @@ function messagesFromCompactBody(
     messages: requestMessagesToInternal(rawMessages),
     reasoningEffort: null,
     tools: parseTools(body.tools) ?? null,
+    text: null,
   };
 }
 
-function anthropicOutputFormatFromBody(body: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (typeof body.output_format === "object" && body.output_format !== null && !Array.isArray(body.output_format)) {
-    return body.output_format as Record<string, unknown>;
+function anthropicOutputFormatFromBody(body: Record<string, unknown>): unknown {
+  return body.output_format;
+}
+
+function mergeAnthropicTextOptions(
+  directText: Record<string, unknown> | undefined,
+  outputFormatText: Record<string, unknown> | null,
+): Record<string, unknown> | undefined {
+  if (outputFormatText === null) return directText;
+  const merged = { ...(directText ?? {}) };
+  for (const [key, value] of Object.entries(outputFormatText)) {
+    if (
+      Object.hasOwn(merged, key)
+      && !isDeepStrictEqual(merged[key], value)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `text.${key} conflicts with Anthropic output format`,
+      );
+    }
+    merged[key] = value;
   }
-  if (typeof body.output_config === "object" && body.output_config !== null && !Array.isArray(body.output_config)) {
-    const format = (body.output_config as Record<string, unknown>).format;
-    if (typeof format === "object" && format !== null && !Array.isArray(format)) {
-      return format as Record<string, unknown>;
+  return merged;
+}
+
+function resolveAnthropicBackendModel(
+  clientModel: unknown,
+  fallbackModel: string,
+): string {
+  return typeof clientModel === "string" && KNOWN_CODEX_MODELS.has(clientModel)
+    ? clientModel
+    : fallbackModel;
+}
+
+function mergeAnthropicReasoningEffort(
+  explicitEffort: unknown,
+  convertedEffort: string | null,
+): unknown {
+  if (
+    explicitEffort != null
+    && convertedEffort != null
+    && explicitEffort !== convertedEffort
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "reasoning_effort conflicts with Anthropic thinking or output_config",
+    );
+  }
+  return explicitEffort ?? convertedEffort ?? undefined;
+}
+
+function validateAnthropicContextManagement(value: unknown): void {
+  if (value == null) return;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "context_management supports only clear_thinking_20251015 with keep set to all",
+    );
+  }
+
+  const contextManagement = value as Record<string, unknown>;
+  const edits = contextManagement.edits;
+  const exactOuterShape = Object.keys(contextManagement).length === 1
+    && Array.isArray(edits)
+    && edits.length === 1;
+  const edit = exactOuterShape ? edits[0] : null;
+  if (
+    typeof edit === "object"
+    && edit !== null
+    && !Array.isArray(edit)
+  ) {
+    const record = edit as Record<string, unknown>;
+    if (
+      Object.keys(record).length === 2
+      && record.type === "clear_thinking_20251015"
+      && record.keep === "all"
+    ) {
+      return;
     }
   }
-  return undefined;
+  throw new ChatGPTOAuthInvalidRequestError(
+    "context_management supports only clear_thinking_20251015 with keep set to all",
+  );
+}
+
+function resolveAnthropicServiceTier(
+  body: Record<string, unknown>,
+): string | undefined {
+  const serviceTier = body.service_tier;
+  if (
+    serviceTier != null
+    && (
+      typeof serviceTier !== "string"
+      || serviceTier.trim().length === 0
+    )
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "service_tier must be a non-empty string when provided",
+    );
+  }
+
+  const speed = body.speed;
+  if (speed == null) return serviceTier as string | undefined;
+  if (speed !== "fast" && speed !== "standard") {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "speed must be one of: fast, standard",
+    );
+  }
+  const speedTier = speed === "fast" ? "fast" : "default";
+  const equivalentTiers = speed === "fast"
+    ? new Set(["fast", "priority"])
+    : new Set(["default"]);
+  if (serviceTier != null && !equivalentTiers.has(serviceTier)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "speed conflicts with service_tier",
+    );
+  }
+  return speedTier;
 }
 
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-as-api"
-version = "0.6.0"
+version = "0.6.1"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -42,6 +42,19 @@ packages = ["src/codex_as_api"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "config/model-capabilities.json" = "codex_as_api/model-capabilities.json"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/config/model-capabilities.json",
+    "/src/codex_as_api",
+    "/tests",
+    "/LICENSE",
+    "/README.md",
+    "/RELEASES.md",
+    "/pyproject.toml",
+    "/requirements-server.txt",
+    "/requirements.txt",
+]
 
 [tool.ruff]
 line-length = 120

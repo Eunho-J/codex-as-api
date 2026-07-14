@@ -4,7 +4,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from typing import Any, cast
 
 from .auth import (
@@ -15,7 +15,7 @@ from .auth import (
 )
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
-from .model_capabilities import capability_for_model
+from .model_capabilities import capability_for_model, load_model_capabilities
 from .provider import ChatGPTOAuthProvider, prime_codex_cli_version_cache
 
 
@@ -68,14 +68,60 @@ def _error_status(exc: BaseException) -> int:
 
 def _anthropic_output_format_from_body(body: dict[str, Any]) -> dict[str, Any] | None:
     output_format = body.get("output_format")
-    if isinstance(output_format, dict):
-        return cast(dict[str, Any], output_format)
-    output_config = body.get("output_config")
-    if isinstance(output_config, dict):
-        format_value = output_config.get("format")
-        if isinstance(format_value, dict):
-            return cast(dict[str, Any], format_value)
-    return None
+    if output_format is None:
+        return None
+    if not isinstance(output_format, dict):
+        raise ChatGPTOAuthInvalidRequestError("output_format must be an object")
+    return cast(dict[str, Any], output_format)
+
+
+def _anthropic_backend_model(client_model: object) -> str:
+    if isinstance(client_model, str) and client_model in load_model_capabilities():
+        return client_model
+    return MODEL
+
+
+def _validate_anthropic_context_management(value: object) -> None:
+    if value is None:
+        return
+    if value == {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}:
+        return
+    raise ChatGPTOAuthInvalidRequestError(
+        "context_management is unsupported except for clear_thinking_20251015 with keep='all'"
+    )
+
+
+def _anthropic_service_tier(body: dict[str, Any]) -> str | None:
+    service_tier = body.get("service_tier")
+    if service_tier is not None and (not isinstance(service_tier, str) or not service_tier.strip()):
+        raise ChatGPTOAuthInvalidRequestError("service_tier must be a non-empty string when provided")
+
+    speed = body.get("speed")
+    if speed is None:
+        return cast(str | None, service_tier)
+    if speed not in {"fast", "standard"}:
+        raise ChatGPTOAuthInvalidRequestError("speed must be one of: fast, standard")
+    speed_tier = "fast" if speed == "fast" else "default"
+    equivalent_tiers = {"fast", "priority"} if speed == "fast" else {"default"}
+    if service_tier is not None and service_tier not in equivalent_tiers:
+        raise ChatGPTOAuthInvalidRequestError("speed conflicts with service_tier")
+    return speed_tier
+
+
+def _merge_anthropic_text(
+    converted: dict[str, Any] | None,
+    direct: object,
+) -> dict[str, Any] | None:
+    if direct is None:
+        return converted
+    if not isinstance(direct, dict):
+        raise ChatGPTOAuthInvalidRequestError("text must be an object")
+    merged = dict(converted or {})
+    for key, value in direct.items():
+        if key in merged and merged[key] != value:
+            raise ChatGPTOAuthInvalidRequestError(f"text.{key} conflicts with Anthropic output format")
+        merged[key] = value
+    return merged
 
 
 def _error_type(exc: BaseException) -> str:
@@ -93,7 +139,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.6.0",
+        version="0.6.1",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -389,23 +435,26 @@ try:
             return req.max_completion_tokens
         return req.max_tokens
 
-    def _context_window() -> int:
-        capability = capability_for_model(MODEL)
+    def _context_window(model: str | None = None) -> int:
+        selected_model = MODEL if model is None else model
+        capability = capability_for_model(selected_model)
         if CODEX_CONFIG.model_context_window is not None:
             if capability.max_context_window is not None:
                 return min(CODEX_CONFIG.model_context_window, capability.max_context_window)
             return CODEX_CONFIG.model_context_window
         return capability.context_window or DEFAULT_CONTEXT_WINDOW
 
-    def _auto_compact_token_limit() -> int:
+    def _auto_compact_token_limit(model: str | None = None) -> int:
+        selected_model = MODEL if model is None else model
         has_resolved_context = (
-            CODEX_CONFIG.model_context_window is not None or capability_for_model(MODEL).context_window is not None
+            CODEX_CONFIG.model_context_window is not None
+            or capability_for_model(selected_model).context_window is not None
         )
         if CODEX_CONFIG.model_auto_compact_token_limit is not None:
-            return min(CODEX_CONFIG.model_auto_compact_token_limit, _context_window() * 9 // 10)
+            return min(CODEX_CONFIG.model_auto_compact_token_limit, _context_window(selected_model) * 9 // 10)
         if has_resolved_context:
-            return _context_window() * 9 // 10
-        return _context_window() * 4 // 5
+            return _context_window(selected_model) * 9 // 10
+        return _context_window(selected_model) * 4 // 5
 
     def _request_reasoning_effort(requested: str | None) -> str | None:
         if requested is not None:
@@ -428,23 +477,28 @@ try:
         body: dict[str, Any],
         *,
         anthropic: bool = False,
-    ) -> tuple[list[Message], list[ToolSchema] | None, str | None]:
+    ) -> tuple[list[Message], list[ToolSchema] | None, str | None, dict[str, Any] | None]:
         messages_value = body.get("messages")
         if anthropic or any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
+            _validate_anthropic_context_management(body.get("context_management"))
             anthropic_messages = cast(list[dict[str, Any]], messages_value) if isinstance(messages_value, list) else []
             max_tokens_value = body.get("max_tokens")
-            messages, tools, _tool_choice, _stop, reasoning_effort, _text = anthropic_request_to_internal(
-                model=str(body.get("model") or MODEL),
-                messages=anthropic_messages,
-                system=body.get("system"),
-                max_tokens=max_tokens_value if isinstance(max_tokens_value, int) else 4096,
-                tools=body.get("tools") if isinstance(body.get("tools"), list) else None,
-                tool_choice=body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None,
-                stop_sequences=body.get("stop_sequences") if isinstance(body.get("stop_sequences"), list) else None,
-                thinking=body.get("thinking") if isinstance(body.get("thinking"), dict) else None,
-                output_format=_anthropic_output_format_from_body(body),
-            )
-            return messages, tools, reasoning_effort
+            try:
+                messages, tools, _tool_choice, _stop, reasoning_effort, text = anthropic_request_to_internal(
+                    model=str(body.get("model") or MODEL),
+                    messages=anthropic_messages,
+                    system=body.get("system"),
+                    max_tokens=max_tokens_value if isinstance(max_tokens_value, int) else 4096,
+                    tools=body.get("tools") if isinstance(body.get("tools"), list) else None,
+                    tool_choice=body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None,
+                    stop_sequences=body.get("stop_sequences") if isinstance(body.get("stop_sequences"), list) else None,
+                    thinking=body.get("thinking") if isinstance(body.get("thinking"), dict) else None,
+                    output_format=_anthropic_output_format_from_body(body),
+                    output_config=body.get("output_config"),
+                )
+            except ValueError as exc:
+                raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
+            return messages, tools, reasoning_effort, text
 
         raw_messages: list[Any] = messages_value if isinstance(messages_value, list) else []
         messages = _request_messages_to_internal(
@@ -452,7 +506,7 @@ try:
             model=MODEL,
         )
         raw_tools = body.get("tools") if isinstance(body.get("tools"), list) else None
-        return messages, _parse_tools(raw_tools), None
+        return messages, _parse_tools(raw_tools), None, None
 
     def _token_bytes(value: str) -> int:
         return len(value.encode("utf-8"))
@@ -549,7 +603,7 @@ try:
                 verbosity=request.verbosity,
             )
 
-            async def _stream() -> AsyncIterator[str]:
+            def _stream() -> Iterator[str]:
                 request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 created = int(time.time())
                 model = _openai_model_id(request.model)
@@ -882,6 +936,7 @@ try:
                     ),
                 )
         try:
+            _validate_anthropic_context_management(body.get("context_management"))
             messages, _tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
                 model=body.get("model"),
                 messages=body.get("messages") or [],
@@ -892,15 +947,17 @@ try:
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
                 output_format=_anthropic_output_format_from_body(body),
+                output_config=body.get("output_config"),
             )
             input_tokens = _estimate_input_tokens(messages, body)
+            request_model = _anthropic_backend_model(body.get("model"))
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
         return JSONResponse(
             content={
                 "input_tokens": input_tokens,
-                "context_window": _context_window(),
-                "auto_compact_token_limit": _auto_compact_token_limit(),
+                "context_window": _context_window(request_model),
+                "auto_compact_token_limit": _auto_compact_token_limit(request_model),
             }
         )
 
@@ -929,6 +986,7 @@ try:
             )
 
         try:
+            _validate_anthropic_context_management(body.get("context_management"))
             messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
                 model=body.get("model", MODEL),
                 messages=body.get("messages", []),
@@ -939,6 +997,7 @@ try:
                 stop_sequences=body.get("stop_sequences"),
                 thinking=body.get("thinking"),
                 output_format=_anthropic_output_format_from_body(body),
+                output_config=body.get("output_config"),
             )
         except Exception as exc:
             return JSONResponse(status_code=400, content=format_anthropic_error(400, str(exc)))
@@ -946,7 +1005,7 @@ try:
         stream = body.get("stream", False)
         responses_lite = body.get("responses_lite")
         client_model = body.get("model") or "claude-sonnet-4-5"
-        request_model = MODEL
+        request_model = _anthropic_backend_model(client_model)
         try:
             explicit_effort = body.get("reasoning_effort")
             if explicit_effort is not None and reasoning_effort is not None and explicit_effort != reasoning_effort:
@@ -955,6 +1014,7 @@ try:
                 cast(str | None, explicit_effort or reasoning_effort),
                 body.get("reasoning"),
             )
+            service_tier = _anthropic_service_tier(body)
         except ChatGPTOAuthError as exc:
             status = _error_status(exc)
             return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
@@ -975,15 +1035,16 @@ try:
                     safety_identifier=body.get("safety_identifier"),
                     prompt_cache_options=body.get("prompt_cache_options"),
                     verbosity=body.get("verbosity"),
+                    service_tier=service_tier,
                 )
             except ChatGPTOAuthError as exc:
                 status = _error_status(exc)
                 return JSONResponse(status_code=status, content=format_anthropic_error(status, str(exc)))
 
-            async def _stream() -> AsyncIterator[str]:
+            def _stream() -> Iterator[str]:
                 request_id = f"msg_{uuid.uuid4().hex[:24]}"
                 try:
-                    for sse_chunk in anthropic_stream_adapter(
+                    yield from anthropic_stream_adapter(
                         provider.chat_stream(
                             messages,
                             model=request_model,
@@ -998,12 +1059,12 @@ try:
                             safety_identifier=body.get("safety_identifier"),
                             prompt_cache_options=body.get("prompt_cache_options"),
                             verbosity=body.get("verbosity"),
+                            service_tier=service_tier,
                             _prepared_request=prepared_request,
                         ),
                         model=client_model,
                         request_id=request_id,
-                    ):
-                        yield sse_chunk
+                    )
                 except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                     status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
                     error = format_anthropic_error(status, str(exc))
@@ -1031,6 +1092,7 @@ try:
                 safety_identifier=body.get("safety_identifier"),
                 prompt_cache_options=body.get("prompt_cache_options"),
                 verbosity=body.get("verbosity"),
+                service_tier=service_tier,
             )
         except ChatGPTOAuthError as exc:
             status = _error_status(exc)
@@ -1089,7 +1151,7 @@ try:
         for field in ("safety_identifier", "include", "prompt_cache_retention"):
             if body.get(field) is not None:
                 raise ChatGPTOAuthInvalidRequestError(f"{field} is not supported by the compact facade")
-        messages, tools, reasoning_effort = _messages_from_compact_body(
+        messages, tools, reasoning_effort, anthropic_text = _messages_from_compact_body(
             body,
             anthropic=request.url.path == "/v1/messages/compact",
         )
@@ -1116,22 +1178,32 @@ try:
         if effort_candidates and any(value != effort_candidates[0] for value in effort_candidates[1:]):
             raise ChatGPTOAuthInvalidRequestError("reasoning effort fields conflict in compact request")
         explicit_effort = cast(str | None, effort_candidates[0] if effort_candidates else None)
+        is_anthropic_compact = request.url.path == "/v1/messages/compact"
         compact_options: dict[str, Any] = {
-            "model": MODEL,
+            "model": _anthropic_backend_model(body.get("model")) if is_anthropic_compact else MODEL,
             "tools": tools,
             "reasoning_effort": _request_reasoning_effort(explicit_effort),
             "responses_lite": body.get("responses_lite"),
         }
+        if is_anthropic_compact:
+            service_tier = _anthropic_service_tier(body)
+            if service_tier is not None:
+                compact_options["service_tier"] = service_tier
+            text = _merge_anthropic_text(anthropic_text, body.get("text"))
+            if text is not None:
+                compact_options["text"] = text
         for key in (
             "previous_response_id",
             "prompt_cache_key",
             "prompt_cache_options",
-            "service_tier",
-            "text",
             "verbosity",
         ):
             if body.get(key) is not None:
                 compact_options[key] = body[key]
+        if not is_anthropic_compact and body.get("service_tier") is not None:
+            compact_options["service_tier"] = body["service_tier"]
+        if not is_anthropic_compact and body.get("text") is not None:
+            compact_options["text"] = body["text"]
         checkpoint = provider.compact_messages(messages, **compact_options)
         return JSONResponse(content={"checkpoint": checkpoint})
 

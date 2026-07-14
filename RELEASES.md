@@ -1,5 +1,26 @@
 # Release Notes
 
+## v0.6.1
+
+### Claude Code 2.1.208 compatibility
+
+- Re-audit official `openai/codex` `main` at `393f64565ab46f09d99ca4d9bd973537e72a114b` after the `0.144.4` release; the private HTTP/WebSocket request split still has no Pro, public cache-policy, or safety-identifier aliases.
+- Route bundled GPT IDs received through `/v1/messages` to the matching Codex backend model while preserving the configured Codex fallback for built-in Claude model names.
+- Route the same model and Fast Mode controls through remote compaction, and report token-count context limits for the effective request model.
+- Map Claude Code `output_config.effort` values through `max`, and translate Fast Mode's `speed: "fast"` into the Codex `priority` service tier.
+- Accept the current no-op `clear_thinking_20251015` context cleanup, and reject context edits, task budgets, or enabled beta tool fields that cannot be represented by the Codex OAuth transport.
+- Preserve Anthropic URL image sources and `tool_result.is_error` state instead of silently discarding them; reject malformed output formats and unsupported image source types.
+- Move Python's blocking provider iterator off the ASGI event loop and replace Rust's buffered Anthropic path with end-to-end incremental SSE.
+- Preserve Rust streaming 401, 429, and 529 semantics and surface OAuth refresh failures directly.
+- Document the official custom model option that appends GPT to the `/model` picker alongside Fable, Opus, Sonnet, and Haiku, including effort controls and the process-wide gateway routing limitation.
+- Restrict Python source distributions to the Python source, shared capability catalog, tests, and release documentation.
+
+### Validation
+
+- Latest Claude Code CLI `2.1.208`: real Codex OAuth chat, two-turn `Read` tool loop, explicit `gpt-5.6-sol`, and `--effort max`.
+- Python concurrency and TypeScript/Rust gated-stream integration tests prove that a live stream does not block or buffer other Claude Code work.
+- Python, TypeScript, and Rust unit and integration suites cover the captured latest request shape and unsupported-field failures.
+
 ## v0.6.0
 
 ### GPT-5.6 Codex compatibility

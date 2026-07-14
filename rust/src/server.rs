@@ -8,14 +8,14 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::task;
 
 use crate::anthropic_adapter::{
-    anthropic_request_to_internal, anthropic_stream_adapter, format_anthropic_error,
-    internal_response_to_anthropic,
+    anthropic_request_to_internal, format_anthropic_error, internal_response_to_anthropic,
+    AnthropicStreamAdapter,
 };
-use crate::auth::{self, AuthError};
+use crate::auth;
 use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::model_capabilities::capability_for_model;
@@ -145,10 +145,33 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     )
 }
 
+fn anthropic_sse_event(chunk: &str) -> Event {
+    let mut lines = chunk.trim_end_matches('\n').splitn(2, '\n');
+    let event_type = lines
+        .next()
+        .and_then(|line| line.strip_prefix("event: "))
+        .unwrap_or("message");
+    let data = lines
+        .next()
+        .and_then(|line| line.strip_prefix("data: "))
+        .unwrap_or("");
+    Event::default().event(event_type).data(data)
+}
+
+fn anthropic_stream_error_event(status: u16, message: &str) -> Event {
+    Event::default().event("error").data(
+        serde_json::to_string(&format_anthropic_error(status, message))
+            .unwrap_or_else(|_| "{\"type\":\"error\"}".to_string()),
+    )
+}
+
 fn map_error_status(e: &ProviderError) -> StatusCode {
     match e {
-        ProviderError::Auth(AuthError::Missing(_)) => StatusCode::UNAUTHORIZED,
+        ProviderError::Auth(_) => StatusCode::UNAUTHORIZED,
         ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ProviderError::UpstreamHttp { status, .. } => {
+            StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
         _ if e.to_string().to_lowercase().contains("context window") => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -169,6 +192,18 @@ pub fn create_router(state: AppState) -> Router {
 
 fn openai_model_id(model: &str) -> String {
     format!("codex-oauth:{}", model)
+}
+
+fn is_known_codex_model(model: &str) -> bool {
+    static CATALOG: OnceLock<Value> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| {
+            serde_json::from_str(include_str!("model-capabilities.json"))
+                .expect("embedded model-capabilities.json must be valid")
+        })
+        .get("models")
+        .and_then(Value::as_object)
+        .is_some_and(|models| models.contains_key(model))
 }
 
 fn request_messages_to_internal(messages: &[ChatMessage]) -> Result<Vec<Message>, ProviderError> {
@@ -493,8 +528,8 @@ fn max_tokens_from_request(req: &ChatCompletionRequest) -> Option<i64> {
     req.max_completion_tokens.or(req.max_tokens)
 }
 
-fn context_window(state: &AppState) -> i64 {
-    let capability = capability_for_model(&state.model);
+fn context_window_for_model(state: &AppState, model: &str) -> i64 {
+    let capability = capability_for_model(model);
     if let Some(configured) = state.codex_config.model_context_window {
         return capability
             .max_context_window
@@ -503,17 +538,26 @@ fn context_window(state: &AppState) -> i64 {
     capability.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
-fn auto_compact_token_limit(state: &AppState) -> i64 {
+fn context_window(state: &AppState) -> i64 {
+    context_window_for_model(state, &state.model)
+}
+
+fn auto_compact_token_limit_for_model(state: &AppState, model: &str) -> i64 {
+    let context_window = context_window_for_model(state, model);
     if let Some(limit) = state.codex_config.model_auto_compact_token_limit {
-        return limit.min((context_window(state) * 9) / 10);
+        return limit.min((context_window * 9) / 10);
     }
 
-    let catalog_context = capability_for_model(&state.model).context_window;
+    let catalog_context = capability_for_model(model).context_window;
     if state.codex_config.model_context_window.is_some() || catalog_context.is_some() {
-        (context_window(state) * 9) / 10
+        (context_window * 9) / 10
     } else {
         (DEFAULT_CONTEXT_WINDOW * 8) / 10
     }
+}
+
+fn auto_compact_token_limit(state: &AppState) -> i64 {
+    auto_compact_token_limit_for_model(state, &state.model)
 }
 
 fn effective_reasoning_effort(
@@ -634,6 +678,58 @@ fn optional_string_field(body: &Value, field: &str) -> Result<Option<String>, Pr
     }
 }
 
+fn validate_anthropic_context_management(body: &Value) -> Result<(), ProviderError> {
+    let Some(context_management) = body.get("context_management") else {
+        return Ok(());
+    };
+    if context_management.is_null()
+        || context_management
+            == &json!({
+                "edits": [{
+                    "type": "clear_thinking_20251015",
+                    "keep": "all",
+                }],
+            })
+    {
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(
+        "context_management supports only clear_thinking_20251015 with keep set to all".to_string(),
+    ))
+}
+
+fn anthropic_service_tier(body: &Value) -> Result<Option<String>, ProviderError> {
+    let service_tier = optional_string_field(body, "service_tier")?;
+    if service_tier
+        .as_deref()
+        .is_some_and(|service_tier| service_tier.trim().is_empty())
+    {
+        return Err(ProviderError::InvalidRequest(
+            "service_tier must be a non-empty string when provided".to_string(),
+        ));
+    }
+
+    let (speed_tier, equivalent_tiers): (&str, &[&str]) = match body.get("speed") {
+        None | Some(Value::Null) => return Ok(service_tier),
+        Some(Value::String(speed)) if speed == "fast" => ("fast", &["fast", "priority"]),
+        Some(Value::String(speed)) if speed == "standard" => ("default", &["default"]),
+        Some(_) => {
+            return Err(ProviderError::InvalidRequest(
+                "speed must be one of: fast, standard".to_string(),
+            ));
+        }
+    };
+    if service_tier
+        .as_deref()
+        .is_some_and(|service_tier| !equivalent_tiers.contains(&service_tier))
+    {
+        return Err(ProviderError::InvalidRequest(
+            "speed conflicts with service_tier".to_string(),
+        ));
+    }
+    Ok(Some(speed_tier.to_string()))
+}
+
 fn reject_unsupported_tool_features(body: &Value) -> Result<(), ProviderError> {
     reject_unsupported_generation_tool_features(
         body.get("tools")
@@ -725,16 +821,24 @@ fn estimate_input_tokens(messages: &[Message], raw_payload: Option<&Value>) -> i
 fn messages_from_compact_body(
     body: &Value,
     force_anthropic: bool,
-) -> Result<(Vec<Message>, Option<Vec<ToolSchema>>, Option<String>), ProviderError> {
+) -> Result<
+    (
+        Vec<Message>,
+        Option<Vec<ToolSchema>>,
+        Option<String>,
+        Option<Value>,
+    ),
+    ProviderError,
+> {
     if force_anthropic
         || body.get("system").is_some()
         || body.get("thinking").is_some()
         || body.get("tool_choice").is_some()
         || body.get("stop_sequences").is_some()
     {
-        let (messages, tools, _tool_choice, _stop, reasoning_effort, _text) =
-            anthropic_request_to_internal(body);
-        return Ok((messages, tools, reasoning_effort));
+        let (messages, tools, _tool_choice, _stop, reasoning_effort, text) =
+            anthropic_request_to_internal(body).map_err(ProviderError::InvalidRequest)?;
+        return Ok((messages, tools, reasoning_effort, text));
     }
 
     let raw_items = match body.get("messages") {
@@ -768,7 +872,45 @@ fn messages_from_compact_body(
         request_messages_to_internal(&raw_messages)?,
         parse_tools(&raw_tools)?,
         None,
+        None,
     ))
+}
+
+fn merge_anthropic_compact_text(
+    direct_text: Option<&Value>,
+    converted_text: Option<Value>,
+) -> Result<Option<Value>, ProviderError> {
+    let direct_present = direct_text.is_some_and(|value| !value.is_null());
+    let mut merged = match direct_text {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => {
+            return Err(ProviderError::InvalidRequest(
+                "text must be an object when provided".to_string(),
+            ));
+        }
+    };
+
+    if let Some(converted_text) = converted_text {
+        let converted = converted_text.as_object().ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "converted Anthropic output format must be an object".to_string(),
+            )
+        })?;
+        for (key, value) in converted {
+            if merged
+                .get(key)
+                .is_some_and(|existing| !existing.is_null() && existing != value)
+            {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "text.{key} conflicts with the Anthropic output format"
+                )));
+            }
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok((direct_present || !merged.is_empty()).then_some(Value::Object(merged)))
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<Value>, axum::response::Response> {
@@ -1372,13 +1514,13 @@ async fn compact(
     }
     let provider = state.provider.clone();
     let force_anthropic = uri.path() == "/v1/messages/compact";
-    let (messages, tools, converted_reasoning_effort) =
+    let (messages, tools, converted_reasoning_effort, converted_text) =
         messages_from_compact_body(&body, force_anthropic).map_err(|error| {
             error_response(map_error_status(&error), error.to_string()).into_response()
         })?;
     let top_level_reasoning_effort = match body.get("reasoning_effort") {
         None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
         Some(_) => {
             let error = ProviderError::InvalidRequest(
                 "reasoning_effort must be a non-empty string when provided".to_string(),
@@ -1404,7 +1546,15 @@ async fn compact(
         return Err(error_response(map_error_status(&error), error.to_string()).into_response());
     }
     let requested_reasoning_effort = first_effort.map(str::to_string);
-    let request_model = state.model.clone();
+    let request_model = if force_anthropic {
+        body.get("model")
+            .and_then(Value::as_str)
+            .filter(|model| is_known_codex_model(model))
+            .map(str::to_string)
+            .unwrap_or_else(|| state.model.clone())
+    } else {
+        state.model.clone()
+    };
     let reasoning_effort = effective_reasoning_effort(
         &state,
         requested_reasoning_effort.as_deref(),
@@ -1421,6 +1571,19 @@ async fn compact(
         );
         return Err(error_response(map_error_status(&error), error.to_string()).into_response());
     }
+    let compact_service_tier = if force_anthropic {
+        anthropic_service_tier(&body)
+    } else {
+        optional_string_field(&body, "service_tier")
+    }
+    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    let compact_text = if force_anthropic {
+        merge_anthropic_compact_text(body.get("text"), converted_text).map_err(|error| {
+            error_response(map_error_status(&error), error.to_string()).into_response()
+        })?
+    } else {
+        body.get("text").filter(|value| !value.is_null()).cloned()
+    };
     let compact_controls = CompactControls {
         previous_response_id,
         prompt_cache_key: optional_string_field(&body, "prompt_cache_key").map_err(|error| {
@@ -1430,10 +1593,8 @@ async fn compact(
             .get("prompt_cache_options")
             .filter(|value| !value.is_null())
             .cloned(),
-        service_tier: optional_string_field(&body, "service_tier").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?,
-        text: body.get("text").filter(|value| !value.is_null()).cloned(),
+        service_tier: compact_service_tier,
+        text: compact_text,
         verbosity: optional_string_field(&body, "verbosity").map_err(|error| {
             error_response(map_error_status(&error), error.to_string()).into_response()
         })?,
@@ -1464,6 +1625,13 @@ async fn anthropic_count_tokens(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    if let Err(error) = validate_anthropic_context_management(&body) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &error.to_string())),
+        )
+            .into_response());
+    }
     if body
         .get("multi_agent")
         .is_some_and(|value| !value.is_null())
@@ -1483,12 +1651,23 @@ async fn anthropic_count_tokens(
             .into_response());
     }
     let (messages, _tools, _tool_choice, _stop, _reasoning_effort, _text) =
-        anthropic_request_to_internal(&body);
+        anthropic_request_to_internal(&body).map_err(|message| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(format_anthropic_error(400, &message)),
+            )
+                .into_response()
+        })?;
     let input_tokens = estimate_input_tokens(&messages, Some(&body));
+    let request_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| is_known_codex_model(model))
+        .unwrap_or(&state.model);
     Ok(Json(json!({
         "input_tokens": input_tokens,
-        "context_window": context_window(&state),
-        "auto_compact_token_limit": auto_compact_token_limit(&state),
+        "context_window": context_window_for_model(&state, request_model),
+        "auto_compact_token_limit": auto_compact_token_limit_for_model(&state, request_model),
     })))
 }
 
@@ -1498,6 +1677,13 @@ async fn anthropic_messages(
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, axum::response::Response> {
     let request_id = format!("msg_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+    validate_anthropic_context_management(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &error.to_string())),
+        )
+            .into_response()
+    })?;
     reject_unsupported_tool_features(&body).map_err(|error| {
         error_response(map_error_status(&error), error.to_string()).into_response()
     })?;
@@ -1524,7 +1710,13 @@ async fn anthropic_messages(
         });
 
     let (messages, tools, tool_choice, stop, converted_reasoning_effort, text) =
-        anthropic_request_to_internal(&body);
+        anthropic_request_to_internal(&body).map_err(|message| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(format_anthropic_error(400, &message)),
+            )
+                .into_response()
+        })?;
 
     let stream = body
         .get("stream")
@@ -1537,10 +1729,18 @@ async fn anthropic_messages(
         .and_then(|v| v.as_str())
         .unwrap_or(&default_client_model)
         .to_string();
-    let request_model = state.model.clone();
+    let request_model = if is_known_codex_model(&client_model) {
+        client_model.clone()
+    } else {
+        state.model.clone()
+    };
     let explicit_reasoning_effort =
         optional_string_field(&body, "reasoning_effort").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(format_anthropic_error(400, &error.to_string())),
+            )
+                .into_response()
         })?;
     if explicit_reasoning_effort.is_some()
         && converted_reasoning_effort.is_some()
@@ -1549,7 +1749,11 @@ async fn anthropic_messages(
         let error = ProviderError::InvalidRequest(
             "reasoning_effort conflicts with Anthropic thinking effort".to_string(),
         );
-        return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &error.to_string())),
+        )
+            .into_response());
     }
     let requested_reasoning_effort = explicit_reasoning_effort.or(converted_reasoning_effort);
     let reasoning = body
@@ -1563,6 +1767,13 @@ async fn anthropic_messages(
         &request_model,
     )
     .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    let service_tier = anthropic_service_tier(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &error.to_string())),
+        )
+            .into_response()
+    })?;
     let controls = generation_controls(
         reasoning,
         optional_string_field(&body, "safety_identifier").map_err(|error| {
@@ -1588,46 +1799,49 @@ async fn anthropic_messages(
         let provider = state.provider.clone();
         let request_model_clone = request_model.clone();
 
-        let result = task::spawn_blocking(move || {
-            let tools_ref = tools.as_deref();
-            let stop_ref = stop.as_deref();
-            let tc_ref = tool_choice_val.as_ref();
-            let text_ref = text_val.as_ref();
+        let prepared = task::spawn_blocking({
+            let provider = provider.clone();
+            move || {
+                let tools_ref = tools.as_deref();
+                let stop_ref = stop.as_deref();
+                let tc_ref = tool_choice_val.as_ref();
+                let text_ref = text_val.as_ref();
 
-            provider.chat_stream_with_controls(
-                &messages,
-                tools_ref,
-                None,
-                reasoning_effort.as_deref(),
-                max_tokens,
-                stop_ref,
-                None,
-                subagent.as_deref(),
-                memgen_request,
-                None,
-                Some(request_model_clone.as_str()),
-                tc_ref,
-                None,
-                text_ref,
-                None,
-                None,
-                responses_lite_val.as_ref(),
-                None,
-                &controls,
-            )
+                provider.prepare_chat_stream_with_controls(
+                    &messages,
+                    tools_ref,
+                    None,
+                    reasoning_effort.as_deref(),
+                    max_tokens,
+                    stop_ref,
+                    None,
+                    subagent.as_deref(),
+                    memgen_request,
+                    None,
+                    Some(request_model_clone.as_str()),
+                    tc_ref,
+                    service_tier.as_deref(),
+                    text_ref,
+                    None,
+                    None,
+                    responses_lite_val.as_ref(),
+                    None,
+                    &controls,
+                )
+            }
         })
         .await
         .unwrap();
 
-        let events = match result {
-            Ok(evts) => evts,
-            Err(e) => {
-                let status_code = match map_error_status(&e) {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let status_code = match map_error_status(&error) {
                     StatusCode::UNAUTHORIZED => 401u16,
                     StatusCode::INTERNAL_SERVER_ERROR => 500u16,
-                    s => s.as_u16(),
+                    status => status.as_u16(),
                 };
-                let body = format_anthropic_error(status_code, &e.to_string());
+                let body = format_anthropic_error(status_code, &error.to_string());
                 return Err((
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     Json(body),
@@ -1636,28 +1850,60 @@ async fn anthropic_messages(
             }
         };
 
-        let sse_strings = anthropic_stream_adapter(&events, &client_model, &request_id);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Event>(32);
+        let worker_sender = sender.clone();
+        let worker = task::spawn_blocking(move || {
+            let mut adapter = AnthropicStreamAdapter::new(&client_model, &request_id);
+            for chunk in adapter.start() {
+                worker_sender
+                    .blocking_send(anthropic_sse_event(&chunk))
+                    .map_err(|_| {
+                        ProviderError::Request("Anthropic SSE client disconnected".to_string())
+                    })?;
+            }
 
-        let sse_events: Vec<Result<Event, std::convert::Infallible>> = sse_strings
-            .into_iter()
-            .map(|chunk| {
-                let mut lines = chunk.trim_end_matches('\n').splitn(2, '\n');
-                let event_type = lines
-                    .next()
-                    .and_then(|l| l.strip_prefix("event: "))
-                    .unwrap_or("message")
-                    .to_string();
-                let data = lines
-                    .next()
-                    .and_then(|l| l.strip_prefix("data: "))
-                    .unwrap_or("")
-                    .to_string();
-                Ok(Event::default().event(event_type).data(data))
+            provider.stream_prepared_chat(prepared, |event| {
+                for chunk in adapter.push(&event) {
+                    worker_sender
+                        .blocking_send(anthropic_sse_event(&chunk))
+                        .map_err(|_| {
+                            ProviderError::Request("Anthropic SSE client disconnected".to_string())
+                        })?;
+                }
+                Ok(())
             })
-            .collect();
+        });
 
-        let sse = Sse::new(stream::iter(sse_events));
-        Ok(sse.into_response())
+        tokio::spawn(async move {
+            let error = match worker.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(ProviderError::Request(format!(
+                    "Anthropic SSE worker failed: {error}"
+                ))),
+            };
+            if let Some(error) = error {
+                let status_code = match map_error_status(&error) {
+                    StatusCode::UNAUTHORIZED => 401u16,
+                    StatusCode::INTERNAL_SERVER_ERROR => 500u16,
+                    status => status.as_u16(),
+                };
+                let _ = sender
+                    .send(anthropic_stream_error_event(
+                        status_code,
+                        &error.to_string(),
+                    ))
+                    .await;
+            }
+        });
+
+        let event_stream = stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|event| (Ok::<Event, std::convert::Infallible>(event), receiver))
+        });
+        Ok(Sse::new(event_stream).into_response())
     } else {
         let provider = state.provider.clone();
         let request_model_clone = request_model.clone();
@@ -1681,7 +1927,7 @@ async fn anthropic_messages(
                 None,
                 Some(request_model_clone.as_str()),
                 tc_ref,
-                None,
+                service_tier.as_deref(),
                 text_ref,
                 None,
                 None,
@@ -1694,7 +1940,7 @@ async fn anthropic_messages(
         .unwrap();
 
         let response = match result {
-            Ok(resp) => resp,
+            Ok(response) => response,
             Err(e) => {
                 let status_code = match map_error_status(&e) {
                     StatusCode::UNAUTHORIZED => 401u16,
@@ -1719,10 +1965,14 @@ async fn anthropic_messages(
 mod tests {
     use super::*;
     use crate::messages::{Message, MessageRole};
+    use axum::body::{Body, Bytes};
     use axum::http::header::CONTENT_TYPE;
+    use futures::StreamExt;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1910,6 +2160,230 @@ mod tests {
         (format!("http://{address}"), state, handle)
     }
 
+    #[derive(Clone)]
+    struct GatedSseState {
+        early_emitted: Arc<Semaphore>,
+        release_completion: Arc<Semaphore>,
+    }
+
+    async fn gated_sse_response(State(state): State<GatedSseState>) -> impl IntoResponse {
+        let body_stream = stream::unfold((0u8, state), |(stage, state)| async move {
+            match stage {
+                0 => {
+                    state.early_emitted.add_permits(1);
+                    let event = json!({
+                        "type": "response.output_text.delta",
+                        "delta": "early"
+                    });
+                    Some((
+                        Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&event).unwrap()
+                        ))),
+                        (1, state),
+                    ))
+                }
+                1 => {
+                    let permit = state.release_completion.acquire().await.unwrap();
+                    permit.forget();
+                    let output_item = json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "early"}]
+                        }
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-incremental",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 2,
+                                "output_tokens": 1,
+                                "total_tokens": 3
+                            }
+                        }
+                    });
+                    Some((
+                        Ok(Bytes::from(format!(
+                            "data: {}\n\ndata: {}\n\n",
+                            serde_json::to_string(&output_item).unwrap(),
+                            serde_json::to_string(&completed).unwrap()
+                        ))),
+                        (2, state),
+                    ))
+                }
+                _ => None,
+            }
+        });
+        (
+            [(CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(body_stream),
+        )
+    }
+
+    async fn start_gated_sse_upstream() -> (String, GatedSseState, JoinHandle<()>) {
+        let state = GatedSseState {
+            early_emitted: Arc::new(Semaphore::new(0)),
+            release_completion: Arc::new(Semaphore::new(0)),
+        };
+        let app = Router::new()
+            .route("/responses", post(gated_sse_response))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), state, handle)
+    }
+
+    async fn silent_sse_response() -> impl IntoResponse {
+        let body_stream = stream::pending::<Result<Bytes, std::convert::Infallible>>();
+        (
+            [(CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(body_stream),
+        )
+    }
+
+    async fn start_silent_sse_upstream() -> (String, JoinHandle<()>) {
+        let app = Router::new().route("/responses", post(silent_sse_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    async fn fixed_status_response(State(status): State<StatusCode>) -> impl IntoResponse {
+        (status, "upstream rejected request")
+    }
+
+    async fn start_fixed_status_upstream(status: u16) -> (String, JoinHandle<()>) {
+        let status = StatusCode::from_u16(status).unwrap();
+        let app = Router::new()
+            .route("/responses", post(fixed_status_response))
+            .with_state(status);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[derive(Clone, Default)]
+    struct AuthRetryState {
+        authorizations: Arc<Mutex<Vec<String>>>,
+        refresh_calls: Arc<AtomicUsize>,
+        fail_refresh: Arc<AtomicBool>,
+        always_unauthorized: Arc<AtomicBool>,
+    }
+
+    async fn auth_retry_responses(
+        State(state): State<AuthRetryState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        let authorization = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let request_number = {
+            let mut authorizations = state.authorizations.lock().unwrap();
+            authorizations.push(authorization);
+            authorizations.len()
+        };
+        if request_number == 1 || state.always_unauthorized.load(Ordering::SeqCst) {
+            return (StatusCode::UNAUTHORIZED, "expired access token").into_response();
+        }
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-auth-retry",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }
+        });
+        (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!("data: {}\n\n", serde_json::to_string(&completed).unwrap()),
+        )
+            .into_response()
+    }
+
+    async fn auth_retry_token(State(state): State<AuthRetryState>) -> axum::response::Response {
+        state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        if state.fail_refresh.load(Ordering::SeqCst) {
+            return (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
+        }
+        Json(json!({
+            "access_token": "header.eyJzdWIiOiJyZWZyZXNoZWQifQ.signature"
+        }))
+        .into_response()
+    }
+
+    async fn start_auth_retry_upstream() -> (String, AuthRetryState, JoinHandle<()>) {
+        let state = AuthRetryState::default();
+        let app = Router::new()
+            .route("/responses", post(auth_retry_responses))
+            .route("/token", post(auth_retry_token))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), state, handle)
+    }
+
+    struct EnvironmentGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvironmentGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    fn parse_anthropic_sse_blocks(pending: &mut String, parsed: &mut Vec<(String, Value)>) {
+        while let Some(end) = pending.find("\n\n") {
+            let block = pending[..end].to_string();
+            pending.drain(..end + 2);
+            if block.is_empty() {
+                continue;
+            }
+            let mut event_type = None;
+            let mut data = None;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    event_type = Some(value.to_string());
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data = Some(serde_json::from_str(value).unwrap());
+                }
+            }
+            parsed.push((event_type.unwrap(), data.unwrap()));
+        }
+    }
+
     fn parse_sse_json_events(body: &str) -> Vec<Value> {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -1957,13 +2431,28 @@ mod tests {
         state_model: &str,
         codex_config: CodexConfig,
     ) -> (String, PathBuf, JoinHandle<()>) {
+        start_api_server_with_timeout(
+            upstream_base_url,
+            state_model,
+            codex_config,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    async fn start_api_server_with_timeout(
+        upstream_base_url: &str,
+        state_model: &str,
+        codex_config: CodexConfig,
+        timeout: std::time::Duration,
+    ) -> (String, PathBuf, JoinHandle<()>) {
         let auth_path = write_test_auth_file();
         let auth_path_string = auth_path.to_string_lossy().to_string();
         let provider = ChatGPTOAuthProvider::new(
             state_model.to_string(),
             upstream_base_url.to_string(),
             Some(auth_path_string.clone()),
-            Some(std::time::Duration::from_secs(5)),
+            Some(timeout),
         );
         let app = create_router(AppState {
             model: state_model.to_string(),
@@ -2040,6 +2529,12 @@ mod tests {
         let base_body = json!({
             "model": "claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "Count this."}],
+            "context_management": {
+                "edits": [{
+                    "type": "clear_thinking_20251015",
+                    "keep": "all"
+                }]
+            },
             "multi_agent": null,
             "programmatic_tool_calling": null
         });
@@ -2094,6 +2589,432 @@ mod tests {
                 .unwrap();
             assert_eq!(invalid_response.status(), reqwest::StatusCode::BAD_REQUEST);
             let error: Value = invalid_response.json().await.unwrap();
+            assert_eq!(error["type"], json!("error"));
+            assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_count_tokens_reports_the_effective_requested_model_context() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let requested = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": "gpt-5.6",
+                "messages": [{"role": "user", "content": "Count this."}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(requested.status(), reqwest::StatusCode::OK);
+        let requested_body: Value = requested.json().await.unwrap();
+        assert_eq!(requested_body["context_window"], json!(372_000));
+        assert_eq!(requested_body["auto_compact_token_limit"], json!(334_800));
+
+        let fallback = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Count this."}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fallback.status(), reqwest::StatusCode::OK);
+        let fallback_body: Value = fallback.json().await.unwrap();
+        assert_eq!(fallback_body["context_window"], json!(272_000));
+        assert_eq!(fallback_body["auto_compact_token_limit"], json!(244_800));
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_route_uses_known_gpt_model_and_output_config_effort_then_falls_back_for_claude(
+    ) {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let gpt_response = client
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "gpt-5.6",
+                "max_tokens": 64,
+                "system": "You are precise.",
+                "messages": [{"role": "user", "content": "Use the requested GPT model."}],
+                "thinking": {"type": "enabled"},
+                "output_config": {"effort": "low"},
+                "speed": "fast",
+                "service_tier": "priority",
+                "context_management": {
+                    "edits": [{
+                        "type": "clear_thinking_20251015",
+                        "keep": "all"
+                    }]
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let gpt_status = gpt_response.status();
+        let gpt_body: Value = gpt_response.json().await.unwrap();
+        assert_eq!(gpt_status, reqwest::StatusCode::OK, "{gpt_body}");
+        assert_eq!(gpt_body["model"], json!("gpt-5.6"));
+
+        let claude_response = client
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "claude-opus-4-6",
+                "max_tokens": 64,
+                "system": "You are precise.",
+                "messages": [{"role": "user", "content": "Use the configured fallback."}],
+                "speed": "standard"
+            }))
+            .send()
+            .await
+            .unwrap();
+        let claude_status = claude_response.status();
+        let claude_body: Value = claude_response.json().await.unwrap();
+        assert_eq!(claude_status, reqwest::StatusCode::OK, "{claude_body}");
+        assert_eq!(claude_body["model"], json!("claude-opus-4-6"));
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].endpoint, RecordedEndpoint::Responses);
+        assert_eq!(requests[0].body["model"], json!("gpt-5.6-sol"));
+        assert_eq!(requests[0].body["reasoning"]["effort"], json!("low"));
+        assert_eq!(requests[0].body["service_tier"], json!("priority"));
+        assert_eq!(requests[1].endpoint, RecordedEndpoint::Responses);
+        assert_eq!(requests[1].body["model"], json!("gpt-5.5"));
+        assert!(requests[1].body.get("service_tier").is_none());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_route_preserves_url_images_and_tool_error_results_on_provider_wire() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "system": "You are precise.",
+                "tools": [{
+                    "name": "lookup",
+                    "strict": false,
+                    "defer_loading": null,
+                    "eager_input_streaming": false,
+                    "input_schema": {"type": "object"}
+                }],
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Inspect this image."},
+                        {"type": "image", "source": {
+                            "type": "url",
+                            "url": "https://example.com/direct.png"
+                        }}
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call-error", "name": "lookup", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call-error", "is_error": true, "content": [
+                            {"type": "text", "text": "command failed"},
+                            {"type": "image", "source": {
+                                "type": "url",
+                                "url": "https://example.com/result.png"
+                            }}
+                        ]}
+                    ]}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body: Value = response.json().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{response_body}");
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 1);
+        let input = requests[0].body["input"].as_array().unwrap();
+        let image_urls: Vec<&str> = input
+            .iter()
+            .filter_map(|item| item.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|content| {
+                if content.get("type").and_then(Value::as_str) == Some("input_image") {
+                    content.get("image_url").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            image_urls,
+            vec![
+                "https://example.com/direct.png",
+                "https://example.com/result.png"
+            ]
+        );
+        let tool_result = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .unwrap();
+        assert_eq!(tool_result["call_id"], json!("call-error"));
+        assert_eq!(tool_result["output"], json!("[tool_error]\ncommand failed"));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_routes_reject_unknown_context_management_before_upstream() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let invalid_values = [
+            json!({}),
+            json!({"edits": []}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "last"}]}),
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}], "extra": true}),
+            json!([{"type": "clear_thinking_20251015", "keep": "all"}]),
+        ];
+
+        for context_management in invalid_values {
+            let response = client
+                .post(format!("{api_url}/v1/messages"))
+                .json(&json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "Reject this control."}],
+                    "context_management": context_management
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["type"], json!("error"));
+            assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+        }
+
+        let count_response = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Reject this control."}],
+                "context_management": {"edits": []}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(count_response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let count_error: Value = count_response.json().await.unwrap();
+        assert_eq!(count_error["type"], json!("error"));
+        assert_eq!(count_error["error"]["type"], json!("invalid_request_error"));
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_route_rejects_unrepresentable_latest_controls_before_upstream() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let invalid_controls = [
+            json!({"output_config": {"effort": ""}}),
+            json!({"output_config": {"effort": 42}}),
+            json!({"output_config": {"effort": "ultra"}}),
+            json!({"output_config": {"effort": "low", "experimental": true}}),
+            json!({"output_config": {"task_budget": {"type": "tokens", "total": 20_000}}}),
+            json!({
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "high"}
+            }),
+            json!({
+                "reasoning_effort": "high",
+                "output_config": {"effort": "low"}
+            }),
+            json!({
+                "tools": [{
+                    "name": "lookup",
+                    "strict": true,
+                    "input_schema": {"type": "object"}
+                }]
+            }),
+            json!({
+                "messages": [{"role": "user", "content": [{
+                    "type": "image",
+                    "source": {"type": "url", "url": ""}
+                }]}]
+            }),
+            json!({
+                "messages": [{"role": "user", "content": [{"type": "image"}]}]
+            }),
+            json!({
+                "messages": [{"role": "user", "content": [{
+                    "type": "image",
+                    "source": "not-an-object"
+                }]}]
+            }),
+            json!({
+                "messages": [{"role": "user", "content": [{
+                    "type": "image",
+                    "source": {"type": "file", "file_id": "file-1"}
+                }]}]
+            }),
+        ];
+
+        for controls in invalid_controls {
+            let mut body = json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Reject this effort."}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let response = client
+                .post(format!("{api_url}/v1/messages"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["type"], json!("error"));
+            assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_endpoints_reject_conflicting_output_formats_before_upstream() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for endpoint in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/messages/compact",
+        ] {
+            let response = client
+                .post(format!("{api_url}{endpoint}"))
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "Reject this format."}],
+                    "output_format": {"type": "json_object"},
+                    "output_config": {
+                        "format": {"type": "json_schema", "schema": {"type": "object"}}
+                    }
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "endpoint {endpoint} accepted conflicting output formats"
+            );
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_route_rejects_invalid_or_conflicting_speed_before_upstream() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let invalid_controls = [
+            json!({"speed": "turbo"}),
+            json!({"speed": true}),
+            json!({"speed": "fast", "service_tier": "default"}),
+            json!({"speed": "standard", "service_tier": "fast"}),
+            json!({"service_tier": ""}),
+        ];
+
+        for controls in invalid_controls {
+            let mut body = json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Reject this speed."}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let response = client
+                .post(format!("{api_url}/v1/messages"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let error: Value = response.json().await.unwrap();
             assert_eq!(error["type"], json!("error"));
             assert_eq!(error["error"]["type"], json!("invalid_request_error"));
         }
@@ -2643,6 +3564,278 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_forwards_translated_delta_before_upstream_completion() {
+        let (upstream_url, gated, upstream_handle) = start_gated_sse_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "system": "Be precise.",
+                "messages": [{"role": "user", "content": "Stream the answer."}],
+                "max_tokens": 64,
+                "stream": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            gated.early_emitted.acquire(),
+        )
+        .await
+        .expect("upstream did not emit its early event")
+        .unwrap()
+        .forget();
+
+        let mut body_stream = response.bytes_stream();
+        let mut pending = String::new();
+        let mut events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let chunk = body_stream.next().await.unwrap().unwrap();
+                pending.push_str(std::str::from_utf8(&chunk).unwrap());
+                parse_anthropic_sse_blocks(&mut pending, &mut events);
+                if events.last().is_some_and(|(_, data)| {
+                    data.get("type").and_then(Value::as_str) == Some("content_block_delta")
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("translated early event was not delivered before upstream completion");
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|(event_type, _)| event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert_eq!(events[0].1["type"], json!("message_start"));
+        assert_eq!(events[1].1["type"], json!("content_block_start"));
+        assert_eq!(events[1].1["content_block"]["type"], json!("text"));
+        assert_eq!(events[2].1["type"], json!("content_block_delta"));
+        assert_eq!(events[2].1["delta"]["type"], json!("text_delta"));
+        assert_eq!(events[2].1["delta"]["text"], json!("early"));
+
+        gated.release_completion.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.unwrap();
+                pending.push_str(std::str::from_utf8(&chunk).unwrap());
+                parse_anthropic_sse_blocks(&mut pending, &mut events);
+            }
+        })
+        .await
+        .expect("translated stream did not terminate after upstream completion");
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .map(|(event_type, _)| event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(events[3].1["type"], json!("content_block_stop"));
+        assert_eq!(events[4].1["type"], json!("message_delta"));
+        assert_eq!(events[4].1["delta"]["stop_reason"], json!("end_turn"));
+        assert_eq!(events[5].1["type"], json!("message_stop"));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_times_out_a_silent_upstream_and_closes_the_worker() {
+        let (upstream_url, upstream_handle) = start_silent_sse_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server_with_timeout(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "system": "Be precise.",
+                "messages": [{"role": "user", "content": "Wait for the stream."}],
+                "max_tokens": 64,
+                "stream": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), response.text())
+            .await
+            .expect("silent upstream did not release its blocking worker")
+            .unwrap();
+        let mut pending = body;
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events[0].0, "message_start");
+        assert_eq!(events.last().unwrap().0, "error");
+        assert_eq!(
+            events.last().unwrap().1["error"]["type"],
+            json!("api_error")
+        );
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_preserves_upstream_retry_status_errors() {
+        for (status, expected_error_type) in [(429, "rate_limit_error"), (529, "overloaded_error")]
+        {
+            let (upstream_url, upstream_handle) = start_fixed_status_upstream(status).await;
+            let (api_url, auth_path, api_handle) = start_api_server(
+                &upstream_url,
+                "gpt-5.5",
+                test_codex_config(None, None, None),
+            )
+            .await;
+            let response = reqwest::Client::new()
+                .post(format!("{api_url}/v1/messages"))
+                .json(&json!({
+                    "model": "claude-sonnet-4-6",
+                    "system": "Be precise.",
+                    "messages": [{"role": "user", "content": "Trigger the error."}],
+                    "max_tokens": 64,
+                    "stream": true,
+                    "responses_lite": false
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let mut pending = response.text().await.unwrap();
+            let mut events = Vec::new();
+            parse_anthropic_sse_blocks(&mut pending, &mut events);
+            assert!(pending.is_empty());
+            assert_eq!(events[0].0, "message_start");
+            assert_eq!(events.last().unwrap().0, "error");
+            assert_eq!(
+                events.last().unwrap().1["error"]["type"],
+                json!(expected_error_type)
+            );
+
+            api_handle.abort();
+            upstream_handle.abort();
+            std::fs::remove_file(auth_path).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_refreshes_once_and_surfaces_refresh_authentication_failures() {
+        let (upstream_url, upstream_state, upstream_handle) = start_auth_retry_upstream().await;
+        let _refresh_url = EnvironmentGuard::set(
+            crate::auth::REFRESH_URL_OVERRIDE_ENV,
+            &format!("{upstream_url}/token"),
+        );
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let request = || {
+            client.post(format!("{api_url}/v1/messages")).json(&json!({
+                "model": "claude-sonnet-4-6",
+                "system": "Be precise.",
+                "messages": [{"role": "user", "content": "Exercise auth retry."}],
+                "max_tokens": 64,
+                "stream": true,
+                "responses_lite": false
+            }))
+        };
+
+        let refreshed = request().send().await.unwrap();
+        assert_eq!(refreshed.status(), reqwest::StatusCode::OK);
+        let mut pending = refreshed.text().await.unwrap();
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events.last().unwrap().0, "message_stop");
+        assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            upstream_state.authorizations.lock().unwrap().as_slice(),
+            [
+                "Bearer header.e30.signature",
+                "Bearer header.eyJzdWIiOiJyZWZyZXNoZWQifQ.signature"
+            ]
+        );
+
+        upstream_state
+            .always_unauthorized
+            .store(true, Ordering::SeqCst);
+        let rejected_after_refresh = request().send().await.unwrap();
+        assert_eq!(rejected_after_refresh.status(), reqwest::StatusCode::OK);
+        let mut pending = rejected_after_refresh.text().await.unwrap();
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events.last().unwrap().0, "error");
+        assert_eq!(
+            events.last().unwrap().1["error"]["type"],
+            json!("authentication_error")
+        );
+        assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream_state.authorizations.lock().unwrap().len(), 4);
+
+        upstream_state.fail_refresh.store(true, Ordering::SeqCst);
+        let failed_refresh = request().send().await.unwrap();
+        assert_eq!(failed_refresh.status(), reqwest::StatusCode::OK);
+        let mut pending = failed_refresh.text().await.unwrap();
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events.last().unwrap().0, "error");
+        assert_eq!(
+            events.last().unwrap().1["error"]["type"],
+            json!("authentication_error")
+        );
+        assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(upstream_state.authorizations.lock().unwrap().len(), 5);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn invalid_responses_lite_request_returns_bad_request_before_upstream() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
@@ -2885,6 +4078,152 @@ mod tests {
             ])
         );
         assert!(requests[0].body.get("instructions").is_none());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_compact_routes_known_gpt_model_and_falls_back_for_claude_model() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for model in ["gpt-5.6", "claude-fable-5"] {
+            let response = client
+                .post(format!("{api_url}/v1/messages/compact"))
+                .json(&json!({
+                    "model": model,
+                    "system": "Compact precisely.",
+                    "messages": [{"role": "user", "content": "History"}],
+                    "speed": if model == "gpt-5.6" { "fast" } else { "standard" },
+                    "responses_lite": "auto"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+
+        let native = client
+            .post(format!("{api_url}/v1/compact"))
+            .json(&json!({
+                "messages": [
+                    {"role": "system", "content": "Compact precisely."},
+                    {"role": "user", "content": "Native history"}
+                ],
+                "speed": "fast",
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(native.status(), reqwest::StatusCode::OK);
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].endpoint, RecordedEndpoint::Compact);
+        assert_eq!(requests[0].body["model"], json!("gpt-5.6-sol"));
+        assert_eq!(requests[0].body["service_tier"], json!("priority"));
+        assert_eq!(requests[1].endpoint, RecordedEndpoint::Compact);
+        assert_eq!(requests[1].body["model"], json!("gpt-5.5"));
+        assert!(requests[1].body.get("service_tier").is_none());
+        assert_eq!(requests[2].endpoint, RecordedEndpoint::Compact);
+        assert!(requests[2].body.get("service_tier").is_none());
+
+        let conflicting_effort = client
+            .post(format!("{api_url}/v1/messages/compact"))
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "system": "Compact precisely.",
+                "messages": [{"role": "user", "content": "History"}],
+                "reasoning_effort": "high",
+                "output_config": {"effort": "low"},
+                "responses_lite": "auto"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            conflicting_effort.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(recording.requests().len(), 3);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_compact_wires_converted_output_format_and_rejects_text_conflicts() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+
+        let response = client
+            .post(format!("{api_url}/v1/messages/compact"))
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "system": "Compact precisely.",
+                "messages": [{"role": "user", "content": "History"}],
+                "output_config": {
+                    "format": {"type": "json_schema", "schema": schema.clone()}
+                },
+                "text": {"verbosity": "high"},
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body["text"],
+            json!({
+                "verbosity": "high",
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "schema": schema
+                }
+            })
+        );
+
+        let conflicting = client
+            .post(format!("{api_url}/v1/messages/compact"))
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "system": "Compact precisely.",
+                "messages": [{"role": "user", "content": "History"}],
+                "output_config": {
+                    "format": {"type": "json_schema", "schema": {"type": "object"}}
+                },
+                "text": {"format": {"type": "json_object"}},
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflicting.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(recording.requests().len(), 1);
 
         api_handle.abort();
         upstream_handle.abort();

@@ -239,6 +239,38 @@ class TestAnthropicRequestToInternal:
         assert tools[0].name == "get_weather"
         assert tools[0].parameters == {"type": "object", "properties": {"city": {"type": "string"}}}
 
+    @pytest.mark.parametrize("field", ["strict", "defer_loading", "eager_input_streaming"])
+    def test_enabled_beta_tool_fields_fail_loudly(self, field):
+        with pytest.raises(ValueError, match=field):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object"},
+                        field: True,
+                    }
+                ],
+            )
+
+    def test_disabled_beta_tool_fields_are_semantic_noops(self):
+        _, tools, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[
+                {
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "strict": False,
+                    "defer_loading": False,
+                    "eager_input_streaming": None,
+                }
+            ],
+        )
+        assert tools is not None
+        assert tools[0].name == "lookup"
+
     def test_tool_choice_auto(self):
         _, _, tc, _, _, _ = anthropic_request_to_internal(
             model="test",
@@ -350,6 +382,42 @@ class TestAnthropicRequestToInternal:
         )
         assert effort == "none"
 
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_output_config_effort_overrides_adaptive_thinking(self, effort):
+        _, _, _, _, converted, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking={"type": "adaptive", "display": "omitted"},
+            output_config={"effort": effort},
+        )
+        assert converted == effort
+
+    def test_output_config_effort_conflicts_with_disabled_thinking(self):
+        with pytest.raises(ValueError, match="thinking.disabled"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                thinking={"type": "disabled"},
+                output_config={"effort": "high"},
+            )
+
+    def test_output_config_task_budget_fails_loudly(self):
+        with pytest.raises(ValueError, match="task_budget"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                output_config={"task_budget": {"type": "tokens", "total": 20_000}},
+            )
+
+    @pytest.mark.parametrize("output_config", [{"effort": "ultra"}, {"future_control": True}])
+    def test_unknown_output_config_values_fail_loudly(self, output_config):
+        with pytest.raises(ValueError, match="output_config"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                output_config=output_config,
+            )
+
     def test_output_format_json_schema_maps_to_text_format(self):
         _, _, _, _, _, text = anthropic_request_to_internal(
             model="test",
@@ -369,6 +437,37 @@ class TestAnthropicRequestToInternal:
                 "strict": False,
             },
         }
+
+    def test_output_config_format_maps_without_top_level_alias(self):
+        _, _, _, _, _, text = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            output_config={"format": {"type": "json_object"}},
+        )
+        assert text == {"format": {"type": "json_object"}}
+
+    @pytest.mark.parametrize(
+        ("output_format", "output_config"),
+        [
+            ("json", None),
+            (None, {"format": "json"}),
+            ({"type": "future"}, None),
+            ({"type": "json_object", "extra": True}, None),
+            ({"type": "json_schema", "schema": {}, "strict": "yes"}, None),
+            (
+                {"type": "json_object"},
+                {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+            ),
+        ],
+    )
+    def test_invalid_or_conflicting_output_formats_fail_loudly(self, output_format, output_config):
+        with pytest.raises(ValueError, match=r"output_(?:format|config\.format)"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                output_format=output_format,
+                output_config=output_config,
+            )
 
     def test_stop_sequences(self):
         _, _, _, stop, _, _ = anthropic_request_to_internal(
@@ -403,6 +502,41 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "What is in this image?"
         assert len(messages[0].images) == 1
         assert messages[0].images[0] == "data:image/png;base64,iVBORw0KGgoAAAANS"
+
+    def test_user_url_image_block(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": "https://example.com/image.png"},
+                        }
+                    ],
+                }
+            ],
+        )
+        assert messages[0].images == ("https://example.com/image.png",)
+
+    @pytest.mark.parametrize(
+        "source",
+        [None, "image.png", {}, {"type": "file", "file_id": "file-1"}],
+    )
+    def test_missing_or_unsupported_image_sources_fail_loudly(self, source):
+        direct = {"type": "image", "source": source}
+        tool_result = {
+            "type": "tool_result",
+            "tool_use_id": "call-image",
+            "content": [direct],
+        }
+        for block in (direct, tool_result):
+            with pytest.raises(ValueError, match="image source"):
+                anthropic_request_to_internal(
+                    model="test",
+                    messages=[{"role": "user", "content": [block]}],
+                )
 
     def test_tool_result_with_content_blocks(self):
         messages, _, _, _, _, _ = anthropic_request_to_internal(
@@ -482,6 +616,35 @@ class TestAnthropicRequestToInternal:
         assert messages[0].content == "file contents"
         assert messages[1].role is MessageRole.USER
         assert messages[1].images[0] == "data:image/jpeg;base64,/9j/4AAQ"
+
+    def test_tool_result_url_image_and_error_state_are_preserved(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-error",
+                            "is_error": True,
+                            "content": [
+                                {"type": "text", "text": "failed"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/failure.png"},
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+        assert len(messages) == 2
+        assert messages[0].role is MessageRole.TOOL
+        assert messages[0].content == "[tool_error]\nfailed"
+        assert messages[1].role is MessageRole.USER
+        assert messages[1].images == ("https://example.com/failure.png",)
 
 
 # ---------------------------------------------------------------------------

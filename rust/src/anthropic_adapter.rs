@@ -4,14 +4,17 @@ use std::collections::HashMap;
 
 pub fn anthropic_request_to_internal(
     body: &Value,
-) -> (
-    Vec<Message>,
-    Option<Vec<ToolSchema>>,
-    Option<Value>,
-    Option<Vec<String>>,
-    Option<String>,
-    Option<Value>,
-) {
+) -> Result<
+    (
+        Vec<Message>,
+        Option<Vec<ToolSchema>>,
+        Option<Value>,
+        Option<Vec<String>>,
+        Option<String>,
+        Option<Value>,
+    ),
+    String,
+> {
     let mut messages: Vec<Message> = Vec::new();
 
     let system = body.get("system");
@@ -37,18 +40,23 @@ pub fn anthropic_request_to_internal(
             let empty = Value::String(String::new());
             let content = msg.get("content").unwrap_or(&empty);
             if role == "user" {
-                convert_user_message(content, &mut messages);
+                convert_user_message(content, &mut messages)?;
             } else if role == "assistant" {
                 convert_assistant_message(content, &mut messages);
             }
         }
     }
 
-    let tools = body
+    let tools = if let Some(tools) = body
         .get("tools")
         .and_then(|v| v.as_array())
         .filter(|a| !a.is_empty())
-        .map(|arr| convert_tools(arr));
+    {
+        validate_anthropic_tool_controls(tools)?;
+        Some(convert_tools(tools))
+    } else {
+        None
+    };
 
     let tool_choice = body.get("tool_choice").map(|tc| convert_tool_choice(tc));
 
@@ -61,11 +69,11 @@ pub fn anthropic_request_to_internal(
                 .collect()
         });
 
-    let reasoning_effort = body.get("thinking").map(|t| convert_thinking(t)).flatten();
+    let reasoning_effort = convert_reasoning_effort(body)?;
     let text =
-        anthropic_output_format_from_body(body).and_then(anthropic_output_format_to_openai_text);
+        anthropic_output_format_from_body(body)?.and_then(anthropic_output_format_to_openai_text);
 
-    (messages, tools, tool_choice, stop, reasoning_effort, text)
+    Ok((messages, tools, tool_choice, stop, reasoning_effort, text))
 }
 
 fn extract_system_text(system: &Value) -> String {
@@ -92,7 +100,7 @@ fn extract_system_text(system: &Value) -> String {
     }
 }
 
-fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
+fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), String> {
     match content {
         Value::String(s) => {
             out.push(Message {
@@ -138,8 +146,11 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                             .unwrap_or("tool-call")
                             .to_string();
                         let raw_content = block.get("content").unwrap_or(&Value::Null);
-                        let (result_content, tool_result_images) =
-                            extract_tool_result_content_with_images(raw_content);
+                        let (mut result_content, tool_result_images) =
+                            extract_tool_result_content_with_images(raw_content)?;
+                        if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                            result_content = format!("[tool_error]\n{result_content}");
+                        }
                         out.push(Message {
                             role: MessageRole::Tool,
                             content: result_content,
@@ -164,17 +175,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
                         }
                     }
                     "image" => {
-                        if let Some(source) = block.get("source").and_then(|v| v.as_object()) {
-                            if source.get("type").and_then(|v| v.as_str()) == Some("base64") {
-                                let media_type = source
-                                    .get("media_type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("image/png");
-                                let data =
-                                    source.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                                image_urls.push(format!("data:{};base64,{}", media_type, data));
-                            }
-                        }
+                        image_urls.push(anthropic_image_source_url(block.get("source"))?);
                     }
                     _ => {
                         let rendered = render_anthropic_content_block(block);
@@ -199,10 +200,13 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) {
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<String>) {
-    match content {
+fn extract_tool_result_content_with_images(
+    content: &Value,
+) -> Result<(String, Vec<String>), String> {
+    Ok(match content {
         Value::String(s) => (s.clone(), vec![]),
         Value::Array(arr) => {
             let mut text_pieces: Vec<String> = Vec::new();
@@ -214,16 +218,7 @@ fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<Stri
                         text_pieces.push(t.to_string());
                     }
                 } else if typ == "image" {
-                    if let Some(source) = p.get("source").and_then(|v| v.as_object()) {
-                        if source.get("type").and_then(|v| v.as_str()) == Some("base64") {
-                            let media_type = source
-                                .get("media_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("image/png");
-                            let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                            images.push(format!("data:{};base64,{}", media_type, data));
-                        }
-                    }
+                    images.push(anthropic_image_source_url(p.get("source"))?);
                 } else {
                     let rendered = render_anthropic_content_block(p);
                     if !rendered.is_empty() {
@@ -235,6 +230,42 @@ fn extract_tool_result_content_with_images(content: &Value) -> (String, Vec<Stri
         }
         Value::Null => (String::new(), vec![]),
         other => (other.to_string(), vec![]),
+    })
+}
+
+fn anthropic_image_source_url(source: Option<&Value>) -> Result<String, String> {
+    let source = source
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Anthropic image block requires an object source".to_string())?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = match source.get("media_type") {
+                None => "image/png",
+                Some(Value::String(media_type)) => media_type,
+                Some(_) => {
+                    return Err(
+                        "Anthropic base64 image source requires a string media_type".to_string()
+                    );
+                }
+            };
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| {
+                    "Anthropic base64 image source requires non-empty data".to_string()
+                })?;
+            Ok(format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => {
+            let url = source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| "Anthropic URL image source requires a non-empty url".to_string())?;
+            Ok(url.to_string())
+        }
+        _ => Err("Anthropic image source type must be one of: base64, url".to_string()),
     }
 }
 
@@ -364,6 +395,28 @@ fn convert_tools(tools: &[Value]) -> Vec<ToolSchema> {
     result
 }
 
+fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        for field in ["strict", "defer_loading", "eager_input_streaming"] {
+            match tool.get(field) {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+                Some(Value::Bool(true)) => {
+                    return Err(format!(
+                        "tool.{field}=true is not supported by the Codex OAuth backend"
+                    ));
+                }
+                Some(_) => {
+                    return Err(format!("tool.{field} must be a boolean when provided"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_anthropic_web_search_tool(tool: &Value) -> bool {
     tool.get("name").and_then(|v| v.as_str()) == Some("web_search")
         && tool
@@ -439,11 +492,121 @@ fn convert_thinking(thinking: &Value) -> Option<String> {
     }
 }
 
-fn anthropic_output_format_from_body(body: &Value) -> Option<&Value> {
-    body.get("output_format").or_else(|| {
-        body.get("output_config")
-            .and_then(|output_config| output_config.get("format"))
-    })
+fn convert_reasoning_effort(body: &Value) -> Result<Option<String>, String> {
+    let thinking_effort = body.get("thinking").and_then(convert_thinking);
+    let output_config = match body.get("output_config") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(output_config)) => Some(output_config),
+        Some(_) => return Err("output_config must be an object".to_string()),
+    };
+    if let Some(unknown_field) = output_config.and_then(|output_config| {
+        output_config
+            .keys()
+            .find(|field| !matches!(field.as_str(), "effort" | "format" | "task_budget"))
+    }) {
+        return Err(format!(
+            "output_config.{unknown_field} is not supported by the Codex OAuth backend"
+        ));
+    }
+    if output_config
+        .and_then(|output_config| output_config.get("task_budget"))
+        .is_some_and(|task_budget| !task_budget.is_null())
+    {
+        return Err(
+            "output_config.task_budget is not supported by the Codex OAuth backend".to_string(),
+        );
+    }
+    let output_effort = output_config.and_then(|output_config| output_config.get("effort"));
+
+    match output_effort {
+        None | Some(Value::Null) => Ok(thinking_effort),
+        Some(Value::String(effort)) if effort.trim().is_empty() => {
+            Err("output_config.effort must be a non-empty string when provided".to_string())
+        }
+        Some(Value::String(_)) if thinking_effort.as_deref() == Some("none") => {
+            Err("output_config.effort cannot be used when thinking.type is disabled".to_string())
+        }
+        Some(Value::String(effort))
+            if matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") =>
+        {
+            Ok(Some(effort.clone()))
+        }
+        Some(Value::String(_)) => {
+            Err("output_config.effort must be one of: low, medium, high, xhigh, max".to_string())
+        }
+        Some(_) => Err("output_config.effort must be a non-empty string when provided".to_string()),
+    }
+}
+
+fn anthropic_output_format_from_body(body: &Value) -> Result<Option<&Value>, String> {
+    let top_level = body.get("output_format").filter(|value| !value.is_null());
+    let nested = body
+        .get("output_config")
+        .and_then(Value::as_object)
+        .and_then(|output_config| output_config.get("format"))
+        .filter(|value| !value.is_null());
+
+    if top_level.is_some() && nested.is_some() && top_level != nested {
+        return Err("output_format conflicts with output_config.format".to_string());
+    }
+
+    let (field, selected) = if let Some(output_format) = top_level {
+        ("output_format", output_format)
+    } else if let Some(output_format) = nested {
+        ("output_config.format", output_format)
+    } else {
+        return Ok(None);
+    };
+    validate_anthropic_output_format(field, selected)?;
+    Ok(Some(selected))
+}
+
+fn validate_anthropic_output_format(field: &str, output_format: &Value) -> Result<(), String> {
+    let object = output_format
+        .as_object()
+        .ok_or_else(|| format!("{field} must be an object when provided"))?;
+    let format_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{field}.type must be a string"))?;
+
+    let allowed_fields: &[&str] = match format_type {
+        "json_object" => &["type"],
+        "json_schema" => &["type", "schema", "name", "description", "strict"],
+        _ => {
+            return Err(format!(
+                "{field}.type must be one of: json_object, json_schema"
+            ));
+        }
+    };
+    if let Some(unknown_field) = object
+        .keys()
+        .find(|key| !allowed_fields.contains(&key.as_str()))
+    {
+        return Err(format!("{field}.{unknown_field} is not supported"));
+    }
+    if format_type == "json_schema" && !object.get("schema").is_some_and(Value::is_object) {
+        return Err(format!("{field}.schema must be an object"));
+    }
+    if object
+        .get("name")
+        .is_some_and(|value| !value.as_str().is_some_and(|name| !name.is_empty()))
+    {
+        return Err(format!("{field}.name must be a non-empty string"));
+    }
+    if object
+        .get("description")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(format!("{field}.description must be a string"));
+    }
+    if object
+        .get("strict")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(format!("{field}.strict must be a boolean"));
+    }
+    Ok(())
 }
 
 pub fn anthropic_output_format_to_openai_text(output_format: &Value) -> Option<Value> {
@@ -772,21 +935,50 @@ fn map_stop_reason(finish_reason: &str, has_tool_calls: bool) -> &'static str {
     }
 }
 
-pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    out.push(message_start_sse(
-        model,
-        request_id,
-        &json!({"input_tokens": 0, "output_tokens": 0}),
-    ));
+pub struct AnthropicStreamAdapter {
+    model: String,
+    request_id: String,
+    started: bool,
+    block_index: u32,
+    current_block: Option<&'static str>,
+    has_any_content: bool,
+    has_tool_calls: bool,
+    web_search_requests: usize,
+}
 
-    let mut block_index: u32 = 0;
-    let mut current_block: Option<&'static str> = None;
-    let mut has_any_content = false;
-    let mut has_tool_calls = false;
-    let mut web_search_requests: usize = 0;
+impl AnthropicStreamAdapter {
+    pub fn new(model: &str, request_id: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            request_id: request_id.to_string(),
+            started: false,
+            block_index: 0,
+            current_block: None,
+            has_any_content: false,
+            has_tool_calls: false,
+            web_search_requests: 0,
+        }
+    }
 
-    for event in events {
+    pub fn start(&mut self) -> Vec<String> {
+        if self.started {
+            return vec![];
+        }
+        self.started = true;
+        vec![message_start_sse(
+            &self.model,
+            &self.request_id,
+            &json!({"input_tokens": 0, "output_tokens": 0}),
+        )]
+    }
+
+    pub fn push(&mut self, event: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut block_index = self.block_index;
+        let mut current_block = self.current_block;
+        let mut has_any_content = self.has_any_content;
+        let mut has_tool_calls = self.has_tool_calls;
+        let mut web_search_requests = self.web_search_requests;
         let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match typ {
@@ -1065,8 +1257,23 @@ pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str)
 
             _ => {}
         }
-    }
 
+        self.block_index = block_index;
+        self.current_block = current_block;
+        self.has_any_content = has_any_content;
+        self.has_tool_calls = has_tool_calls;
+        self.web_search_requests = web_search_requests;
+        out
+    }
+}
+
+#[cfg(test)]
+pub fn anthropic_stream_adapter(events: &[Value], model: &str, request_id: &str) -> Vec<String> {
+    let mut adapter = AnthropicStreamAdapter::new(model, request_id);
+    let mut out = adapter.start();
+    for event in events {
+        out.extend(adapter.push(event));
+    }
     out
 }
 
@@ -1194,7 +1401,7 @@ mod tests {
             "messages": [],
             "system": "You are a helpful assistant.",
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::System);
         assert_eq!(msgs[0].content, "You are a helpful assistant.");
@@ -1209,7 +1416,7 @@ mod tests {
                 {"type": "text", "text": "Part two."},
             ],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].content, "Part one.\n\nPart two.");
     }
 
@@ -1222,7 +1429,7 @@ mod tests {
                 {"type": "text", "text": "Only text."},
             ],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].content, "Only text.");
     }
 
@@ -1231,7 +1438,7 @@ mod tests {
         let body = json!({
             "messages": [{"role": "user", "content": "Hello"}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::User);
         assert_eq!(msgs[0].content, "Hello");
@@ -1245,7 +1452,7 @@ mod tests {
                 {"type": "text", "text": "world"},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello world");
     }
@@ -1258,7 +1465,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "call-1", "content": "result"},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::User);
         assert_eq!(msgs[0].content, "Before");
@@ -1277,7 +1484,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].content, "part A part B");
@@ -1292,7 +1499,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].tool_call_id, Some("call-img".to_string()));
@@ -1312,12 +1519,130 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert_eq!(msgs[0].content, "file contents");
         assert_eq!(msgs[1].role, MessageRole::User);
         assert_eq!(msgs[1].images[0], "data:image/jpeg;base64,/9j/4AAQ");
+    }
+
+    #[test]
+    fn test_url_images_map_in_direct_and_tool_result_content() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/direct.png"}},
+                {"type": "tool_result", "tool_use_id": "call-url", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/result.png"}}
+                ]}
+            ]}],
+        });
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, MessageRole::User);
+        assert_eq!(msgs[0].images, vec!["https://example.com/direct.png"]);
+        assert_eq!(msgs[1].role, MessageRole::Tool);
+        assert_eq!(msgs[1].tool_call_id, Some("call-url".to_string()));
+        assert_eq!(msgs[2].role, MessageRole::User);
+        assert_eq!(msgs[2].images, vec!["https://example.com/result.png"]);
+    }
+
+    #[test]
+    fn test_malformed_known_image_sources_fail_loudly_in_direct_content() {
+        for (source, expected_error) in [
+            (
+                json!({"type": "url", "url": ""}),
+                "Anthropic URL image source requires a non-empty url",
+            ),
+            (
+                json!({"type": "url", "url": 42}),
+                "Anthropic URL image source requires a non-empty url",
+            ),
+            (
+                json!({"type": "base64", "data": ""}),
+                "Anthropic base64 image source requires non-empty data",
+            ),
+            (
+                json!({"type": "base64", "media_type": 42, "data": "AAAA"}),
+                "Anthropic base64 image source requires a string media_type",
+            ),
+        ] {
+            let body = json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": source}
+                ]}]
+            });
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_non_object_and_unknown_image_sources_fail_loudly() {
+        for (image, expected_error) in [
+            (
+                json!({"type": "image"}),
+                "Anthropic image block requires an object source",
+            ),
+            (
+                json!({"type": "image", "source": "not-an-object"}),
+                "Anthropic image block requires an object source",
+            ),
+            (
+                json!({"type": "image", "source": {}}),
+                "Anthropic image source type must be one of: base64, url",
+            ),
+            (
+                json!({"type": "image", "source": {"type": "file", "file_id": "file-1"}}),
+                "Anthropic image source type must be one of: base64, url",
+            ),
+        ] {
+            let body = json!({
+                "messages": [{"role": "user", "content": [image]}]
+            });
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_known_image_source_fails_loudly_in_tool_result() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call-image",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "url", "url": null}
+                }]
+            }]}]
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&body).unwrap_err(),
+            "Anthropic URL image source requires a non-empty url"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_error_preserves_explicit_prefix() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-error",
+                    "is_error": true,
+                    "content": [{"type": "text", "text": "command failed"}]
+                }
+            ]}],
+        });
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, MessageRole::Tool);
+        assert_eq!(msgs[0].content, "[tool_error]\ncommand failed");
     }
 
     #[test]
@@ -1327,7 +1652,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "", "content": "x"},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].tool_call_id, Some("tool-call".to_string()));
     }
 
@@ -1336,7 +1661,7 @@ mod tests {
         let body = json!({
             "messages": [{"role": "assistant", "content": "I can help."}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].role, MessageRole::Assistant);
         assert_eq!(msgs[0].content, "I can help.");
     }
@@ -1349,7 +1674,7 @@ mod tests {
                 {"type": "tool_use", "id": "tc-1", "name": "search", "input": {"q": "rust"}},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].content, "Calling tool.");
         assert_eq!(msgs[0].tool_calls.len(), 1);
         assert_eq!(msgs[0].tool_calls[0].id, "tc-1");
@@ -1368,7 +1693,7 @@ mod tests {
                 {"type": "text", "text": "Answer."},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(
             msgs[0].reasoning_content,
             Some("Let me think...".to_string())
@@ -1387,7 +1712,7 @@ mod tests {
                 {"type": "text", "text": "Summary"},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert!(msgs[0].content.contains("server_tool_use: web_search"));
         assert!(msgs[0].content.contains("https://example.com"));
         assert!(msgs[0].content.contains("Summary"));
@@ -1403,7 +1728,7 @@ mod tests {
                 ]},
             ]}],
         });
-        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].role, MessageRole::Tool);
         assert!(msgs[0].content.contains("Docs"));
         assert!(msgs[0].content.contains("document body"));
@@ -1419,7 +1744,7 @@ mod tests {
                 "input_schema": {"type": "object", "properties": {"location": {"type": "string"}}},
             }],
         });
-        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         let tools = tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "get_weather");
@@ -1428,44 +1753,81 @@ mod tests {
     }
 
     #[test]
+    fn test_false_and_null_tool_controls_are_noops() {
+        let body = json!({
+            "messages": [],
+            "tools": [{
+                "name": "get_weather",
+                "strict": false,
+                "defer_loading": null,
+                "eager_input_streaming": false,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}}
+                }
+            }],
+        });
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(tools.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_true_tool_controls_fail_loudly() {
+        for field in ["strict", "defer_loading", "eager_input_streaming"] {
+            let mut tool = json!({
+                "name": "get_weather",
+                "input_schema": {"type": "object"},
+            });
+            tool.as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), json!(true));
+            let body = json!({"messages": [], "tools": [tool]});
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                format!("tool.{field}=true is not supported by the Codex OAuth backend")
+            );
+        }
+    }
+
+    #[test]
     fn test_tool_choice_auto() {
         let body = json!({"messages": [], "tool_choice": {"type": "auto"}});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, Some(json!("auto")));
     }
 
     #[test]
     fn test_tool_choice_any() {
         let body = json!({"messages": [], "tool_choice": {"type": "any"}});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, Some(json!("required")));
     }
 
     #[test]
     fn test_tool_choice_tool() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "my_fn"}});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, Some(json!({"type": "function", "name": "my_fn"})));
     }
 
     #[test]
     fn test_tool_choice_web_search() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "web_search"}});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, Some(json!({"type": "web_search"})));
     }
 
     #[test]
     fn test_tool_choice_none() {
         let body = json!({"messages": [], "tool_choice": {"type": "none"}});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, Some(json!("none")));
     }
 
     #[test]
     fn test_tool_choice_absent() {
         let body = json!({"messages": []});
-        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(tc, None);
     }
 
@@ -1475,7 +1837,7 @@ mod tests {
             "messages": [],
             "tools": [{"type": "web_search", "name": "web_search"}],
         });
-        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body);
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         let tools = tools.unwrap();
         assert_eq!(
             tools[0].parameters.get("__codex_as_api_tool_type"),
@@ -1486,35 +1848,129 @@ mod tests {
     #[test]
     fn test_thinking_enabled() {
         let body = json!({"messages": [], "thinking": {"type": "enabled"}});
-        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(effort, Some("high".to_string()));
     }
 
     #[test]
     fn test_thinking_adaptive() {
         let body = json!({"messages": [], "thinking": {"type": "adaptive"}});
-        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(effort, Some("medium".to_string()));
     }
 
     #[test]
     fn test_thinking_disabled() {
         let body = json!({"messages": [], "thinking": {"type": "disabled"}});
-        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(effort, Some("none".to_string()));
     }
 
     #[test]
     fn test_thinking_unspecified_has_no_request_override() {
         let body = json!({"messages": []});
-        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn test_output_config_effort_precedes_enabled_and_adaptive_thinking() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let body = json!({
+                "messages": [],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": effort},
+            });
+            let (_, _, _, _, converted, _) = anthropic_request_to_internal(&body).unwrap();
+            assert_eq!(converted, Some(effort.to_string()));
+        }
+
+        let enabled = json!({
+            "messages": [],
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": "low"},
+        });
+        let (_, _, _, _, converted, _) = anthropic_request_to_internal(&enabled).unwrap();
+        assert_eq!(converted, Some("low".to_string()));
+    }
+
+    #[test]
+    fn test_output_config_effort_rejects_disabled_thinking() {
+        let body = json!({
+            "messages": [],
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high"},
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&body).unwrap_err(),
+            "output_config.effort cannot be used when thinking.type is disabled"
+        );
+    }
+
+    #[test]
+    fn test_output_config_effort_must_be_a_non_empty_string() {
+        for effort in [json!(""), json!("   "), json!(42), json!({"level": "high"})] {
+            let body = json!({
+                "messages": [],
+                "output_config": {"effort": effort},
+            });
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                "output_config.effort must be a non-empty string when provided"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_config_effort_rejects_unknown_values() {
+        for effort in ["none", "ultra", "custom"] {
+            let body = json!({
+                "messages": [],
+                "output_config": {"effort": effort},
+            });
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                "output_config.effort must be one of: low, medium, high, xhigh, max"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_config_rejects_unknown_fields() {
+        let body = json!({
+            "messages": [],
+            "output_config": {"effort": "low", "experimental": true},
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&body).unwrap_err(),
+            "output_config.experimental is not supported by the Codex OAuth backend"
+        );
+    }
+
+    #[test]
+    fn test_output_config_task_budget_fails_loudly() {
+        let body = json!({
+            "messages": [],
+            "output_config": {
+                "task_budget": {"type": "tokens", "total": 20_000}
+            },
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&body).unwrap_err(),
+            "output_config.task_budget is not supported by the Codex OAuth backend"
+        );
+
+        let null_body = json!({
+            "messages": [],
+            "output_config": {"task_budget": null},
+        });
+        assert!(anthropic_request_to_internal(&null_body).is_ok());
     }
 
     #[test]
     fn test_stop_sequences() {
         let body = json!({"messages": [], "stop_sequences": ["STOP", "END"]});
-        let (_, _, _, stop, _, _) = anthropic_request_to_internal(&body);
+        let (_, _, _, stop, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(stop, Some(vec!["STOP".to_string(), "END".to_string()]));
     }
 
@@ -1529,7 +1985,7 @@ mod tests {
                 "strict": false,
             },
         });
-        let (_, _, _, _, _, text) = anthropic_request_to_internal(&body);
+        let (_, _, _, _, _, text) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(
             text,
             Some(json!({"format": {
@@ -1539,6 +1995,85 @@ mod tests {
                 "strict": false,
             }}))
         );
+    }
+
+    #[test]
+    fn test_output_config_effort_preserves_nested_format_mapping() {
+        let body = json!({
+            "messages": [],
+            "output_config": {
+                "effort": "medium",
+                "format": {"type": "json_object"},
+            },
+        });
+        let (_, _, _, _, effort, text) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(effort, Some("medium".to_string()));
+        assert_eq!(text, Some(json!({"format": {"type": "json_object"}})));
+    }
+
+    #[test]
+    fn test_output_formats_fail_loudly_in_top_level_and_nested_locations() {
+        for (field, value, expected_error) in [
+            (
+                "output_format",
+                json!("json_object"),
+                "output_format must be an object when provided",
+            ),
+            (
+                "output_format",
+                json!({}),
+                "output_format.type must be a string",
+            ),
+            (
+                "output_format",
+                json!({"type": "text"}),
+                "output_format.type must be one of: json_object, json_schema",
+            ),
+            (
+                "output_config.format",
+                json!({"type": "json_schema"}),
+                "output_config.format.schema must be an object",
+            ),
+            (
+                "output_config.format",
+                json!({"type": "json_object", "extra": true}),
+                "output_config.format.extra is not supported",
+            ),
+        ] {
+            let mut body = json!({"messages": []});
+            if field == "output_format" {
+                body["output_format"] = value;
+            } else {
+                body["output_config"] = json!({"format": value});
+            }
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_output_formats_must_match() {
+        let conflicting = json!({
+            "messages": [],
+            "output_format": {"type": "json_object"},
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            },
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&conflicting).unwrap_err(),
+            "output_format conflicts with output_config.format"
+        );
+
+        let identical = json!({
+            "messages": [],
+            "output_format": {"type": "json_object"},
+            "output_config": {"format": {"type": "json_object"}},
+        });
+        let (_, _, _, _, _, text) = anthropic_request_to_internal(&identical).unwrap();
+        assert_eq!(text, Some(json!({"format": {"type": "json_object"}})));
     }
 
     // -----------------------------------------------------------------------

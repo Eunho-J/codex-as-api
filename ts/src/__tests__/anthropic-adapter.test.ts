@@ -128,6 +128,97 @@ describe("anthropicRequestToInternal", () => {
     assert.ok(messages.every((m) => m.role === MessageRole.TOOL));
   });
 
+  it("maps direct and tool-result URL images and preserves tool errors", () => {
+    const { messages } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "inspect" },
+          {
+            type: "image",
+            source: { type: "url", url: "https://example.com/direct.png" },
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "call-image",
+            is_error: true,
+            content: [
+              { type: "text", text: "tool failed" },
+              {
+                type: "image",
+                source: { type: "url", url: "https://example.com/tool.png" },
+              },
+            ],
+          },
+        ],
+      }],
+    });
+
+    assert.deepEqual(messages, [
+      {
+        role: MessageRole.USER,
+        content: "inspect",
+        images: ["https://example.com/direct.png"],
+      },
+      {
+        role: MessageRole.TOOL,
+        content: "[tool_error]\ntool failed",
+        tool_call_id: "call-image",
+        name: "call-image",
+      },
+      {
+        role: MessageRole.USER,
+        content: "",
+        images: ["https://example.com/tool.png"],
+      },
+    ]);
+  });
+
+  it("rejects known image sources with missing payloads", () => {
+    const malformedBlocks = [
+      { type: "image" },
+      { type: "image", source: null },
+      { type: "image", source: { type: "file", file_id: "file-1" } },
+      { type: "image", source: { type: "base64", media_type: 42, data: "AAAA" } },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "" } },
+      { type: "image", source: { type: "base64", media_type: "image/png" } },
+      { type: "image", source: { type: "url", url: "" } },
+      { type: "image", source: { type: "url" } },
+    ];
+    for (const block of malformedBlocks) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: [block] }],
+      }));
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "call-image",
+            content: [block],
+          }],
+        }],
+      }));
+    }
+
+    assert.throws(
+      () => anthropicRequestToInternal({
+        model: "test",
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: 42, data: "AAAA" },
+          }],
+        }],
+      }),
+      /Anthropic base64 image source requires a string media_type/,
+    );
+  });
+
   it("assistant text", () => {
     const { messages } = anthropicRequestToInternal({
       model: "test",
@@ -253,6 +344,39 @@ describe("anthropicRequestToInternal", () => {
     }));
   });
 
+  it("rejects enabled beta tool semantics and accepts explicit no-ops", () => {
+    const base = {
+      model: "test",
+      messages: [] as Record<string, unknown>[],
+    };
+    for (const field of ["strict", "defer_loading", "eager_input_streaming"] as const) {
+      assert.throws(() => anthropicRequestToInternal({
+        ...base,
+        tools: [{
+          name: "lookup",
+          input_schema: { type: "object" },
+          [field]: true,
+        }],
+      }));
+    }
+
+    const { tools } = anthropicRequestToInternal({
+      ...base,
+      tools: [{
+        name: "lookup",
+        input_schema: { type: "object" },
+        strict: false,
+        defer_loading: null,
+        eager_input_streaming: false,
+      }],
+    });
+    assert.deepEqual(tools, [{
+      name: "lookup",
+      description: "",
+      parameters: { type: "object" },
+    }]);
+  });
+
   it("tool_choice auto", () => {
     const { toolChoice } = anthropicRequestToInternal({
       model: "test",
@@ -368,6 +492,114 @@ describe("anthropicRequestToInternal", () => {
     assert.equal(reasoningEffort, "none");
   });
 
+  it("uses output_config effort ahead of adaptive or enabled thinking", () => {
+    for (const thinkingType of ["adaptive", "enabled"] as const) {
+      const { reasoningEffort } = anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        thinking: { type: thinkingType, display: "omitted" },
+        outputConfig: { effort: "max" },
+      });
+      assert.equal(reasoningEffort, "max");
+    }
+  });
+
+  it("rejects output_config effort with disabled thinking", () => {
+    assert.throws(() => anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "disabled" },
+      outputConfig: { effort: "high" },
+    }));
+  });
+
+  it("rejects invalid output_config effort and non-null task budgets", () => {
+    for (const outputConfig of [
+      { effort: "" },
+      { effort: 42 },
+      { effort: "ultra" },
+      { task_budget: { type: "tokens", total: 20_000 } },
+      { unknown_control: true },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        outputConfig,
+      }));
+    }
+  });
+
+  it("keeps nested output_config format conversion alongside effort", () => {
+    const { reasoningEffort, text } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "adaptive" },
+      outputConfig: {
+        effort: "high",
+        format: { type: "json_object" },
+      },
+      outputFormat: { type: "json_object" },
+    });
+    assert.equal(reasoningEffort, "high");
+    assert.deepEqual(text, { format: { type: "json_object" } });
+  });
+
+  it("rejects malformed, unsupported, and conflicting output formats", () => {
+    const invalid = [
+      { outputFormat: "json" },
+      { outputConfig: { format: "json" } },
+      { outputFormat: {} },
+      { outputFormat: { type: "future" } },
+      { outputFormat: { type: "json_schema", schema: [] } },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          extra: true,
+        },
+      },
+      {
+        outputConfig: {
+          format: { type: "json_object", schema: { type: "object" } },
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          name: "",
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          description: 42,
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          strict: "true",
+        },
+      },
+      {
+        outputFormat: { type: "json_object" },
+        outputConfig: {
+          format: { type: "json_schema", schema: { type: "object" } },
+        },
+      },
+    ];
+    for (const controls of invalid) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        ...controls,
+      }));
+    }
+  });
+
   it("maps Anthropic output_format to OpenAI Responses text.format", () => {
     const { text } = anthropicRequestToInternal({
       model: "test",
@@ -375,6 +607,7 @@ describe("anthropicRequestToInternal", () => {
       outputFormat: {
         type: "json_schema",
         name: "my schema!",
+        description: "Answer envelope",
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
         strict: false,
       },
@@ -383,6 +616,7 @@ describe("anthropicRequestToInternal", () => {
       format: {
         type: "json_schema",
         name: "my_schema_",
+        description: "Answer envelope",
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
         strict: false,
       },

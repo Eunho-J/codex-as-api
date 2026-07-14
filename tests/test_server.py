@@ -1619,6 +1619,39 @@ def test_messages_count_tokens_counts_utf8_bytes_conservatively(client):
     assert body["input_tokens"] >= len("hello 안녕 👋".encode())
 
 
+def test_messages_count_tokens_reports_effective_request_model_context(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.5")
+    monkeypatch.setattr(
+        server_mod,
+        "CODEX_CONFIG",
+        CodexConfig(codex_home="/tmp/codex", config_path="/tmp/codex/config.toml"),
+    )
+
+    known = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    fallback = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert known.status_code == 200
+    assert known.json()["context_window"] == 372_000
+    assert known.json()["auto_compact_token_limit"] == 334_800
+    assert fallback.status_code == 200
+    assert fallback.json()["context_window"] == 272_000
+    assert fallback.json()["auto_compact_token_limit"] == 244_800
+
+
 def test_messages_compact_accepts_anthropic_body(client, monkeypatch):
     import codex_as_api.server as server_mod
 
@@ -1652,6 +1685,129 @@ def test_messages_compact_accepts_anthropic_body(client, monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.json() == {"checkpoint": "checkpoint"}
+
+
+def test_messages_compact_routes_known_gpt_model_to_backend(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.5")
+    response = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    recorded = recording_backend.requests.get(timeout=1)
+    assert recorded["path"] == "/responses/compact"
+    assert recorded["body"]["model"] == "gpt-5.6-sol"
+
+
+def test_messages_compact_maps_fast_mode_and_rejects_invalid_speed(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "speed": "fast",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    recorded = recording_backend.requests.get(timeout=1)
+    assert recorded["body"]["service_tier"] == "priority"
+
+    invalid = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            "speed": "warp",
+        },
+    )
+    assert invalid.status_code == 400
+    assert recording_backend.requests.empty()
+
+
+def test_messages_compact_wires_output_config_format_to_codex_text(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "history"}],
+            "output_config": {"format": {"type": "json_object"}},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    recorded = recording_backend.requests.get(timeout=1)
+    assert recorded["path"] == "/responses/compact"
+    assert recorded["body"]["text"]["format"] == {"type": "json_object"}
+
+    conflict = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "history"}],
+            "output_config": {"format": {"type": "json_object"}},
+            "text": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+        },
+    )
+    assert conflict.status_code == 400
+    assert recording_backend.requests.empty()
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"output_config": {"task_budget": {"type": "tokens", "total": 20_000}}},
+        {"tools": [{"name": "lookup", "input_schema": {}, "strict": True}]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "url", "url": ""}}],
+                }
+            ]
+        },
+    ],
+)
+def test_messages_compact_rejects_unrepresentable_adapter_fields_before_upstream(
+    client,
+    recording_backend: RecordingBackend,
+    unsupported,
+):
+    response = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            **unsupported,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "chatgpt_oauth_error"
+    assert recording_backend.requests.empty()
 
 
 def test_compact_resolves_known_previous_response_to_full_input(
@@ -1800,6 +1956,241 @@ def test_anthropic_messages_uses_codex_model_for_provider_and_client_model_in_re
     )
     assert resp.status_code == 200
     assert resp.json()["model"] == "claude-sonnet-4-5"
+
+
+def test_anthropic_latest_claude_code_shape_routes_known_gpt_effort_and_fast_mode(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.5")
+    response = client.post(
+        "/v1/messages?beta=true",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64_000,
+            "stream": False,
+            "system": [{"type": "text", "text": "system"}],
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
+            "output_config": {"effort": "max"},
+            "speed": "fast",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "gpt-5.6-sol"
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert outbound["model"] == "gpt-5.6-sol"
+    assert outbound["reasoning"]["effort"] == "max"
+    assert outbound["service_tier"] == "priority"
+    assert "output_config" not in outbound
+    assert "context_management" not in outbound
+    assert "speed" not in outbound
+
+
+def test_anthropic_output_config_format_reaches_codex_text_format(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "Return structured output.",
+            "messages": [{"role": "user", "content": "return json"}],
+            "output_config": {"format": {"type": "json_object"}},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert outbound["text"]["format"] == {"type": "json_object"}
+
+
+def test_anthropic_stream_does_not_block_concurrent_claude_code_requests(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+
+    provider_waiting = threading.Event()
+    release_provider = threading.Event()
+
+    class GatedProvider:
+        def preflight_chat(self, messages, **kwargs):
+            del messages, kwargs
+            return {}, []
+
+        def chat_stream(self, messages, **kwargs):
+            del messages, kwargs
+            yield {"type": "content", "text": "early"}
+            provider_waiting.set()
+            if not release_provider.wait(timeout=5):
+                raise AssertionError("test did not release the provider stream")
+            yield {
+                "type": "finish",
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+    monkeypatch.setattr(server_mod, "_provider", GatedProvider())
+    stream_result: dict[str, Any] = {}
+    health_result: dict[str, Any] = {}
+
+    with TestClient(server_mod.app, raise_server_exceptions=False) as concurrent_client:
+        def request_stream() -> None:
+            stream_result["response"] = concurrent_client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-fable-5",
+                    "max_tokens": 1024,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        def request_health() -> None:
+            health_result["response"] = concurrent_client.get("/health")
+
+        stream_thread = threading.Thread(target=request_stream)
+        stream_thread.start()
+        assert provider_waiting.wait(timeout=2)
+
+        health_thread = threading.Thread(target=request_health)
+        health_thread.start()
+        try:
+            health_thread.join(timeout=2)
+            assert not health_thread.is_alive(), "the provider stream blocked the ASGI event loop"
+            assert health_result["response"].status_code == 200
+        finally:
+            release_provider.set()
+
+        stream_thread.join(timeout=5)
+        health_thread.join(timeout=5)
+        assert not stream_thread.is_alive()
+
+    response = stream_result["response"]
+    assert response.status_code == 200
+    events = []
+    for block in response.text.split("\n\n"):
+        data_lines = [line.removeprefix("data: ") for line in block.splitlines() if line.startswith("data: ")]
+        if data_lines:
+            events.append(json.loads(data_lines[0]))
+    assert [event["type"] for event in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[2]["delta"] == {"type": "text_delta", "text": "early"}
+
+
+def test_anthropic_builtin_claude_model_keeps_configured_codex_fallback(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.5")
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-fable-5",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model"] == "claude-fable-5"
+    assert recording_backend.requests.get(timeout=1)["body"]["model"] == "gpt-5.5"
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {
+            "context_management": {
+                "edits": [
+                    {
+                        "type": "clear_tool_uses_20250919",
+                        "trigger": {"type": "input_tokens", "value": 30_000},
+                    }
+                ]
+            }
+        },
+        {"output_config": {"task_budget": {"type": "tokens", "total": 20_000}}},
+    ],
+)
+def test_anthropic_unrepresentable_latest_controls_fail_before_upstream(
+    client,
+    recording_backend: RecordingBackend,
+    unsupported,
+):
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            **unsupported,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert recording_backend.requests.empty()
+
+
+@pytest.mark.parametrize("route", ["/v1/messages", "/v1/messages/count_tokens", "/v1/messages/compact"])
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"output_config": {"format": "json"}},
+        {"output_config": {"format": {"type": "json_object", "extra": True}}},
+        {
+            "output_format": {"type": "json_object"},
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "file", "file_id": "file-1"}}],
+                }
+            ]
+        },
+    ],
+)
+def test_anthropic_routes_reject_invalid_formats_and_unknown_image_sources(
+    client,
+    recording_backend: RecordingBackend,
+    route,
+    unsupported,
+):
+    response = client.post(
+        route,
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+            **unsupported,
+        },
+    )
+
+    assert response.status_code == 400
+    assert recording_backend.requests.empty()
 
 
 def test_anthropic_stream_preflight_returns_json_error_before_upstream_request(

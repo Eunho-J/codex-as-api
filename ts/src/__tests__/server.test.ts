@@ -355,6 +355,91 @@ describe("server error handling", () => {
     });
   });
 
+  it("delivers Anthropic content before the provider stream completes", async () => {
+    let releaseFinish!: () => void;
+    const finishGate = new Promise<void>((resolve) => {
+      releaseFinish = resolve;
+    });
+    let providerCompleted = false;
+    const provider = {
+      chatStream() {
+        return (async function* () {
+          yield { type: "content", text: "early" };
+          await finishGate;
+          providerCompleted = true;
+          yield {
+            type: "finish",
+            finish_reason: "stop",
+            usage: { input_tokens: 1, output_tokens: 1 },
+          };
+        })();
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-fable-5",
+          max_tokens: 1024,
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      assert.equal(response.status, 200);
+      assert.ok(response.body);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const events: Record<string, unknown>[] = [];
+      let pending = "";
+      const parseCompleteBlocks = () => {
+        for (;;) {
+          const boundary = pending.indexOf("\n\n");
+          if (boundary < 0) return;
+          const block = pending.slice(0, boundary);
+          pending = pending.slice(boundary + 2);
+          const dataLine = block.split("\n").find((line) => line.startsWith("data: "));
+          if (dataLine !== undefined) {
+            events.push(JSON.parse(dataLine.slice(6)) as Record<string, unknown>);
+          }
+        }
+      };
+      const hasEarlyDelta = () => events.some((event) => {
+        if (event.type !== "content_block_delta") return false;
+        const delta = event.delta;
+        return typeof delta === "object"
+          && delta !== null
+          && (delta as Record<string, unknown>).type === "text_delta"
+          && (delta as Record<string, unknown>).text === "early";
+      });
+
+      try {
+        while (!hasEarlyDelta()) {
+          const chunk = await reader.read();
+          assert.equal(chunk.done, false);
+          pending += decoder.decode(chunk.value, { stream: true });
+          parseCompleteBlocks();
+        }
+        assert.equal(providerCompleted, false);
+      } finally {
+        releaseFinish();
+      }
+
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        pending += decoder.decode(chunk.value, { stream: true });
+        parseCompleteBlocks();
+      }
+      pending += decoder.decode();
+      parseCompleteBlocks();
+      assert.equal(providerCompleted, true);
+      assert.ok(events.some((event) => event.type === "message_stop"));
+    });
+  });
+
   it("rejects deterministic Anthropic Lite tool failures before SSE headers", async () => {
     const previous = process.env.CODEX_AS_API_RESPONSES_LITE;
     process.env.CODEX_AS_API_RESPONSES_LITE = "on";
@@ -587,6 +672,419 @@ describe("Anthropic compatibility helper routes", () => {
     });
   });
 
+  it("wires the Claude Code 2.1.208 request shape to a known GPT model", async () => {
+    const auth = writeAuthFile();
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const provider = new ChatGPTOAuthProvider({
+          model: "gpt-5.5",
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+        await withServer(provider, async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/v1/messages?beta=true`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: "gpt-5.6",
+              messages: [{
+                role: "user",
+                content: [{
+                  type: "text",
+                  text: "Reply OK",
+                  cache_control: { type: "ephemeral" },
+                }],
+              }],
+              system: [{
+                type: "text",
+                text: "You are a Claude agent.",
+                cache_control: { type: "ephemeral" },
+              }],
+              tools: [],
+              metadata: { user_id: "claude-code-2.1.208" },
+              max_tokens: 32_000,
+              thinking: { type: "adaptive", display: "omitted" },
+              context_management: {
+                edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+              },
+              output_config: { effort: "max" },
+              speed: "fast",
+              stream: true,
+            }),
+          });
+
+          assert.equal(response.status, 200);
+          const events = (await response.text())
+            .split("\n\n")
+            .filter((block) => block.length > 0)
+            .map((block) => {
+              const dataLine = block.split("\n").find((line) => line.startsWith("data: "));
+              return dataLine == null
+                ? null
+                : JSON.parse(dataLine.slice(6)) as Record<string, unknown>;
+            })
+            .filter((event): event is Record<string, unknown> => event !== null);
+          const messageStart = events.find((event) => event.type === "message_start");
+          const responseMessage = messageStart?.message as Record<string, unknown> | undefined;
+          assert.equal(responseMessage?.model, "gpt-5.6");
+
+          assert.equal(requests.length, 1);
+          const upstream = requests[0].body;
+          assert.equal(upstream.model, "gpt-5.6-sol");
+          assert.deepEqual(upstream.reasoning, {
+            effort: "max",
+            context: "all_turns",
+          });
+          assert.equal(upstream.service_tier, "priority");
+          assert.equal(Object.hasOwn(upstream, "output_config"), false);
+          assert.equal(Object.hasOwn(upstream, "context_management"), false);
+          assert.equal(Object.hasOwn(upstream, "speed"), false);
+        }, { model: "gpt-5.5", authPath: auth.authPath });
+      });
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the configured GPT fallback for built-in Claude model names", async () => {
+    let providerModel: string | undefined;
+    const provider = {
+      async chat(_messages: unknown, opts: { model?: string }) {
+        providerModel = opts.model;
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+          raw: null,
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-fable-5",
+          max_tokens: 1024,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as Record<string, unknown>;
+      assert.equal(body.model, "claude-fable-5");
+      assert.equal(providerModel, "gpt-5.5");
+    }, { model: "gpt-5.5" });
+  });
+
+  it("maps Anthropic speed and rejects conflicting service tiers", async () => {
+    const serviceTiers: Array<string | undefined> = [];
+    const provider = {
+      async chat(_messages: unknown, opts: { serviceTier?: string }) {
+        serviceTiers.push(opts.serviceTier);
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+          raw: null,
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      for (const fields of [
+        { speed: "fast" },
+        { speed: "standard" },
+        { speed: "fast", service_tier: "priority" },
+      ]) {
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.6-sol",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: "hello" }],
+            ...fields,
+          }),
+        });
+        assert.equal(response.status, 200);
+      }
+      assert.deepEqual(serviceTiers, ["fast", "default", "fast"]);
+
+      for (const fields of [
+        { speed: "fast", service_tier: "default" },
+        { speed: "warp" },
+      ]) {
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.6-sol",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: "hello" }],
+            ...fields,
+          }),
+        });
+        assert.equal(response.status, 400);
+        const body = await response.json() as {
+          type: string;
+          error: { type: string };
+        };
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+      }
+      assert.deepEqual(serviceTiers, ["fast", "default", "fast"]);
+    }, { model: "gpt-5.5" });
+  });
+
+  it("accepts only the exact no-op context_management shape", async () => {
+    let chatCalls = 0;
+    const provider = {
+      async chat() {
+        chatCalls += 1;
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+          raw: null,
+        };
+      },
+    };
+    const accepted = {
+      edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      for (const route of ["/v1/messages/count_tokens", "/v1/messages"] as const) {
+        const response = await fetch(`${baseUrl}${route}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-fable-5",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: "hello" }],
+            context_management: accepted,
+          }),
+        });
+        assert.equal(response.status, 200);
+      }
+      assert.equal(chatCalls, 1);
+
+      const invalidValues = [
+        { edits: [{ type: "clear_thinking_20251015", keep: "recent" }] },
+        {
+          edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+          extra: true,
+        },
+        {
+          edits: [{
+            type: "clear_tool_uses_20250919",
+            trigger: { type: "input_tokens", value: 30_000 },
+          }],
+        },
+      ];
+      for (const contextManagement of invalidValues) {
+        for (const route of ["/v1/messages/count_tokens", "/v1/messages"] as const) {
+          const response = await fetch(`${baseUrl}${route}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-fable-5",
+              max_tokens: 1024,
+              messages: [{ role: "user", content: "hello" }],
+              context_management: contextManagement,
+            }),
+          });
+          assert.equal(response.status, 400);
+          const body = await response.json() as {
+            type: string;
+            error: { type: string };
+          };
+          assert.equal(body.type, "error");
+          assert.equal(body.error.type, "invalid_request_error");
+        }
+      }
+      assert.equal(chatCalls, 1);
+    });
+  });
+
+  it("rejects unrepresentable Claude beta controls before provider transport", async () => {
+    let chatCalls = 0;
+    const provider = {
+      async chat() {
+        chatCalls += 1;
+        throw new Error("provider must not be called");
+      },
+    };
+    const unsupported = [
+      { output_config: { task_budget: { type: "tokens", total: 20_000 } } },
+      { output_config: { effort: "" } },
+      { output_config: { effort: "ultra" } },
+      { output_config: { unknown_control: true } },
+      { thinking: { type: "disabled" }, output_config: { effort: "high" } },
+      { reasoning_effort: "low", output_config: { effort: "high" } },
+      { tools: [{ name: "lookup", input_schema: {}, strict: true }] },
+      { tools: [{ name: "lookup", input_schema: {}, defer_loading: true }] },
+      { tools: [{ name: "lookup", input_schema: {}, eager_input_streaming: true }] },
+      {
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "" },
+          }],
+        }],
+      },
+      {
+        messages: [{
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "call-image",
+            content: [{ type: "image", source: { type: "url", url: "" } }],
+          }],
+        }],
+      },
+    ];
+
+    await withServer(provider, async (baseUrl) => {
+      for (const controls of unsupported) {
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.6-sol",
+            max_tokens: 1024,
+            messages: [{ role: "user", content: "hello" }],
+            ...controls,
+          }),
+        });
+        assert.equal(response.status, 400);
+        const body = await response.json() as {
+          type: string;
+          error: { type: string };
+        };
+        assert.equal(body.type, "error");
+        assert.equal(body.error.type, "invalid_request_error");
+      }
+      assert.equal(chatCalls, 0);
+    });
+  });
+
+  it("rejects lossy output formats and image sources on every Anthropic route", async () => {
+    let providerCalls = 0;
+    const provider = {
+      async chat() {
+        providerCalls += 1;
+        throw new Error("provider must not be called");
+      },
+      async compactMessages() {
+        providerCalls += 1;
+        throw new Error("provider must not be called");
+      },
+    };
+    const base = {
+      model: "gpt-5.6-sol",
+      max_tokens: 1024,
+      system: "system",
+      messages: [{ role: "user", content: "hello" }],
+    };
+    const invalidBodies = [
+      { ...base, output_format: "json" },
+      { ...base, output_config: { format: "json" } },
+      { ...base, output_format: { type: "future" } },
+      {
+        ...base,
+        output_format: { type: "json_object", schema: { type: "object" } },
+      },
+      {
+        ...base,
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: { type: "object" },
+            extra: true,
+          },
+        },
+      },
+      {
+        ...base,
+        output_format: {
+          type: "json_schema",
+          schema: { type: "object" },
+          name: "",
+        },
+      },
+      {
+        ...base,
+        output_format: {
+          type: "json_schema",
+          schema: { type: "object" },
+          description: 42,
+        },
+      },
+      {
+        ...base,
+        output_format: {
+          type: "json_schema",
+          schema: { type: "object" },
+          strict: "true",
+        },
+      },
+      {
+        ...base,
+        output_format: { type: "json_object" },
+        output_config: {
+          format: { type: "json_schema", schema: { type: "object" } },
+        },
+      },
+      {
+        ...base,
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "file", file_id: "file-1" },
+          }],
+        }],
+      },
+      {
+        ...base,
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: 42, data: "AAAA" },
+          }],
+        }],
+      },
+    ];
+
+    await withServer(provider, async (baseUrl) => {
+      for (const route of [
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/messages/compact",
+      ]) {
+        for (const body of invalidBodies) {
+          const response = await fetch(`${baseUrl}${route}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          assert.equal(response.status, 400);
+        }
+      }
+      assert.equal(providerCalls, 0);
+    });
+  });
+
   it("returns conservative count_tokens estimate without calling provider", async () => {
     const provider = {
       async countTokens() {
@@ -649,6 +1147,34 @@ describe("Anthropic compatibility helper routes", () => {
     });
   });
 
+  it("reports count_tokens limits for the effective Anthropic backend model", async () => {
+    await withServer({}, async (baseUrl) => {
+      const count = async (model: string) => {
+        const response = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+        assert.equal(response.status, 200);
+        return await response.json() as {
+          context_window: number;
+          auto_compact_token_limit: number;
+        };
+      };
+
+      const gpt = await count("gpt-5.6");
+      assert.equal(gpt.context_window, 372_000);
+      assert.equal(gpt.auto_compact_token_limit, 334_800);
+
+      const claudeFallback = await count("claude-fable-5");
+      assert.equal(claudeFallback.context_window, 272_000);
+      assert.equal(claudeFallback.auto_compact_token_limit, 244_800);
+    }, { model: "gpt-5.5" });
+  });
+
   it("counts UTF-8 bytes conservatively", async () => {
     await withServer({}, async (baseUrl) => {
       const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
@@ -664,6 +1190,125 @@ describe("Anthropic compatibility helper routes", () => {
       const body = await res.json() as { input_tokens: number };
       assert.ok(body.input_tokens >= Buffer.byteLength("hello 안녕 👋"));
     });
+  });
+
+  it("routes Anthropic compact requests by exact bundled model ID", async () => {
+    const auth = writeAuthFile();
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const provider = new ChatGPTOAuthProvider({
+          model: "gpt-5.5",
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+        await withServer(provider, async (baseUrl) => {
+          const common = {
+            max_tokens: 1024,
+            messages: [{ role: "user", content: "history" }],
+            context_management: {
+              edits: [{ type: "clear_thinking_20251015", keep: "all" }],
+            },
+          };
+          const known = await fetch(`${baseUrl}/v1/messages/compact`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...common,
+              model: "gpt-5.6",
+              thinking: { type: "adaptive", display: "omitted" },
+              output_config: {
+                effort: "high",
+                format: {
+                  type: "json_schema",
+                  name: "compact schema!",
+                  description: "Compaction checkpoint",
+                  strict: true,
+                  schema: {
+                    type: "object",
+                    properties: { checkpoint: { type: "string" } },
+                    required: ["checkpoint"],
+                  },
+                },
+              },
+              speed: "fast",
+            }),
+          });
+          assert.equal(known.status, 200);
+
+          const fallback = await fetch(`${baseUrl}/v1/messages/compact`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...common,
+              model: "claude-fable-5",
+              speed: "standard",
+            }),
+          });
+          assert.equal(fallback.status, 200);
+
+          const conflict = await fetch(`${baseUrl}/v1/messages/compact`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...common,
+              model: "gpt-5.6",
+              reasoning_effort: "low",
+              output_config: { effort: "high" },
+            }),
+          });
+          assert.equal(conflict.status, 400);
+          const conflictBody = await conflict.json() as {
+            error: { type: string };
+          };
+          assert.equal(conflictBody.error.type, "chatgpt_oauth_error");
+
+          assert.equal(requests.length, 2);
+          assert.deepEqual(requests.map((request) => request.path), [
+            "/responses/compact",
+            "/responses/compact",
+          ]);
+          assert.equal(requests[0].body.model, "gpt-5.6-sol");
+          assert.equal(requests[0].body.service_tier, "priority");
+          const text = requests[0].body.text as Record<string, unknown>;
+          assert.deepEqual(text.format, {
+            type: "json_schema",
+            name: "compact_schema_",
+            description: "Compaction checkpoint",
+            strict: true,
+            schema: {
+              type: "object",
+              properties: { checkpoint: { type: "string" } },
+              required: ["checkpoint"],
+            },
+          });
+          assert.equal(requests[1].body.model, "gpt-5.5");
+          assert.equal(Object.hasOwn(requests[1].body, "service_tier"), false);
+
+          for (const fields of [
+            { speed: "warp" },
+            { speed: "fast", service_tier: "default" },
+          ]) {
+            const invalid = await fetch(`${baseUrl}/v1/messages/compact`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                ...common,
+                model: "gpt-5.6",
+                ...fields,
+              }),
+            });
+            assert.equal(invalid.status, 400);
+            const error = await invalid.json() as {
+              error: { type: string };
+            };
+            assert.equal(error.error.type, "chatgpt_oauth_error");
+          }
+          assert.equal(requests.length, 2);
+        }, { model: "gpt-5.5", authPath: auth.authPath });
+      });
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
   });
 
 
