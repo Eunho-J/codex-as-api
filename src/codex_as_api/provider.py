@@ -27,6 +27,7 @@ from .model_capabilities import (
     LITE_HEADER_NAME,
     LITE_HEADER_VALUE,
     RESPONSES_LITE_ENV,
+    SESSION_ID_KEY,
     apply_model_capability_fields,
     build_codex_client_metadata,
     capability_for_model,
@@ -753,18 +754,27 @@ class ChatGPTOAuthProvider:
         }
         if any(tool.get("type") == "web_search" for tool in payload["tools"]):
             payload["include"] = ["web_search_call.action.sources"]
-        if prompt_cache_key is not None:
+        metadata = dict(client_metadata) if client_metadata is not None else None
+        if resolve_codex_metadata_enabled(codex_metadata):
+            try:
+                metadata = build_codex_client_metadata(
+                    auth_json_path=self.auth_json_path,
+                    existing=metadata,
+                )
+            except ValueError as exc:
+                raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
+        effective_prompt_cache_key = prompt_cache_key
+        if effective_prompt_cache_key is None and metadata is not None:
+            session_id = metadata.get(SESSION_ID_KEY)
+            if isinstance(session_id, str) and session_id.strip():
+                effective_prompt_cache_key = session_id
+        if effective_prompt_cache_key is not None:
             payload["prompt_cache_key"] = _validate_non_empty_string(
-                prompt_cache_key,
+                effective_prompt_cache_key,
                 "prompt_cache_key",
             )
-        if client_metadata is not None:
-            payload["client_metadata"] = client_metadata
-        if resolve_codex_metadata_enabled(codex_metadata):
-            payload["client_metadata"] = build_codex_client_metadata(
-                auth_json_path=self.auth_json_path,
-                existing=payload.get("client_metadata") if isinstance(payload.get("client_metadata"), dict) else None,
-            )
+        if metadata is not None:
+            payload["client_metadata"] = metadata
         _finalize_responses_payload(
             payload,
             model=request_model,

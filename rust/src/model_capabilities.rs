@@ -15,8 +15,6 @@ pub const THREAD_ID_KEY: &str = "thread_id";
 pub const TURN_ID_KEY: &str = "turn_id";
 
 static CAPABILITIES_JSON: &str = include_str!("model-capabilities.json");
-static SESSION_ID: OnceLock<String> = OnceLock::new();
-static THREAD_ID: OnceLock<String> = OnceLock::new();
 static WINDOW_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -138,8 +136,24 @@ pub fn apply_model_capability_fields(
 pub fn build_codex_client_metadata(
     auth_json_path: Option<&str>,
     existing: Option<&HashMap<String, String>>,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, String> {
     let mut metadata = existing.cloned().unwrap_or_default();
+    let session_id = metadata
+        .get(SESSION_ID_KEY)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            "codex_metadata requires a non-empty client_metadata.session_id".to_string()
+        })?;
+    let thread_id = match metadata.get(THREAD_ID_KEY) {
+        Some(value) if value.trim().is_empty() => {
+            return Err(
+                "client_metadata.thread_id must be a non-empty string when provided".to_string(),
+            );
+        }
+        Some(value) => value.clone(),
+        None => session_id.clone(),
+    };
     let raw_path = auth_json_path.unwrap_or("~/.codex/auth.json");
     let expanded = if let Some(rest) = raw_path.strip_prefix("~/") {
         std::env::var("HOME")
@@ -161,12 +175,6 @@ pub fn build_codex_client_metadata(
         format!("codex-as-api:{}", absolute.display()).as_bytes(),
     )
     .to_string();
-    let session_id = SESSION_ID
-        .get_or_init(|| uuid::Uuid::new_v4().to_string())
-        .clone();
-    let thread_id = THREAD_ID
-        .get_or_init(|| uuid::Uuid::new_v4().to_string())
-        .clone();
     let window_id = WINDOW_ID
         .get_or_init(|| uuid::Uuid::new_v4().to_string())
         .clone();
@@ -185,7 +193,7 @@ pub fn build_codex_client_metadata(
     metadata.insert(TURN_ID_KEY.to_string(), turn_id);
     metadata.insert(WINDOW_ID_KEY.to_string(), window_id);
     metadata.insert(TURN_METADATA_KEY.to_string(), turn_metadata.to_string());
-    metadata
+    Ok(metadata)
 }
 
 pub fn strip_image_detail_fields(value: Value) -> Value {
@@ -422,5 +430,56 @@ mod tests {
             assert_eq!(capability.context_window, Some(272_000));
             assert_eq!(capability.max_context_window, Some(maximum));
         }
+    }
+
+    #[test]
+    fn codex_metadata_requires_explicit_session_identity() {
+        assert!(build_codex_client_metadata(None, None).is_err());
+
+        let metadata = HashMap::from([(SESSION_ID_KEY.to_string(), "   ".to_string())]);
+        assert!(build_codex_client_metadata(None, Some(&metadata)).is_err());
+    }
+
+    #[test]
+    fn codex_metadata_defaults_root_thread_and_refreshes_only_turn_identity() {
+        let existing = HashMap::from([
+            (SESSION_ID_KEY.to_string(), "session-root".to_string()),
+            ("custom".to_string(), "preserved".to_string()),
+        ]);
+
+        let first =
+            build_codex_client_metadata(Some("/tmp/codex-auth.json"), Some(&existing)).unwrap();
+        let second =
+            build_codex_client_metadata(Some("/tmp/codex-auth.json"), Some(&existing)).unwrap();
+
+        assert_eq!(first[SESSION_ID_KEY], "session-root");
+        assert_eq!(first[THREAD_ID_KEY], "session-root");
+        assert_eq!(first["custom"], "preserved");
+        assert_eq!(first[INSTALLATION_ID_KEY], second[INSTALLATION_ID_KEY]);
+        assert_eq!(first[WINDOW_ID_KEY], second[WINDOW_ID_KEY]);
+        assert_ne!(first[TURN_ID_KEY], second[TURN_ID_KEY]);
+
+        let turn_metadata: Value = serde_json::from_str(&first[TURN_METADATA_KEY]).unwrap();
+        assert_eq!(turn_metadata["session_id"], "session-root");
+        assert_eq!(turn_metadata["thread_id"], "session-root");
+        assert_eq!(turn_metadata["turn_id"], first[TURN_ID_KEY]);
+    }
+
+    #[test]
+    fn codex_metadata_preserves_explicit_subagent_thread() {
+        let existing = HashMap::from([
+            (SESSION_ID_KEY.to_string(), "session-root".to_string()),
+            (THREAD_ID_KEY.to_string(), "thread-child".to_string()),
+        ]);
+
+        let metadata = build_codex_client_metadata(None, Some(&existing)).unwrap();
+        assert_eq!(metadata[SESSION_ID_KEY], "session-root");
+        assert_eq!(metadata[THREAD_ID_KEY], "thread-child");
+
+        let invalid = HashMap::from([
+            (SESSION_ID_KEY.to_string(), "session-root".to_string()),
+            (THREAD_ID_KEY.to_string(), " ".to_string()),
+        ]);
+        assert!(build_codex_client_metadata(None, Some(&invalid)).is_err());
     }
 }

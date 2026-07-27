@@ -481,15 +481,89 @@ def test_responses_payload_client_metadata_mode_overlays_reserved_keys(auth_json
     payload = provider._responses_payload(  # noqa: SLF001
         _provider_messages(),
         model="gpt-5.5",
-        client_metadata={"app": "kept", "turn_id": "user-value"},
+        client_metadata={"app": "kept", "session_id": "session-root", "turn_id": "user-value"},
         codex_metadata=True,
     )
 
     metadata = payload["client_metadata"]
     assert metadata["app"] == "kept"
+    assert metadata["session_id"] == "session-root"
+    assert metadata["thread_id"] == "session-root"
     assert metadata["turn_id"] != "user-value"
     assert metadata["x-codex-installation-id"]
-    assert json.loads(metadata["x-codex-turn-metadata"])["source"] == "codex-as-api"
+    turn_metadata = json.loads(metadata["x-codex-turn-metadata"])
+    assert turn_metadata["source"] == "codex-as-api"
+    assert turn_metadata["session_id"] == "session-root"
+    assert turn_metadata["thread_id"] == "session-root"
+    assert payload["prompt_cache_key"] == "session-root"
+
+
+def test_responses_payload_codex_metadata_preserves_thread_and_refreshes_only_turn_identity(auth_json_factory):
+    provider = ChatGPTOAuthProvider(auth_json_path=str(auth_json_factory()))
+    options = {
+        "model": "gpt-5.5",
+        "client_metadata": {"session_id": "session-root", "thread_id": "thread-child"},
+        "codex_metadata": True,
+    }
+
+    first = provider._responses_payload(_provider_messages(), **options)  # noqa: SLF001
+    second = provider._responses_payload(_provider_messages(), **options)  # noqa: SLF001
+    first_metadata = first["client_metadata"]
+    second_metadata = second["client_metadata"]
+
+    assert first_metadata["session_id"] == second_metadata["session_id"] == "session-root"
+    assert first_metadata["thread_id"] == second_metadata["thread_id"] == "thread-child"
+    assert first_metadata["x-codex-installation-id"] == second_metadata["x-codex-installation-id"]
+    assert first_metadata["x-codex-window-id"] == second_metadata["x-codex-window-id"]
+    assert first_metadata["turn_id"] != second_metadata["turn_id"]
+
+
+def test_responses_payload_codex_metadata_requires_explicit_session_identity():
+    provider = ChatGPTOAuthProvider()
+
+    with pytest.raises(ChatGPTOAuthInvalidRequestError):
+        provider._responses_payload(  # noqa: SLF001
+            _provider_messages(),
+            model="gpt-5.5",
+            codex_metadata=True,
+        )
+
+
+def test_responses_payload_prompt_cache_key_precedence_and_session_fallback():
+    provider = ChatGPTOAuthProvider()
+
+    fallback = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        client_metadata={"session_id": "session-cache"},
+    )
+    explicit = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        prompt_cache_key="explicit-cache",
+        client_metadata={"session_id": "session-cache"},
+    )
+    absent = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+    )
+    blank_session = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        client_metadata={"session_id": "   "},
+    )
+    explicit_with_blank_session = provider._responses_payload(  # noqa: SLF001
+        _provider_messages(),
+        model="gpt-5.5",
+        prompt_cache_key="explicit-cache",
+        client_metadata={"session_id": "   "},
+    )
+
+    assert fallback["prompt_cache_key"] == "session-cache"
+    assert explicit["prompt_cache_key"] == "explicit-cache"
+    assert "prompt_cache_key" not in absent
+    assert "prompt_cache_key" not in blank_session
+    assert explicit_with_blank_session["prompt_cache_key"] == "explicit-cache"
 
 
 def test_chat_stream_adds_responses_lite_header(monkeypatch):

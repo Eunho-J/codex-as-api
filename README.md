@@ -15,7 +15,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Tool calling** — function calls, tool results, and parallel tool calls
 - **Image support** — generation, inspection, multimodal Chat input, and capability-gated `original` image detail in classic Responses
 - **Reasoning** — configurable effort/context, `standard` mode compatibility, persisted reasoning, and streaming thinking content
-- **Codex features** — `prompt_cache_key`, process-local `response_id` continuation, subagent headers, and remote compaction
+- **Codex features** — session-aware `prompt_cache_key`, process-local Chat `response_id` continuation, subagent headers, and remote compaction
 - **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model, reasoning-effort, and context-window settings
 - **Token estimate & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
 - **Auto auth** — reads `~/.codex/auth.json` and auto-refreshes OAuth tokens
@@ -276,13 +276,36 @@ curl -N http://localhost:18080/v1/messages \
   }'
 ```
 
+### Identifier and cache behavior
+
+The two compatibility facades intentionally use the similarly named fields for
+different jobs:
+
+| Input or output | `/v1/chat/completions` | `/v1/messages` |
+|---|---|---|
+| `client_metadata.session_id` | Forwarded to Codex, used as the default `prompt_cache_key`, and required when Codex metadata mode is enabled | Not used or forwarded |
+| `client_metadata.thread_id` | Codex metadata thread identity; defaults to `session_id` for a root request and preserves an explicit child thread | Not used or synthesized |
+| `prompt_cache_key` | Explicit value wins; otherwise a non-empty `client_metadata.session_id` is used; otherwise omitted | Optional proxy extension; explicit value wins, otherwise the Claude Code session header is hashed |
+| `x-claude-code-session-id` | Not used | SHA-256 of `codex-as-api:claude-code-session:<exact header value>` supplies cache affinity only |
+| `previous_response_id` | Resolves a known entry from the 256-chain process-local history and replays full input/output over HTTP; never forwarded | Non-null values return Anthropic-style HTTP 400 because normal Messages is stateless |
+| `cache_control` | Not an OpenAI Chat control | Validated as an Anthropic compatibility hint, then stripped before Codex transport |
+
+Anthropic `cache_control` is a cache-boundary annotation, not an identifier.
+This proxy accepts only `{"type":"ephemeral"}` with optional `ttl: "5m"` or
+`"1h"` at request, system, message, content-block, and tool locations. The
+private Codex request has no Anthropic breakpoint or TTL fields, so accepted
+hints do not reproduce Anthropic caching semantics. Normal `/v1/messages`
+responses do not expose the Chat-only `response_id`. The custom
+`/v1/messages/compact` endpoint retains its documented local
+`previous_response_id` support.
+
 ### `POST /v1/messages/count_tokens`
 
 Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route counts text locally and returns context-window metadata for the effective backend model. Normalized model-visible messages, tool calls, tool-result metadata, reasoning, and tool schemas are counted once. Request-envelope and generation-control fields are excluded, and image inputs use a separate fixed estimate so inline base64 data is not counted as text.
 
 GPT-5-family text uses a bundled port of official `tiktoken` `o200k_base` `encode_ordinary`: the same Unicode pre-tokenization regex, byte-pair merge algorithm, and merge-rank data are implemented in Python, TypeScript, and Rust. Official `tiktoken` maps `gpt-5` and its `gpt-5-`-prefixed variants to [`o200k_base`](https://github.com/openai/tiktoken/blob/08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa/tiktoken/model.py#L7-L20); this project applies that GPT-5-family encoding to the bundled `gpt-5.*` Codex model IDs. The project does not depend on a `tiktoken` package or download encoding data at runtime. The last upstream synchronization check was **2026-07-14**, against [`tiktoken` 0.13.0 at `08a5f3b`](https://github.com/openai/tiktoken/tree/08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa); the bundled rank file SHA-256 is `446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`.
 
-Official Codex also has a [`ceil(UTF-8 bytes / 4)` truncation helper](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/utils/string/src/truncate.rs#L4-L84), but Codex documents the history estimate using that helper as [a coarse lower bound rather than a tokenizer-accurate count](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/core/src/context_manager/history.rs#L160-L185). This endpoint therefore uses exact `o200k_base` ordinary text tokenization instead. The complete request count remains an estimate because protocol-wrapper overhead and image cost are local constants, but the former byte-as-token and raw-payload double count that could overstate ordinary Claude Code requests by about 8x is removed.
+Official Codex also has a [`ceil(UTF-8 bytes / 4)` truncation helper](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/utils/string/src/truncate.rs#L4-L84), but Codex documents the history estimate using that helper as [a coarse lower bound rather than a tokenizer-accurate count](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/core/src/context_manager/history.rs#L162-L186). This endpoint therefore uses exact `o200k_base` ordinary text tokenization instead. The complete request count remains an estimate because protocol-wrapper overhead and image cost are local constants, but the former byte-as-token and raw-payload double count that could overstate ordinary Claude Code requests by about 8x is removed.
 
 ```bash
 curl http://localhost:18080/v1/messages/count_tokens \
@@ -365,7 +388,7 @@ These features are extensions beyond the standard OpenAI API, designed for Codex
 
 `prompt_cache_key` keeps related prefixes in the same backend cache family. Use one stable, privacy-safe key per conversation or application prefix.
 
-Official Codex [defaults this field to its own per-conversation `thread_id`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/core/src/client.rs#L469-L473). This multi-client facade cannot infer that boundary safely and does not reuse its process-level metadata thread ID as a cache key, which could mix unrelated callers. Set `prompt_cache_key` explicitly when stable cache affinity is required.
+Official Codex 0.145.0 and current `main` [default this field to Responses metadata `session_id`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/core/src/client.rs#L483-L486), unless an explicit override is present. This proxy follows the same precedence on Chat requests: explicit `prompt_cache_key`, then a non-empty `client_metadata.session_id`, then omission. It does not generate a process-wide session or reuse `thread_id` as the cache key.
 
 The private Codex OAuth HTTP and WebSocket request structures do not contain public GPT-5.6 `prompt_cache_options` or content-block `prompt_cache_breakpoint` fields. This proxy treats explicit `null` as omitted and rejects non-null controls with HTTP 400 instead of forwarding a request that the private route rejects or silently pretending the requested cache policy was applied. Use a public Responses API client when explicit cache policy or breakpoints are required. See OpenAI's [public prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints).
 
@@ -420,7 +443,7 @@ The mapping is intentionally transport-aware:
 |---|---|
 | `reasoning.mode: "standard"` | Omit mode; send the resolved effort/context |
 | `reasoning.mode: "pro"` | HTTP 400; no official Codex alias |
-| `prompt_cache_key` | Forward unchanged |
+| `prompt_cache_key` | Forward an explicit value; otherwise use non-empty `client_metadata.session_id` |
 | Non-null `prompt_cache_options` / breakpoint | HTTP 400; `null` is omitted and there is no private field |
 | Non-null `safety_identifier` | HTTP 400; `null` is omitted and OAuth account/thread IDs are not semantic aliases |
 | Non-empty `stop` / `stop_sequences` | HTTP 400; no private field |
@@ -428,7 +451,7 @@ The mapping is intentionally transport-aware:
 | `service_tier: "fast"` | Send `service_tier: "priority"` |
 | `service_tier: "default"` | Omit the field |
 
-Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the official Codex [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/common.rs#L215-L293).
+Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the official Codex [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/common.rs#L251-L307).
 
 ### `responses_lite`
 
@@ -474,15 +497,15 @@ Set `parallel_tool_calls: true` to request parallel tool calls when the selected
 
 ### `client_metadata` and `codex_metadata`
 
-`client_metadata` is forwarded to the Codex backend. Set `codex_metadata: true` or `CODEX_AS_API_CODEX_METADATA=on` to overlay Codex-style turn metadata keys such as `turn_id`, `session_id`, `thread_id`, and `x-codex-turn-metadata`.
+`client_metadata` is forwarded to the Codex backend. Set `codex_metadata: true` or `CODEX_AS_API_CODEX_METADATA=on` to add Codex-style turn metadata. Metadata mode requires a non-empty caller-supplied `client_metadata.session_id`; it preserves that session, defaults a missing root `thread_id` to the session, and preserves an explicit child `thread_id`.
 
-Do not rely on user-supplied values for those reserved Codex metadata keys when metadata mode is enabled; this package regenerates them per turn. Metadata `thread_id` is not a `previous_response_id` alias and is not automatically reused as `prompt_cache_key` by this multi-client proxy.
+The installation ID and process window ID remain stable, while `turn_id` and `x-codex-turn-metadata` are regenerated for each request. Metadata `thread_id` is neither a `previous_response_id` alias nor a cache key. An explicit `prompt_cache_key` wins; otherwise the non-empty session ID supplies cache affinity.
 
 ### `previous_response_id`
 
 Non-streaming responses and the final streaming finish chunk expose the real upstream Responses ID as `response_id`. The provider keeps up to 256 completed chains in a process-local LRU store. Passing a known ID as `previous_response_id` prepends the saved semantic input and exact prior `response.output_item.done` items—including encrypted reasoning and tool items—to the new input, then sends one full private HTTP request. The ID itself is never forwarded and is never converted to `thread_id`.
 
-That event source is intentional: the official Codex SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/sse/responses.rs#L326-L337), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/393f64565ab46f09d99ca4d9bd973537e72a114b/codex-rs/codex-api/src/sse/responses.rs#L112-L120), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
+That event source is intentional: the official Codex SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/sse/responses.rs#L327-L337), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/sse/responses.rs#L112-L120), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
 
 Only a real `response.completed` event commits a chain. Branches from an older retained ID are supported. Restarting the server or evicting an old entry removes that local state; an unknown ID returns HTTP 400 before any upstream request.
 
@@ -608,7 +631,7 @@ curl -N http://localhost:18080/v1/chat/completions \
 
 ## Using with Claude Code
 
-The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used by Claude Code. Compatibility was validated with Claude Code `2.1.209`, including streaming, real Codex OAuth chat, request-level GPT model routing, adaptive thinking, `--effort max`, and Fast Mode.
+The `/v1/messages` endpoint implements the Anthropic Messages gateway shape used by Claude Code. The current request shape was reproduced with Claude Code `2.1.220`; streaming, real Codex OAuth chat, request-level GPT model routing, adaptive thinking, `--effort max`, and Fast Mode remain covered.
 
 Start the proxy first. `CODEX_AS_API_MODEL` is the fallback used when Claude Code sends a built-in Anthropic model name:
 
@@ -632,7 +655,14 @@ CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
 claude
 ```
 
-Run `/model` and select **GPT-5.6 Sol**. The custom entry is appended to the built-in rows rather than replacing them. Claude Code `2.1.209` recognizes this GPT model ID without a custom capability declaration: `/effort low|medium|high|xhigh|max`, the picker effort control, and `claude --effort ...` are translated from Claude Code's `output_config.effort` to the Codex reasoning effort. Claude Code Fast Mode's `speed: "fast"` is translated to the Codex `priority` service tier.
+Run `/model` and select **GPT-5.6 Sol**. The custom entry is appended to the built-in rows rather than replacing them. Claude Code `2.1.220` recognizes this GPT model ID without a custom capability declaration: `/effort low|medium|high|xhigh|max`, the picker effort control, and `claude --effort ...` are translated from Claude Code's `output_config.effort` to the Codex reasoning effort. Claude Code Fast Mode's `speed: "fast"` is translated to the Codex `priority` service tier.
+
+Claude Code sends `x-claude-code-session-id` for gateway request grouping. This
+proxy hashes the exact header value into a stable `prompt_cache_key`; it does
+not turn the header into Codex `session_id` or `thread_id` metadata. A
+top-level `prompt_cache_key` is supported as a proxy extension and takes
+precedence. Normal Messages requests remain stateless, so callers must send
+full message history.
 
 If managed settings define an `availableModels` allowlist, that list must include the exact `ANTHROPIC_CUSTOM_MODEL_OPTION` value, such as `gpt-5.6-sol`; otherwise Claude Code hides or rejects the custom row.
 
@@ -690,7 +720,7 @@ The provider handles:
 ## Release & package publishing
 
 - Bump versions in `pyproject.toml`, `src/codex_as_api/__init__.py`, `src/codex_as_api/server.py`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.6.3` from the matching commit.
+- Publish a GitHub Release such as `v0.6.4` from the matching commit.
 - The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
 
 Publishing to npmjs requires an authenticated npm session (`npm login` beforehand; `npm whoami` should succeed). From the repository root, the publish itself is one command:
@@ -732,6 +762,19 @@ npm test
 
 
 ## Release Notes
+
+### v0.6.4
+
+- Remove process-global generated Codex session/thread identities and require
+  explicit session identity when Codex metadata mode is enabled.
+- Resolve Chat cache affinity as explicit `prompt_cache_key`, then
+  `client_metadata.session_id`, then omission.
+- Derive Claude Code cache affinity from `x-claude-code-session-id` without
+  fabricating Codex metadata; keep normal Anthropic Messages stateless.
+- Validate and strip Anthropic `cache_control` compatibility hints without
+  claiming unavailable breakpoint or TTL semantics.
+- Update current compatibility evidence to Codex `0.145.0`, Codex `main` at
+  `bd2de422aa287b97b06ca6425a10935bcf1b3731`, and Claude Code `2.1.220`.
 
 ### v0.6.3
 

@@ -23,8 +23,6 @@ _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _CAPABILITIES_PATH = _PROJECT_ROOT / "config" / "model-capabilities.json"
 _PACKAGE_CAPABILITIES_PATH = pathlib.Path(__file__).resolve().with_name("model-capabilities.json")
 _INSTALLATION_NAMESPACE = uuid.UUID("d2c81270-8f15-5e8d-a5c4-4cdbf2c21fd0")
-_SESSION_ID = str(uuid.uuid4())
-_THREAD_ID = str(uuid.uuid4())
 _WINDOW_ID = str(uuid.uuid4())
 
 ResponsesLiteMode = Literal["off", "on", "auto"]
@@ -157,14 +155,23 @@ def build_codex_client_metadata(
     existing: Mapping[str, str] | None,
 ) -> dict[str, str]:
     metadata = dict(existing or {})
+    session_id = metadata.get(SESSION_ID_KEY)
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("codex_metadata requires a non-empty client_metadata.session_id")
+    thread_id = metadata.get(THREAD_ID_KEY)
+    if thread_id is None:
+        thread_id = session_id
+    elif not isinstance(thread_id, str) or not thread_id.strip():
+        raise ValueError("client_metadata.thread_id must be a non-empty string when provided")
+
     auth_path = pathlib.Path(auth_json_path or "~/.codex/auth.json").expanduser()
     absolute_path = os.path.abspath(os.fspath(auth_path))
     installation_id = str(uuid.uuid5(_INSTALLATION_NAMESPACE, f"codex-as-api:{absolute_path}"))
     turn_id = str(uuid.uuid4())
     turn_metadata = {
         "installation_id": installation_id,
-        "session_id": _SESSION_ID,
-        "thread_id": _THREAD_ID,
+        "session_id": session_id,
+        "thread_id": thread_id,
         "turn_id": turn_id,
         "window_id": _WINDOW_ID,
         "source": "codex-as-api",
@@ -172,8 +179,8 @@ def build_codex_client_metadata(
     metadata.update(
         {
             INSTALLATION_ID_KEY: installation_id,
-            SESSION_ID_KEY: _SESSION_ID,
-            THREAD_ID_KEY: _THREAD_ID,
+            SESSION_ID_KEY: session_id,
+            THREAD_ID_KEY: thread_id,
             TURN_ID_KEY: turn_id,
             WINDOW_ID_KEY: _WINDOW_ID,
             TURN_METADATA_KEY: json.dumps(turn_metadata, separators=(",", ":"), sort_keys=True),

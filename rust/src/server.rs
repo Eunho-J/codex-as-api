@@ -7,7 +7,9 @@ use axum::Router;
 use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
 use tokio::task;
 
@@ -677,6 +679,40 @@ fn optional_string_field(body: &Value, field: &str) -> Result<Option<String>, Pr
             "{field} must be a string when provided"
         ))),
     }
+}
+
+fn anthropic_prompt_cache_key(
+    body: &Value,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ProviderError> {
+    if let Some(explicit) = optional_string_field(body, "prompt_cache_key")? {
+        if explicit.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "prompt_cache_key must be a non-empty string when provided".to_string(),
+            ));
+        }
+        return Ok(Some(explicit));
+    }
+
+    let Some(header) = headers.get("x-claude-code-session-id") else {
+        return Ok(None);
+    };
+    let session_id = header.to_str().map_err(|_| {
+        ProviderError::InvalidRequest("x-claude-code-session-id must be valid UTF-8".to_string())
+    })?;
+    if session_id.trim().is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "x-claude-code-session-id must be a non-empty string".to_string(),
+        ));
+    }
+
+    let digest =
+        Sha256::digest(format!("codex-as-api:claude-code-session:{session_id}").as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(Some(key))
 }
 
 fn validate_anthropic_context_management(body: &Value) -> Result<(), ProviderError> {
@@ -1700,6 +1736,19 @@ async fn anthropic_messages(
         )
             .into_response()
     })?;
+    if body
+        .get("previous_response_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(
+                400,
+                "previous_response_id is not supported by /v1/messages",
+            )),
+        )
+            .into_response());
+    }
     reject_unsupported_tool_features(&body).map_err(|error| {
         error_response(map_error_status(&error), error.to_string()).into_response()
     })?;
@@ -1790,6 +1839,13 @@ async fn anthropic_messages(
         )
             .into_response()
     })?;
+    let prompt_cache_key = anthropic_prompt_cache_key(&body, &headers).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &error.to_string())),
+        )
+            .into_response()
+    })?;
     let controls = generation_controls(
         reasoning,
         optional_string_field(&body, "safety_identifier").map_err(|error| {
@@ -1830,7 +1886,7 @@ async fn anthropic_messages(
                     reasoning_effort.as_deref(),
                     max_tokens,
                     stop_ref,
-                    None,
+                    prompt_cache_key.as_deref(),
                     subagent.as_deref(),
                     memgen_request,
                     None,
@@ -1839,7 +1895,7 @@ async fn anthropic_messages(
                     service_tier.as_deref(),
                     text_ref,
                     None,
-                    None,
+                    Some(false),
                     responses_lite_val.as_ref(),
                     None,
                     &controls,
@@ -1937,7 +1993,7 @@ async fn anthropic_messages(
                 reasoning_effort.as_deref(),
                 max_tokens,
                 stop_ref,
-                None,
+                prompt_cache_key.as_deref(),
                 subagent.as_deref(),
                 memgen_request,
                 None,
@@ -1946,7 +2002,7 @@ async fn anthropic_messages(
                 service_tier.as_deref(),
                 text_ref,
                 None,
-                None,
+                Some(false),
                 responses_lite_val.as_ref(),
                 None,
                 &controls,
@@ -1990,6 +2046,16 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
+
+    fn has_nested_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Array(items) => items.iter().any(|item| has_nested_key(item, key)),
+            Value::Object(object) => {
+                object.contains_key(key) || object.values().any(|item| has_nested_key(item, key))
+            }
+            _ => false,
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RecordedEndpoint {
@@ -5619,6 +5685,279 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         }
+        assert_eq!(recording.requests().len(), before_invalid);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chat_identity_drives_codex_metadata_and_prompt_cache_affinity() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let messages = json!([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "Answer."}
+        ]);
+
+        let missing_identity = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "messages": messages,
+                "codex_metadata": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_identity.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(recording.requests().is_empty());
+
+        let root = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "messages": messages,
+                "client_metadata": {
+                    "session_id": "session-root",
+                    "caller": "test"
+                },
+                "codex_metadata": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(root.status(), reqwest::StatusCode::OK);
+
+        let child = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "messages": messages,
+                "prompt_cache_key": "explicit-cache-key",
+                "client_metadata": {
+                    "session_id": "session-root",
+                    "thread_id": "thread-child"
+                },
+                "codex_metadata": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(child.status(), reqwest::StatusCode::OK);
+
+        let anonymous = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "messages": messages,
+                "codex_metadata": false,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), reqwest::StatusCode::OK);
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].body["prompt_cache_key"], "session-root");
+        assert_eq!(requests[1].body["prompt_cache_key"], "explicit-cache-key");
+        assert!(requests[2].body.get("prompt_cache_key").is_none());
+
+        let root_metadata = requests[0].body["client_metadata"].as_object().unwrap();
+        let child_metadata = requests[1].body["client_metadata"].as_object().unwrap();
+        assert_eq!(root_metadata["session_id"], "session-root");
+        assert_eq!(root_metadata["thread_id"], "session-root");
+        assert_eq!(root_metadata["caller"], "test");
+        assert_eq!(child_metadata["session_id"], "session-root");
+        assert_eq!(child_metadata["thread_id"], "thread-child");
+        assert_eq!(
+            root_metadata["x-codex-installation-id"],
+            child_metadata["x-codex-installation-id"]
+        );
+        assert_eq!(
+            root_metadata["x-codex-window-id"],
+            child_metadata["x-codex-window-id"]
+        );
+        assert_ne!(
+            root_metadata["turn_id"], child_metadata["turn_id"],
+            "turn_id must be fresh for each request"
+        );
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_session_cache_affinity_and_cache_controls_wire_end_to_end() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let controlled_body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 64,
+            "cache_control": {"type": "ephemeral"},
+            "system": [{
+                "type": "text",
+                "text": "Be precise.",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "cache_control": {"type": "ephemeral"},
+                "content": [{
+                    "type": "text",
+                    "text": "Answer.",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]
+            }],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look something up",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "responses_lite": false
+        });
+
+        let first = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-a")
+            .json(&controlled_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        let mut streaming_body = controlled_body.clone();
+        streaming_body["stream"] = json!(true);
+        let second = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-a")
+            .json(&streaming_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), reqwest::StatusCode::OK);
+        let _ = second.text().await.unwrap();
+
+        let third = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-b")
+            .json(&controlled_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(third.status(), reqwest::StatusCode::OK);
+
+        let mut explicit_body = controlled_body.clone();
+        explicit_body["prompt_cache_key"] = json!("caller-cache-key");
+        let explicit = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-a")
+            .json(&explicit_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(explicit.status(), reqwest::StatusCode::OK);
+
+        let mut no_session_body = controlled_body.clone();
+        no_session_body["previous_response_id"] = Value::Null;
+        let no_session = client
+            .post(format!("{api_url}/v1/messages"))
+            .json(&no_session_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_session.status(), reqwest::StatusCode::OK);
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 5);
+        let session_a_key = "fed3534a8ed1887fdc51648477597f2a98ec264b033271334062e9cba3c23fae";
+        let session_b_key = "00d0e78bab5b2ca951064120f1c2d86d481250a6814637aeec71f12b6aed398b";
+        assert_eq!(requests[0].body["prompt_cache_key"], session_a_key);
+        assert_eq!(requests[1].body["prompt_cache_key"], session_a_key);
+        assert_eq!(requests[2].body["prompt_cache_key"], session_b_key);
+        assert_eq!(requests[3].body["prompt_cache_key"], "caller-cache-key");
+        assert!(requests[4].body.get("prompt_cache_key").is_none());
+        for request in &requests {
+            assert!(request.body.get("client_metadata").is_none());
+            assert!(request.body.get("previous_response_id").is_none());
+        }
+        assert!(!has_nested_key(&requests[0].body, "cache_control"));
+
+        let before_invalid = recording.requests().len();
+        let invalid_requests = [
+            json!({"previous_response_id": "resp-prior"}),
+            json!({"prompt_cache_key": ""}),
+            json!({"prompt_cache_key": 42}),
+            json!({"cache_control": {"type": "persistent"}}),
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Answer.",
+                        "cache_control": {"type": "ephemeral", "ttl": "2h"}
+                    }]
+                }]
+            }),
+        ];
+        for fields in invalid_requests {
+            let mut body = json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "system": "Be precise.",
+                "messages": [{"role": "user", "content": "Answer."}],
+                "responses_lite": false
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let response = client
+                .post(format!("{api_url}/v1/messages"))
+                .header("x-claude-code-session-id", "session-a")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["type"], "error");
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+        }
+
+        let empty_session = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", " ")
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "system": "Be precise.",
+                "messages": [{"role": "user", "content": "Answer."}],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_session.status(), reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(recording.requests().len(), before_invalid);
 
         api_handle.abort();

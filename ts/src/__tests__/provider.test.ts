@@ -750,20 +750,126 @@ describe("ChatGPTOAuthProvider payload", () => {
     assert.equal(Object.hasOwn(captured ?? {}, "safety_identifier"), false);
   });
 
-  it("codex metadata mode overlays reserved keys", () => {
+  it("uses explicit Codex session identity and preserves metadata lifetimes", () => {
     const provider = new ChatGPTOAuthProvider({ authJsonPath: writeAuthFile() });
-    const payload = (provider as unknown as {
-      responsesPayload(messages: Message[], opts: { model: string; clientMetadata: Record<string, string>; codexMetadata: boolean }): Record<string, unknown>;
-    }).responsesPayload(providerMessages(), {
+    const responsesPayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: Record<string, unknown>): Record<string, unknown>;
+    }).responsesPayload.bind(provider);
+    const first = responsesPayload(providerMessages(), {
       model: "gpt-5.5",
-      clientMetadata: { app: "kept", turn_id: "user-value" },
+      clientMetadata: {
+        app: "kept",
+        session_id: "session-root",
+        turn_id: "user-value",
+      },
       codexMetadata: true,
     });
-    const metadata = payload.client_metadata as Record<string, string>;
+    const second = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      clientMetadata: { session_id: "session-root" },
+      codexMetadata: true,
+    });
+    const child = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      clientMetadata: {
+        session_id: "session-root",
+        thread_id: "thread-child",
+      },
+      codexMetadata: true,
+    });
+    const firstMetadata = first.client_metadata as Record<string, string>;
+    const secondMetadata = second.client_metadata as Record<string, string>;
+    const childMetadata = child.client_metadata as Record<string, string>;
+    const turnMetadata = JSON.parse(
+      firstMetadata["x-codex-turn-metadata"],
+    ) as Record<string, string>;
 
-    assert.equal(metadata.app, "kept");
-    assert.notEqual(metadata.turn_id, "user-value");
-    assert.equal(JSON.parse(metadata["x-codex-turn-metadata"]).source, "codex-as-api");
+    assert.equal(firstMetadata.app, "kept");
+    assert.equal(firstMetadata.session_id, "session-root");
+    assert.equal(firstMetadata.thread_id, "session-root");
+    assert.equal(childMetadata.session_id, "session-root");
+    assert.equal(childMetadata.thread_id, "thread-child");
+    assert.notEqual(firstMetadata.turn_id, "user-value");
+    assert.notEqual(firstMetadata.turn_id, secondMetadata.turn_id);
+    assert.equal(
+      firstMetadata["x-codex-installation-id"],
+      secondMetadata["x-codex-installation-id"],
+    );
+    assert.equal(
+      firstMetadata["x-codex-window-id"],
+      secondMetadata["x-codex-window-id"],
+    );
+    assert.deepEqual(
+      {
+        session_id: turnMetadata.session_id,
+        thread_id: turnMetadata.thread_id,
+        turn_id: turnMetadata.turn_id,
+        source: turnMetadata.source,
+      },
+      {
+        session_id: "session-root",
+        thread_id: "session-root",
+        turn_id: firstMetadata.turn_id,
+        source: "codex-as-api",
+      },
+    );
+    assert.equal(first.prompt_cache_key, "session-root");
+    assert.equal(child.prompt_cache_key, "session-root");
+  });
+
+  it("requires session identity when Codex metadata is enabled", () => {
+    const provider = new ChatGPTOAuthProvider({ authJsonPath: writeAuthFile() });
+    const responsesPayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: Record<string, unknown>): Record<string, unknown>;
+    }).responsesPayload.bind(provider);
+
+    assert.throws(
+      () => responsesPayload(providerMessages(), {
+        model: "gpt-5.5",
+        clientMetadata: { thread_id: "orphan-thread" },
+        codexMetadata: true,
+      }),
+      ChatGPTOAuthInvalidRequestError,
+    );
+  });
+
+  it("prefers an explicit prompt cache key, then session identity, then omission", () => {
+    const provider = new ChatGPTOAuthProvider({});
+    const responsesPayload = (provider as unknown as {
+      responsesPayload(messages: Message[], opts: Record<string, unknown>): Record<string, unknown>;
+    }).responsesPayload.bind(provider);
+    const explicit = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      promptCacheKey: "explicit-cache",
+      clientMetadata: { session_id: "session-cache" },
+      codexMetadata: false,
+    });
+    const derived = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      clientMetadata: { session_id: "session-cache" },
+      codexMetadata: false,
+    });
+    const absent = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      codexMetadata: false,
+    });
+    const blankSession = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      clientMetadata: { session_id: "   " },
+      codexMetadata: false,
+    });
+    const explicitWithBlankSession = responsesPayload(providerMessages(), {
+      model: "gpt-5.5",
+      promptCacheKey: "explicit-cache",
+      clientMetadata: { session_id: "   " },
+      codexMetadata: false,
+    });
+
+    assert.equal(explicit.prompt_cache_key, "explicit-cache");
+    assert.equal(derived.prompt_cache_key, "session-cache");
+    assert.equal(Object.hasOwn(absent, "prompt_cache_key"), false);
+    assert.equal(Object.hasOwn(blankSession, "prompt_cache_key"), false);
+    assert.equal(explicitWithBlankSession.prompt_cache_key, "explicit-cache");
   });
 });
 

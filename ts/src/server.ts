@@ -528,10 +528,12 @@ export function createApp(opts?: CreateAppOptions): express.Express {
 
   async function compact(req: Request, res: Response): Promise<void> {
     try {
-      const body = req.body;
+      const isAnthropicCompact = req.path === "/v1/messages/compact";
+      const body = isAnthropicCompact
+        ? stripAnthropicCacheControls(req.body)
+        : req.body;
       rejectUnsupportedGenerationFeatures(body);
       rejectUnsupportedCompactFields(body);
-      const isAnthropicCompact = req.path === "/v1/messages/compact";
       if (isAnthropicCompact) {
         validateAnthropicContextManagement(body.context_management);
       }
@@ -581,7 +583,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
 
   app.post("/v1/messages/count_tokens", async (req: Request, res: Response) => {
     try {
-      const body = req.body;
+      const body = stripAnthropicCacheControls(req.body);
       rejectUnsupportedGenerationFeatures(body);
       validateAnthropicContextManagement(body.context_management);
       const { messages, tools } = anthropicRequestToInternal({
@@ -613,10 +615,29 @@ export function createApp(opts?: CreateAppOptions): express.Express {
 
   app.post("/v1/messages", async (req: Request, res: Response) => {
     try {
-      const body = req.body;
+      const body = stripAnthropicCacheControls(req.body);
       rejectUnsupportedGenerationFeatures(body);
       validateAnthropicContextManagement(body.context_management);
+      if (body.previous_response_id != null) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          "previous_response_id is not supported by /v1/messages; send the full messages history",
+        );
+      }
       const requestId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+      const explicitPromptCacheKey = resolvePromptCacheKey(
+        body.prompt_cache_key,
+      );
+      const claudeCodeSessionId = explicitPromptCacheKey == null
+        ? resolveClaudeCodeSessionId(
+            req.headers["x-claude-code-session-id"],
+          )
+        : undefined;
+      const promptCacheKey = explicitPromptCacheKey
+        ?? (
+          claudeCodeSessionId == null
+            ? undefined
+            : claudeSessionPromptCacheKey(claudeCodeSessionId)
+        );
 
       const subagent =
         body.subagent ||
@@ -668,10 +689,12 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         maxTokens: body.max_tokens,
         stop: stop ?? undefined,
         text: resolveTextOptions(text, body.verbosity),
+        promptCacheKey,
         promptCacheOptions: body.prompt_cache_options,
         safetyIdentifier: body.safety_identifier,
         subagent,
         memgenRequest,
+        codexMetadata: false,
         responsesLite: body.responses_lite,
         serviceTier: resolveAnthropicServiceTier(body),
       };
@@ -758,6 +781,128 @@ function resolvePreviousResponseId(value: unknown): string | undefined {
     );
   }
   return value;
+}
+
+function resolveClaudeCodeSessionId(
+  value: string | string[] | undefined,
+): string | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "x-claude-code-session-id must be a non-empty string when provided",
+    );
+  }
+  return value;
+}
+
+function claudeSessionPromptCacheKey(sessionId: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(`codex-as-api:claude-code-session:${sessionId}`, "utf8")
+    .digest("hex");
+}
+
+function stripAnthropicCacheControls<T extends Record<string, unknown>>(
+  body: T,
+): T {
+  const stripped = stripCacheControlFromRecord(body, "request");
+  if (Array.isArray(stripped.system)) {
+    stripped.system = stripped.system.map((block, index) =>
+      stripAnthropicContentCacheControls(block, `system block ${index}`)
+    );
+  } else if (isRecord(stripped.system)) {
+    stripped.system = stripAnthropicContentCacheControls(
+      stripped.system,
+      "system",
+    );
+  }
+  if (Array.isArray(stripped.messages)) {
+    stripped.messages = stripped.messages.map((message, index) => {
+      if (!isRecord(message)) return message;
+      const cleanMessage = stripCacheControlFromRecord(
+        message,
+        `message ${index}`,
+      );
+      if (Array.isArray(cleanMessage.content)) {
+        cleanMessage.content = cleanMessage.content.map((block, blockIndex) =>
+          stripAnthropicContentCacheControls(
+            block,
+            `message ${index} content block ${blockIndex}`,
+          )
+        );
+      }
+      return cleanMessage;
+    });
+  }
+  if (Array.isArray(stripped.tools)) {
+    stripped.tools = stripped.tools.map((tool, index) =>
+      isRecord(tool)
+        ? stripCacheControlFromRecord(tool, `tool ${index}`)
+        : tool
+    );
+  }
+  return stripped as T;
+}
+
+function stripAnthropicContentCacheControls(
+  value: unknown,
+  location: string,
+): unknown {
+  if (!isRecord(value)) return value;
+  const stripped = stripCacheControlFromRecord(value, location);
+  if (Array.isArray(stripped.content)) {
+    stripped.content = stripped.content.map((block, index) =>
+      stripAnthropicContentCacheControls(
+        block,
+        `${location} nested content block ${index}`,
+      )
+    );
+  }
+  return stripped;
+}
+
+function stripCacheControlFromRecord(
+  value: Record<string, unknown>,
+  location: string,
+): Record<string, unknown> {
+  const stripped = { ...value };
+  if (!Object.hasOwn(stripped, "cache_control")) return stripped;
+  validateAnthropicCacheControl(stripped.cache_control, location);
+  delete stripped.cache_control;
+  return stripped;
+}
+
+function validateAnthropicCacheControl(
+  value: unknown,
+  location: string,
+): void {
+  // Accepted only as a Claude request-shape hint; Codex receives no TTL or
+  // breakpoint metadata.
+  if (!isRecord(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${location} cache_control must be an object`,
+    );
+  }
+  const unknownKeys = Object.keys(value).filter(
+    (key) => key !== "type" && key !== "ttl",
+  );
+  if (
+    value.type !== "ephemeral"
+    || unknownKeys.length > 0
+    || (
+      Object.hasOwn(value, "ttl")
+      && value.ttl !== "5m"
+      && value.ttl !== "1h"
+    )
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${location} cache_control must have type ephemeral and optional ttl 5m or 1h`,
+    );
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // --- Helpers ---

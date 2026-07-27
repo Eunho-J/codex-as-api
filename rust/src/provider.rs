@@ -3,7 +3,7 @@ use crate::messages::{AssistantResponse, Message, MessageRole, ToolCall, ToolSch
 use crate::model_capabilities::{
     apply_model_capability_fields, build_codex_client_metadata, capability_for_model,
     resolve_codex_metadata_enabled, should_enable_parallel_tool_calls, strip_image_detail_fields,
-    use_responses_lite, LITE_HEADER_NAME, LITE_HEADER_VALUE,
+    use_responses_lite, LITE_HEADER_NAME, LITE_HEADER_VALUE, SESSION_ID_KEY,
 };
 use crate::protocol::{reasoning_from_response_items, response_failure_message};
 use serde_json::{json, Value};
@@ -23,6 +23,25 @@ const CODEX_CLI_VERSION_ENV: &str = "CODEX_AS_API_CODEX_CLI_VERSION";
 const CODEX_CLI_NPM_PACKAGE: &str = "@openai/codex";
 static CODEX_CLI_VERSION_CACHE: OnceLock<Option<String>> = OnceLock::new();
 const RESPONSE_CHAIN_CAPACITY: usize = 256;
+
+fn resolve_prompt_cache_key(
+    explicit: Option<&str>,
+    client_metadata: Option<&HashMap<String, String>>,
+) -> Result<Option<String>, ProviderError> {
+    if let Some(key) = explicit {
+        if key.trim().is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "prompt_cache_key must be a non-empty string when provided".to_string(),
+            ));
+        }
+        return Ok(Some(key.to_string()));
+    }
+
+    Ok(client_metadata
+        .and_then(|metadata| metadata.get(SESSION_ID_KEY))
+        .filter(|session_id| !session_id.trim().is_empty())
+        .cloned())
+}
 
 pub fn prime_codex_cli_version_cache() {
     let _ = resolve_codex_cli_version();
@@ -1361,16 +1380,11 @@ impl ChatGPTOAuthProvider {
             );
         }
 
-        if let Some(key) = prompt_cache_key {
-            if key.is_empty() {
-                return Err(ProviderError::InvalidRequest(
-                    "prompt_cache_key must be a non-empty string when provided".to_string(),
-                ));
-            }
-            payload.as_object_mut().unwrap().insert(
-                "prompt_cache_key".to_string(),
-                Value::String(key.to_string()),
-            );
+        if let Some(key) = resolve_prompt_cache_key(prompt_cache_key, client_metadata)? {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("prompt_cache_key".to_string(), Value::String(key));
         }
         let _ = max_tokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         if let Some(cm) = client_metadata {
@@ -1385,7 +1399,8 @@ impl ChatGPTOAuthProvider {
         }
         if resolve_codex_metadata_enabled(codex_metadata).map_err(ProviderError::Request)? {
             let merged =
-                build_codex_client_metadata(self.auth_json_path.as_deref(), client_metadata);
+                build_codex_client_metadata(self.auth_json_path.as_deref(), client_metadata)
+                    .map_err(ProviderError::InvalidRequest)?;
             let map: serde_json::Map<String, Value> = merged
                 .into_iter()
                 .map(|(k, v)| (k, Value::String(v)))

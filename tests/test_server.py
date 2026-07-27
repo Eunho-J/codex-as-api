@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import threading
@@ -12,6 +13,14 @@ import pytest
 from codex_as_api.codex_config import CodexConfig
 from codex_as_api.model_capabilities import LITE_HEADER_NAME, LITE_HEADER_VALUE, RESPONSES_LITE_ENV
 from codex_as_api.provider import REMOTE_COMPACTION_MARKER, ChatGPTOAuthProvider
+
+
+def _has_nested_key(value: object, key: str) -> bool:
+    if isinstance(value, dict):
+        return key in value or any(_has_nested_key(child, key) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_nested_key(child, key) for child in value)
+    return False
 
 
 class RecordingBackend(NamedTuple):
@@ -517,6 +526,27 @@ def test_chat_handler_omits_standard_reasoning_mode_and_preserves_supported_fiel
             ],
         }
     ]
+
+
+def test_chat_handler_codex_metadata_requires_client_session_before_upstream(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "hello"},
+            ],
+            "codex_metadata": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "chatgpt_oauth_error"
+    assert recording_backend.requests.empty()
 
 
 def test_chat_handler_rejects_pro_mode_before_upstream(
@@ -2074,6 +2104,213 @@ def test_anthropic_messages_uses_codex_model_for_provider_and_client_model_in_re
     )
     assert resp.status_code == 200
     assert resp.json()["model"] == "claude-sonnet-4-5"
+
+
+def test_anthropic_messages_uses_session_cache_affinity_without_codex_metadata(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    monkeypatch.setenv("CODEX_AS_API_CODEX_METADATA", "on")
+    payload = {
+        "model": "gpt-5.6-sol",
+        "max_tokens": 1024,
+        "system": "system",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    session_id = "claude-session-123"
+    other_session_id = "claude-session-456"
+    expected = hashlib.sha256(f"codex-as-api:claude-code-session:{session_id}".encode()).hexdigest()
+    other_expected = hashlib.sha256(f"codex-as-api:claude-code-session:{other_session_id}".encode()).hexdigest()
+
+    first = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": session_id},
+        json=payload,
+    )
+    second = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": session_id},
+        json=payload,
+    )
+    third = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": other_session_id},
+        json=payload,
+    )
+    explicit = client.post(
+        "/v1/messages",
+        headers={"x-claude-code-session-id": session_id},
+        json={**payload, "prompt_cache_key": "explicit-cache-key"},
+    )
+
+    assert first.status_code == second.status_code == third.status_code == explicit.status_code == 200
+    first_outbound = recording_backend.requests.get(timeout=1)["body"]
+    second_outbound = recording_backend.requests.get(timeout=1)["body"]
+    third_outbound = recording_backend.requests.get(timeout=1)["body"]
+    explicit_outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert first_outbound["prompt_cache_key"] == expected
+    assert second_outbound["prompt_cache_key"] == expected
+    assert third_outbound["prompt_cache_key"] == other_expected
+    assert explicit_outbound["prompt_cache_key"] == "explicit-cache-key"
+    assert "client_metadata" not in first_outbound
+    assert "client_metadata" not in second_outbound
+    assert "client_metadata" not in third_outbound
+    assert "client_metadata" not in explicit_outbound
+    assert "response_id" not in first.json()
+    assert "response_id" not in second.json()
+    assert "response_id" not in third.json()
+    assert "response_id" not in explicit.json()
+
+
+def test_anthropic_messages_without_session_or_explicit_cache_key_omits_cache_key(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+            "previous_response_id": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "prompt_cache_key" not in recording_backend.requests.get(timeout=1)["body"]
+
+
+def test_anthropic_messages_accepts_and_strips_ephemeral_cache_control_hints(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "responses_lite": False,
+            "cache_control": {"type": "ephemeral"},
+            "system": [
+                {
+                    "type": "text",
+                    "text": "system",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert not _has_nested_key(outbound, "cache_control")
+    assert outbound["instructions"] == "system"
+    assert outbound["input"][0]["content"][0]["text"] == "hello"
+    assert outbound["tools"][0]["name"] == "lookup"
+
+
+@pytest.mark.parametrize(
+    "cache_control_payload",
+    [
+        {"cache_control": "ephemeral"},
+        {"cache_control": {"type": "persistent"}},
+        {"cache_control": {"type": "ephemeral", "ttl": None}},
+        {
+            "system": [
+                {
+                    "type": "text",
+                    "text": "system",
+                    "cache_control": {"type": "ephemeral", "ttl": "24h"},
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral", "extra": True},
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral", "ttl": []},
+                }
+            ]
+        },
+    ],
+)
+def test_anthropic_messages_rejects_malformed_cache_control_before_upstream(
+    client,
+    recording_backend: RecordingBackend,
+    cache_control_payload,
+):
+    payload = {
+        "model": "gpt-5.6-sol",
+        "max_tokens": 1024,
+        "system": "system",
+        "messages": [{"role": "user", "content": "hello"}],
+        **cache_control_payload,
+    }
+    response = client.post("/v1/messages", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert recording_backend.requests.empty()
+
+
+def test_anthropic_messages_rejects_non_null_previous_response_id_before_upstream(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+            "previous_response_id": "resp-prior",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert recording_backend.requests.empty()
 
 
 def test_anthropic_latest_claude_code_shape_routes_known_gpt_effort_and_fast_mode(

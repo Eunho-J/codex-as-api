@@ -204,7 +204,7 @@ export interface ChatOptions {
   previousResponseId?: string;
   serviceTier?: string;
   text?: Record<string, unknown>;
-  clientMetadata?: Record<string, string>;
+  clientMetadata?: Record<string, unknown>;
   codexMetadata?: boolean;
   responsesLite?: boolean | string;
   parallelToolCalls?: boolean;
@@ -747,26 +747,31 @@ export class ChatGPTOAuthProvider {
       payload.include = ["web_search_call.action.sources"];
     }
     void opts.maxTokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
+    let clientMetadata = normalizeClientMetadata(opts.clientMetadata);
+    if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
+      clientMetadata = buildCodexClientMetadata({
+        authJsonPath: this.authJsonPath,
+        existing: clientMetadata,
+      });
+    }
+    if (clientMetadata != null) {
+      payload.client_metadata = clientMetadata;
+    }
     if (opts.promptCacheKey != null) {
       if (
         typeof opts.promptCacheKey !== "string"
-        || opts.promptCacheKey.length === 0
+        || opts.promptCacheKey.trim().length === 0
       ) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           "prompt_cache_key must be a non-empty string when provided",
         );
       }
       payload.prompt_cache_key = opts.promptCacheKey;
-    }
-    if (opts.clientMetadata != null)
-      payload.client_metadata = opts.clientMetadata;
-    if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
-      payload.client_metadata = buildCodexClientMetadata({
-        authJsonPath: this.authJsonPath,
-        existing: typeof payload.client_metadata === "object" && payload.client_metadata !== null
-          ? payload.client_metadata as Record<string, string>
-          : undefined,
-      });
+    } else {
+      const sessionId = sessionIdFromClientMetadata(clientMetadata);
+      if (sessionId != null) {
+        payload.prompt_cache_key = sessionId;
+      }
     }
     setReasoningPayload(
       payload,
@@ -975,6 +980,30 @@ export class ChatGPTOAuthProvider {
       return;
     }
   }
+}
+
+function normalizeClientMetadata(
+  value: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "client_metadata must be an object when provided",
+    );
+  }
+  return { ...value };
+}
+
+function sessionIdFromClientMetadata(
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  if (metadata == null || !Object.hasOwn(metadata, "session_id")) {
+    return undefined;
+  }
+  const sessionId = metadata.session_id;
+  return typeof sessionId === "string" && sessionId.trim().length > 0
+    ? sessionId
+    : undefined;
 }
 
 function rejectUnsupportedStop(stop: string | string[] | undefined): void {

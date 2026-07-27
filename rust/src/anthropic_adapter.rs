@@ -15,6 +15,7 @@ pub fn anthropic_request_to_internal(
     ),
     String,
 > {
+    validate_anthropic_cache_controls(body)?;
     let mut messages: Vec<Message> = Vec::new();
 
     let system = body.get("system");
@@ -74,6 +75,86 @@ pub fn anthropic_request_to_internal(
         anthropic_output_format_from_body(body)?.and_then(anthropic_output_format_to_openai_text);
 
     Ok((messages, tools, tool_choice, stop, reasoning_effort, text))
+}
+
+fn validate_anthropic_cache_controls(body: &Value) -> Result<(), String> {
+    validate_cache_control_at(body, "cache_control")?;
+
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::Array(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    validate_cache_control_at(block, &format!("system[{index}].cache_control"))?;
+                }
+            }
+            Value::Object(_) => {
+                validate_cache_control_at(system, "system.cache_control")?;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            validate_cache_control_at(
+                message,
+                &format!("messages[{message_index}].cache_control"),
+            )?;
+            if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                validate_message_content_cache_controls(blocks, message_index, "content")?;
+            }
+        }
+    }
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for (index, tool) in tools.iter().enumerate() {
+            validate_cache_control_at(tool, &format!("tools[{index}].cache_control"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_message_content_cache_controls(
+    blocks: &[Value],
+    message_index: usize,
+    path: &str,
+) -> Result<(), String> {
+    for (block_index, block) in blocks.iter().enumerate() {
+        let block_path = format!("messages[{message_index}].{path}[{block_index}]");
+        validate_cache_control_at(block, &format!("{block_path}.cache_control"))?;
+        if let Some(nested) = block.get("content").and_then(Value::as_array) {
+            validate_message_content_cache_controls(
+                nested,
+                message_index,
+                &format!("{path}[{block_index}].content"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache_control_at(value: &Value, location: &str) -> Result<(), String> {
+    let Some(cache_control) = value.get("cache_control") else {
+        return Ok(());
+    };
+    let object = cache_control
+        .as_object()
+        .ok_or_else(|| format!("{location} must be an object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !matches!(field.as_str(), "type" | "ttl"))
+    {
+        return Err(format!("{location}.{field} is not supported"));
+    }
+    if object.get("type").and_then(Value::as_str) != Some("ephemeral") {
+        return Err(format!("{location}.type must be ephemeral"));
+    }
+    match object.get("ttl") {
+        None => Ok(()),
+        Some(Value::String(ttl)) if matches!(ttl.as_str(), "5m" | "1h") => Ok(()),
+        Some(_) => Err(format!("{location}.ttl must be one of: 5m, 1h")),
+    }
 }
 
 fn extract_system_text(system: &Value) -> String {
@@ -666,7 +747,7 @@ fn render_anthropic_content_block(block: &Value) -> String {
         "document" => render_document_block(block),
         "search_result" => render_search_result_block(block),
         _ if typ.ends_with("_tool_result") => render_generic_tool_result_block(block),
-        _ => format!("\n\n[{}] {}\n", typ, safe_json(block)),
+        _ => format!("\n\n[{}] {}\n", typ, safe_json_without_cache_control(block)),
     }
 }
 
@@ -769,7 +850,7 @@ fn render_generic_tool_result_block(block: &Value) -> String {
                             },
                         )
                     } else {
-                        safe_json(item)
+                        safe_json_without_cache_control(item)
                     }
                 } else {
                     item.to_string()
@@ -784,12 +865,24 @@ fn render_generic_tool_result_block(block: &Value) -> String {
     } else if let Some(s) = content.as_str() {
         format!("\n\n[{}]\n{}\n", typ, s)
     } else {
-        format!("\n\n[{}] {}\n", typ, safe_json(content))
+        format!(
+            "\n\n[{}] {}\n",
+            typ,
+            safe_json_without_cache_control(content)
+        )
     }
 }
 
 fn safe_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn safe_json_without_cache_control(value: &Value) -> String {
+    let mut sanitized = value.clone();
+    if let Some(object) = sanitized.as_object_mut() {
+        object.remove("cache_control");
+    }
+    safe_json(&sanitized)
 }
 
 pub fn internal_response_to_anthropic(
@@ -1432,6 +1525,91 @@ mod tests {
         });
         let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(msgs[0].content, "Only text.");
+    }
+
+    #[test]
+    fn cache_control_hints_are_validated_and_stripped_from_conversion() {
+        let body = json!({
+            "cache_control": {"type": "ephemeral"},
+            "system": [{
+                "type": "text",
+                "text": "Cached system",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Hello",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "custom_context",
+                        "value": "kept",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+            }],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look something up",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+
+        let (messages, tools, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(tools.unwrap()[0].name, "lookup");
+
+        let sanitized: Value = serde_json::from_str(&safe_json_without_cache_control(&json!({
+            "type": "custom_context",
+            "value": "kept",
+            "cache_control": {"type": "ephemeral"}
+        })))
+        .unwrap();
+        assert_eq!(
+            sanitized,
+            json!({"type": "custom_context", "value": "kept"})
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_cache_control_hints_fail_loudly() {
+        let invalid = [
+            json!({"cache_control": null}),
+            json!({"cache_control": {"type": "persistent"}}),
+            json!({"cache_control": {"type": "ephemeral", "ttl": "2h"}}),
+            json!({"cache_control": {"type": "ephemeral", "scope": "global"}}),
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Hello",
+                        "cache_control": "ephemeral"
+                    }]
+                }]
+            }),
+            json!({
+                "tools": [{
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"ttl": "5m"}
+                }]
+            }),
+        ];
+
+        for body in invalid {
+            assert!(
+                anthropic_request_to_internal(&body).is_err(),
+                "accepted invalid cache_control: {body}"
+            );
+        }
     }
 
     #[test]

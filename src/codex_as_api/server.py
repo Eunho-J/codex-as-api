@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -39,6 +40,9 @@ CODEX_CONFIG = load_codex_config()
 MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model or "gpt-5.5")
 AUTH_PATH = os.getenv("CODEX_AS_API_AUTH_PATH")
 DEFAULT_CONTEXT_WINDOW = 200_000
+CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
+_CLAUDE_CACHE_KEY_NAMESPACE = "codex-as-api:claude-code-session:"
+_ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
 
 _provider: ChatGPTOAuthProvider | None = None
 
@@ -109,6 +113,76 @@ def _anthropic_service_tier(body: dict[str, Any]) -> str | None:
     return speed_tier
 
 
+def _validate_anthropic_cache_control(value: object, location: str) -> None:
+    if not isinstance(value, dict):
+        raise ChatGPTOAuthInvalidRequestError(f"{location}.cache_control must be an object")
+    unknown = sorted(set(value) - {"type", "ttl"})
+    if unknown:
+        raise ChatGPTOAuthInvalidRequestError(
+            f"{location}.cache_control contains unsupported fields: {', '.join(unknown)}"
+        )
+    if value.get("type") != "ephemeral":
+        raise ChatGPTOAuthInvalidRequestError(f"{location}.cache_control.type must be 'ephemeral'")
+    if "ttl" in value and (
+        not isinstance(value["ttl"], str) or value["ttl"] not in _ANTHROPIC_CACHE_CONTROL_TTLS
+    ):
+        raise ChatGPTOAuthInvalidRequestError(f"{location}.cache_control.ttl must be one of: 5m, 1h")
+
+
+def _strip_anthropic_content_cache_controls(value: object, location: str) -> None:
+    if not isinstance(value, list):
+        return
+    for index, block in enumerate(value):
+        if not isinstance(block, dict):
+            continue
+        block_location = f"{location}[{index}]"
+        if "cache_control" in block:
+            _validate_anthropic_cache_control(block["cache_control"], block_location)
+            block.pop("cache_control")
+        _strip_anthropic_content_cache_controls(block.get("content"), f"{block_location}.content")
+
+
+def _strip_anthropic_cache_controls(body: dict[str, Any]) -> None:
+    if "cache_control" in body:
+        _validate_anthropic_cache_control(body["cache_control"], "request")
+        body.pop("cache_control")
+
+    _strip_anthropic_content_cache_controls(body.get("system"), "system")
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            location = f"messages[{index}]"
+            if "cache_control" in message:
+                _validate_anthropic_cache_control(message["cache_control"], location)
+                message.pop("cache_control")
+            _strip_anthropic_content_cache_controls(message.get("content"), f"{location}.content")
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for index, tool in enumerate(tools):
+            if not isinstance(tool, dict) or "cache_control" not in tool:
+                continue
+            location = f"tools[{index}]"
+            _validate_anthropic_cache_control(tool["cache_control"], location)
+            tool.pop("cache_control")
+
+
+def _anthropic_prompt_cache_key(body: dict[str, Any], claude_session_id: str | None) -> str | None:
+    explicit = body.get("prompt_cache_key")
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit.strip():
+            raise ChatGPTOAuthInvalidRequestError("prompt_cache_key must be a non-empty string")
+        return explicit
+    if claude_session_id is None:
+        return None
+    if not claude_session_id.strip():
+        raise ChatGPTOAuthInvalidRequestError(f"{CLAUDE_CODE_SESSION_HEADER} must be a non-empty string")
+    value = f"{_CLAUDE_CACHE_KEY_NAMESPACE}{claude_session_id}".encode()
+    return hashlib.sha256(value).hexdigest()
+
+
 def _merge_anthropic_text(
     converted: dict[str, Any] | None,
     direct: object,
@@ -140,7 +214,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.6.3",
+        version="0.6.4",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -481,6 +555,7 @@ try:
     ) -> tuple[list[Message], list[ToolSchema] | None, str | None, dict[str, Any] | None]:
         messages_value = body.get("messages")
         if anthropic or any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
+            _strip_anthropic_cache_controls(body)
             _validate_anthropic_context_management(body.get("context_management"))
             anthropic_messages = cast(list[dict[str, Any]], messages_value) if isinstance(messages_value, list) else []
             max_tokens_value = body.get("max_tokens")
@@ -952,6 +1027,7 @@ try:
                     ),
                 )
         try:
+            _strip_anthropic_cache_controls(body)
             _validate_anthropic_context_management(body.get("context_management"))
             messages, tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
                 model=body.get("model"),
@@ -1002,6 +1078,15 @@ try:
             )
 
         try:
+            if body.get("previous_response_id") is not None:
+                raise ChatGPTOAuthInvalidRequestError(
+                    "previous_response_id is not supported by the Anthropic Messages endpoint"
+                )
+            _strip_anthropic_cache_controls(body)
+            prompt_cache_key = _anthropic_prompt_cache_key(
+                body,
+                http_request.headers.get(CLAUDE_CODE_SESSION_HEADER),
+            )
             _validate_anthropic_context_management(body.get("context_management"))
             messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
                 model=body.get("model", MODEL),
@@ -1046,7 +1131,9 @@ try:
                     reasoning_mode=reasoning_mode,
                     reasoning_context=reasoning_context,
                     stop=stop,
+                    prompt_cache_key=prompt_cache_key,
                     text=text,
+                    codex_metadata=False,
                     responses_lite=responses_lite,
                     safety_identifier=body.get("safety_identifier"),
                     prompt_cache_options=body.get("prompt_cache_options"),
@@ -1070,7 +1157,9 @@ try:
                             reasoning_mode=reasoning_mode,
                             reasoning_context=reasoning_context,
                             stop=stop,
+                            prompt_cache_key=prompt_cache_key,
                             text=text,
+                            codex_metadata=False,
                             responses_lite=responses_lite,
                             safety_identifier=body.get("safety_identifier"),
                             prompt_cache_options=body.get("prompt_cache_options"),
@@ -1103,7 +1192,9 @@ try:
                 reasoning_mode=reasoning_mode,
                 reasoning_context=reasoning_context,
                 stop=stop,
+                prompt_cache_key=prompt_cache_key,
                 text=text,
+                codex_metadata=False,
                 responses_lite=responses_lite,
                 safety_identifier=body.get("safety_identifier"),
                 prompt_cache_options=body.get("prompt_cache_options"),
@@ -1116,8 +1207,6 @@ try:
 
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
         result = internal_response_to_anthropic(response, client_model, request_id)
-        if response.response_id is not None:
-            result["response_id"] = response.response_id
         return JSONResponse(content=result)
 
     # ------------------------------------------------------------------

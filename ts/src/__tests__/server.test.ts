@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import * as os from "node:os";
@@ -15,6 +16,14 @@ const TEST_CONFIG: CodexConfig = {
   codexHome: "/test/codex-home",
   configPath: "/test/codex-home/config.toml",
 };
+
+function hasNestedKey(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) return value.some((item) => hasNestedKey(item, key));
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return Object.hasOwn(record, key)
+    || Object.values(record).some((item) => hasNestedKey(item, key));
+}
 
 async function withServer(
   provider: ChatGPTOAuthProvider | Record<string, unknown>,
@@ -718,7 +727,7 @@ describe("Anthropic compatibility helper routes", () => {
     }
   });
 
-  it("wires the Claude Code 2.1.209 request shape to a known GPT model", async () => {
+  it("wires the Claude Code 2.1.220 request shape and cache hints to a known GPT model", async () => {
     const auth = writeAuthFile();
     try {
       await withRecordingUpstream(async (upstreamUrl, requests) => {
@@ -730,11 +739,16 @@ describe("Anthropic compatibility helper routes", () => {
         await withServer(provider, async (baseUrl) => {
           const response = await fetch(`${baseUrl}/v1/messages?beta=true`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: {
+              "content-type": "application/json",
+              "x-claude-code-session-id": "claude-code-session-fixture",
+            },
             body: JSON.stringify({
               model: "gpt-5.6",
+              cache_control: { type: "ephemeral", ttl: "5m" },
               messages: [{
                 role: "user",
+                cache_control: { type: "ephemeral" },
                 content: [{
                   type: "text",
                   text: "Reply OK",
@@ -744,10 +758,15 @@ describe("Anthropic compatibility helper routes", () => {
               system: [{
                 type: "text",
                 text: "You are a Claude agent.",
+                cache_control: { type: "ephemeral", ttl: "1h" },
+              }],
+              tools: [{
+                name: "lookup",
+                description: "Lookup a value",
+                input_schema: { type: "object", properties: {} },
                 cache_control: { type: "ephemeral" },
               }],
-              tools: [],
-              metadata: { user_id: "claude-code-2.1.209" },
+              metadata: { user_id: "claude-code-2.1.220" },
               max_tokens: 32_000,
               thinking: { type: "adaptive", display: "omitted" },
               context_management: {
@@ -782,6 +801,45 @@ describe("Anthropic compatibility helper routes", () => {
             context: "all_turns",
           });
           assert.equal(upstream.service_tier, "priority");
+          assert.equal(
+            upstream.prompt_cache_key,
+            crypto
+              .createHash("sha256")
+              .update(
+                "codex-as-api:claude-code-session:claude-code-session-fixture",
+                "utf8",
+              )
+              .digest("hex"),
+          );
+          const lookupTool = {
+            type: "function",
+            name: "lookup",
+            description: "Lookup a value",
+            parameters: { type: "object", properties: {} },
+            strict: false,
+          };
+          assert.deepEqual(upstream.input, [
+            {
+              type: "additional_tools",
+              role: "developer",
+              tools: [lookupTool],
+            },
+            {
+              type: "message",
+              role: "developer",
+              content: [{
+                type: "input_text",
+                text: "You are a Claude agent.",
+              }],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "Reply OK" }],
+            },
+          ]);
+          assert.equal(hasNestedKey(upstream, "cache_control"), false);
+          assert.equal(Object.hasOwn(upstream, "client_metadata"), false);
           assert.equal(Object.hasOwn(upstream, "output_config"), false);
           assert.equal(Object.hasOwn(upstream, "context_management"), false);
           assert.equal(Object.hasOwn(upstream, "speed"), false);
@@ -790,6 +848,179 @@ describe("Anthropic compatibility helper routes", () => {
     } finally {
       fs.rmSync(auth.directory, { recursive: true, force: true });
     }
+  });
+
+  it("derives stable Claude cache affinity while explicit keys take precedence", async () => {
+    const options: Record<string, unknown>[] = [];
+    const provider = {
+      async chat(_messages: unknown, opts: Record<string, unknown>) {
+        options.push(opts);
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: null,
+          reasoning_content: null,
+          raw: null,
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const send = async (
+        sessionId?: string,
+        promptCacheKey?: string,
+      ): Promise<Response> => fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(sessionId == null
+            ? {}
+            : { "x-claude-code-session-id": sessionId }),
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          max_tokens: 128,
+          messages: [{ role: "user", content: "hello" }],
+          ...(promptCacheKey == null
+            ? {}
+            : { prompt_cache_key: promptCacheKey }),
+        }),
+      });
+
+      for (const response of [
+        await send("session-a"),
+        await send("session-a"),
+        await send("session-b"),
+        await send("session-a", "explicit-cache-key"),
+        await send(" ", "explicit-cache-key-with-blank-session"),
+        await send(),
+      ]) {
+        assert.equal(response.status, 200);
+      }
+    });
+
+    const hash = (sessionId: string): string => crypto
+      .createHash("sha256")
+      .update(`codex-as-api:claude-code-session:${sessionId}`, "utf8")
+      .digest("hex");
+    assert.equal(options[0].promptCacheKey, hash("session-a"));
+    assert.equal(options[1].promptCacheKey, options[0].promptCacheKey);
+    assert.equal(options[2].promptCacheKey, hash("session-b"));
+    assert.notEqual(options[2].promptCacheKey, options[0].promptCacheKey);
+    assert.equal(options[3].promptCacheKey, "explicit-cache-key");
+    assert.equal(
+      options[4].promptCacheKey,
+      "explicit-cache-key-with-blank-session",
+    );
+    assert.equal(options[5].promptCacheKey, undefined);
+    for (const opts of options) {
+      assert.equal(opts.codexMetadata, false);
+      assert.equal(Object.hasOwn(opts, "clientMetadata"), false);
+      assert.equal(Object.hasOwn(opts, "previousResponseId"), false);
+    }
+  });
+
+  it("rejects malformed Claude cache controls before provider transport", async () => {
+    let chatCalls = 0;
+    const provider = {
+      async chat() {
+        chatCalls += 1;
+        throw new Error("provider must not be called");
+      },
+    };
+    const invalidControls = [
+      { cache_control: null },
+      { cache_control: { type: "persistent" } },
+      { cache_control: { type: "ephemeral", ttl: "30m" } },
+      { cache_control: { type: "ephemeral", extra: true } },
+      {
+        system: [{
+          type: "text",
+          text: "system",
+          cache_control: "ephemeral",
+        }],
+      },
+      {
+        messages: [{
+          role: "user",
+          content: "hello",
+          cache_control: { type: "persistent" },
+        }],
+      },
+      {
+        messages: [{
+          role: "user",
+          content: [{
+            type: "text",
+            text: "hello",
+            cache_control: { type: "ephemeral", ttl: null },
+          }],
+        }],
+      },
+      {
+        tools: [{
+          name: "lookup",
+          input_schema: { type: "object" },
+          cache_control: [],
+        }],
+      },
+    ];
+
+    await withServer(provider, async (baseUrl) => {
+      for (const fields of invalidControls) {
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-5",
+            max_tokens: 128,
+            system: "system",
+            messages: [{ role: "user", content: "hello" }],
+            ...fields,
+          }),
+        });
+        assert.equal(response.status, 400);
+        const error = await response.json() as {
+          type: string;
+          error: { type: string; message: string };
+        };
+        assert.equal(error.type, "error");
+        assert.equal(error.error.type, "invalid_request_error");
+      }
+    });
+    assert.equal(chatCalls, 0);
+  });
+
+  it("rejects previous_response_id on stateless Claude messages", async () => {
+    let chatCalls = 0;
+    const provider = {
+      async chat() {
+        chatCalls += 1;
+        throw new Error("provider must not be called");
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          max_tokens: 128,
+          previous_response_id: "response-not-a-claude-session",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      assert.equal(response.status, 400);
+      const error = await response.json() as {
+        type: string;
+        error: { type: string; message: string };
+      };
+      assert.equal(error.type, "error");
+      assert.equal(error.error.type, "invalid_request_error");
+    });
+    assert.equal(chatCalls, 0);
   });
 
   it("uses the configured GPT fallback for built-in Claude model names", async () => {

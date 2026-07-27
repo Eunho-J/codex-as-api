@@ -1,5 +1,43 @@
 # Release Notes
 
+## v0.6.4
+
+### Codex identity and cache affinity
+
+- Remove process-global generated `session_id` and `thread_id` values from
+  Python, TypeScript, and Rust. Codex metadata mode now requires an explicit
+  non-empty `client_metadata.session_id`, defaults a root `thread_id` to that
+  session, preserves an explicit child thread, and refreshes only turn-scoped
+  identity on each request.
+- Resolve Chat `prompt_cache_key` as explicit value, then non-empty
+  `client_metadata.session_id`, then omission. This matches Codex 0.145.0 and
+  current `main`, where the official default is Responses metadata
+  `session_id`, not `thread_id`.
+- Retain bounded process-local Chat `previous_response_id` history replay over
+  private HTTP. The ID remains local and is never forwarded upstream.
+
+### Claude Code session and cache compatibility
+
+- Read `x-claude-code-session-id` on `/v1/messages` and derive a stable,
+  privacy-safe SHA-256 `prompt_cache_key`; an explicit proxy extension
+  `prompt_cache_key` takes precedence.
+- Keep normal Anthropic Messages stateless: reject non-null
+  `previous_response_id`, disable ambient Codex metadata, avoid fabricated
+  Claude thread IDs, and remove Python's nonstandard Anthropic `response_id`.
+- Validate Anthropic `cache_control` hints at request, system, message, content,
+  and tool locations. Accept only `type: "ephemeral"` with optional TTL `5m` or
+  `1h`, then strip the hint because the private Codex transport cannot preserve
+  Anthropic cache breakpoints or TTL behavior.
+
+### Validation
+
+- Python: 515 tests, mypy, and changed-file Ruff checks.
+- TypeScript: 261 tests and production build.
+- Rust: 253 tests and rustfmt.
+- Re-audited `@openai/codex` 0.145.0 plus `main` at
+  `bd2de422aa287b97b06ca6425a10935bcf1b3731`, and reproduced the Claude Code
+  2.1.220 request shape.
+
 ## v0.6.3
 
 ### Claude Code WebSearch/WebFetch auxiliary calls

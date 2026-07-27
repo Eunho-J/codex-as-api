@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-as-api"
-version = "0.6.3"
+version = "0.6.4"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 readme = "README.md"
 license = { text = "Apache-2.0" }

@@ -45,8 +45,6 @@ const UNKNOWN_CAPABILITY: ModelCapability = {
 };
 
 const INSTALLATION_NAMESPACE = "d2c81270-8f15-5e8d-a5c4-4cdbf2c21fd0";
-const SESSION_ID = crypto.randomUUID();
-const THREAD_ID = crypto.randomUUID();
 const WINDOW_ID = crypto.randomUUID();
 
 let cachedCapabilities: Record<string, ModelCapability> | null = null;
@@ -127,9 +125,20 @@ export function shouldEnableParallelToolCalls(opts: {
 
 export function buildCodexClientMetadata(opts: {
   authJsonPath?: string;
-  existing?: Record<string, string>;
+  existing?: Record<string, unknown>;
 }): Record<string, string> {
-  const metadata = { ...(opts.existing ?? {}) };
+  const existing = opts.existing ?? {};
+  const sessionId = requireMetadataIdentity(
+    existing[SESSION_ID_KEY],
+    `client_metadata.${SESSION_ID_KEY}`,
+  );
+  const threadId = existing[THREAD_ID_KEY] == null
+    ? sessionId
+    : requireMetadataIdentity(
+        existing[THREAD_ID_KEY],
+        `client_metadata.${THREAD_ID_KEY}`,
+      );
+  const metadata = { ...existing } as Record<string, string>;
   const rawPath = opts.authJsonPath ?? "~/.codex/auth.json";
   const expandedPath = rawPath.startsWith("~/")
     ? path.join(process.env.HOME ?? "", rawPath.slice(2))
@@ -138,19 +147,28 @@ export function buildCodexClientMetadata(opts: {
   const turnId = crypto.randomUUID();
   const turnMetadata = {
     installation_id: installationId,
-    session_id: SESSION_ID,
-    thread_id: THREAD_ID,
+    session_id: sessionId,
+    thread_id: threadId,
     turn_id: turnId,
     window_id: WINDOW_ID,
     source: "codex-as-api",
   };
   metadata[INSTALLATION_ID_KEY] = installationId;
-  metadata[SESSION_ID_KEY] = SESSION_ID;
-  metadata[THREAD_ID_KEY] = THREAD_ID;
+  metadata[SESSION_ID_KEY] = sessionId;
+  metadata[THREAD_ID_KEY] = threadId;
   metadata[TURN_ID_KEY] = turnId;
   metadata[WINDOW_ID_KEY] = WINDOW_ID;
   metadata[TURN_METADATA_KEY] = JSON.stringify(turnMetadata);
   return metadata;
+}
+
+function requireMetadataIdentity(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${field} must be a non-empty string when codex_metadata is enabled`,
+    );
+  }
+  return value;
 }
 
 export function stripImageDetailFields(value: unknown): unknown {

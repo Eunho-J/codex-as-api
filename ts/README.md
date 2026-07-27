@@ -28,6 +28,24 @@ required. The last upstream synchronization check was 2026-07-14 against
 
 For configuration, supported endpoints, model behavior, and examples, see the [canonical GitHub documentation](https://github.com/Eunho-J/codex-as-api#readme).
 
+## Identifier and cache behavior
+
+| Input | `/v1/chat/completions` | `/v1/messages` |
+|---|---|---|
+| `client_metadata.session_id` | Forwarded, used as default cache affinity, and required by Codex metadata mode | Not used |
+| `client_metadata.thread_id` | Codex metadata identity; root defaults to the session and an explicit child thread is preserved | Not used or synthesized |
+| `prompt_cache_key` | Explicit value, then non-empty session ID, then omission | Explicit proxy extension, then hashed Claude Code session header |
+| `previous_response_id` | 256-chain process-local full-history replay; never forwarded | Non-null values return HTTP 400 |
+| `cache_control` | Not a Chat control | Validated as an Anthropic hint and stripped before Codex |
+
+Claude Code's exact `x-claude-code-session-id` value is hashed as
+`SHA-256("codex-as-api:claude-code-session:" + sessionId)` for cache affinity
+only. It is not converted to Codex session or thread metadata. Accepted
+Anthropic cache hints use `type: "ephemeral"` with optional TTL `5m` or `1h`;
+the private Codex transport cannot apply Anthropic breakpoint or TTL semantics.
+This behavior was checked against Codex `0.145.0`, Codex `main` at
+`bd2de422aa287b97b06ca6425a10935bcf1b3731`, and Claude Code `2.1.220`.
+
 ## Claude Code with GPT
 
 Start `codex-as-api` with the classic Responses transport so Claude Code can use hosted WebSearch:
