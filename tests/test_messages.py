@@ -51,9 +51,10 @@ def test_message_tool_missing_tool_call_id_raises():
         Message(role=MessageRole.TOOL, content="x", name="fn")
 
 
-def test_message_tool_missing_name_raises():
-    with pytest.raises(ValueError, match="tool messages require"):
-        Message(role=MessageRole.TOOL, content="x", tool_call_id="tc-1")
+def test_message_tool_name_is_optional():
+    m = Message(role=MessageRole.TOOL, content="x", tool_call_id="tc-1")
+    assert m.tool_call_id == "tc-1"
+    assert m.name is None
 
 
 def test_message_non_tool_with_tool_call_id_raises():

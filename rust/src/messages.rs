@@ -41,9 +41,9 @@ impl Message {
         name: Option<String>,
     ) -> Result<Self, MessageError> {
         if role == MessageRole::Tool {
-            if tool_call_id.is_none() || name.is_none() {
+            if tool_call_id.is_none() {
                 return Err(MessageError::Validation(
-                    "tool messages require tool_call_id and name".to_string(),
+                    "tool messages require tool_call_id".to_string(),
                 ));
             }
         } else if tool_call_id.is_some() || name.is_some() {
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_tool_requires_fields() {
+    fn test_message_tool_requires_tool_call_id() {
         let result = Message::new(MessageRole::Tool, "output".to_string(), vec![], None, None);
         assert!(result.is_err());
     }
@@ -155,6 +155,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(msg.role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn test_message_tool_name_is_optional() {
+        let msg = Message::new(
+            MessageRole::Tool,
+            "output".to_string(),
+            vec![],
+            Some("call-1".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-1"));
+        assert!(msg.name.is_none());
     }
 
     #[test]

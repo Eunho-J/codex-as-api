@@ -464,6 +464,42 @@ def test_chat_handler_reaches_real_provider_with_sol_ultra_lite_contract(
     }
 
 
+def test_chat_handler_accepts_tool_result_without_optional_name(
+    client,
+    recording_backend: RecordingBackend,
+):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "look it up"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    recorded = recording_backend.requests.get(timeout=1)
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "result",
+    } in recorded["body"]["input"]
+
+
 def test_chat_handler_omits_standard_reasoning_mode_and_preserves_supported_fields(
     client,
     recording_backend: RecordingBackend,

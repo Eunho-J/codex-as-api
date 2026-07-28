@@ -35,8 +35,8 @@ class Message:
         if not isinstance(self.content_parts, tuple):
             object.__setattr__(self, "content_parts", tuple(self.content_parts))
         if self.role is MessageRole.TOOL:
-            if self.tool_call_id is None or self.name is None:
-                raise ValueError("tool messages require tool_call_id and name")
+            if self.tool_call_id is None:
+                raise ValueError("tool messages require tool_call_id")
         elif self.tool_call_id is not None or self.name is not None:
             raise ValueError("tool_call_id and name are only allowed on tool messages")
         if self.tool_calls and self.role is not MessageRole.ASSISTANT:

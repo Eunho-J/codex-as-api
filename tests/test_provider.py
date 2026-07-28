@@ -1319,8 +1319,8 @@ def test_messages_to_response_items_assistant():
     assert items[0]["role"] == "assistant"
 
 
-def test_messages_to_response_items_tool():
-    messages = [Message(role=MessageRole.TOOL, content="result", tool_call_id="tc-1", name="fn")]
+def test_messages_to_response_items_tool_without_optional_name():
+    messages = [Message(role=MessageRole.TOOL, content="result", tool_call_id="tc-1")]
     items = _messages_to_response_items(messages)
     assert items[0]["type"] == "function_call_output"
     assert items[0]["output"] == "result"
