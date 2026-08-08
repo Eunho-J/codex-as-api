@@ -5,8 +5,9 @@ import * as fs from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import upstreamContract from "../../../config/codex-upstream-contract.json";
 import { createApp } from "../server.js";
-import { ChatGPTOAuthError } from "../auth.js";
+import { ChatGPTOAuthError, ChatGPTOAuthUpstreamError } from "../auth.js";
 import { ChatGPTOAuthProvider, messagesToResponseItems } from "../provider.js";
 import type { CodexConfig } from "../codex-config.js";
 import { MessageRole } from "../messages.js";
@@ -83,6 +84,7 @@ function writeAuthFile(): { authPath: string; directory: string } {
 }
 
 interface RecordedRequest {
+  method: string;
   path: string;
   headers: IncomingHttpHeaders;
   body: Record<string, unknown>;
@@ -130,7 +132,7 @@ async function withRecordingUpstream(
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-      requests.push({ path: req.url ?? "", headers: req.headers, body });
+      requests.push({ method: req.method ?? "", path: req.url ?? "", headers: req.headers, body });
       if (req.url === "/responses/compact") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
@@ -188,6 +190,43 @@ async function withRecordingUpstream(
 }
 
 describe("server error handling", () => {
+  it("preserves structured upstream statuses across OpenAI and Anthropic routes", async () => {
+    for (const status of [401, 429, 529]) {
+      const provider = {
+        async chat() {
+          throw new ChatGPTOAuthUpstreamError(status, "upstream status without parseable digits");
+        },
+      };
+      await withServer(provider, async (baseUrl) => {
+        const openai = await fetch(`${baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+        const anthropic = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            messages: [{ role: "user", content: "hello" }],
+            max_tokens: 32,
+          }),
+        });
+        assert.equal(openai.status, status);
+        assert.equal(anthropic.status, status);
+        const body = await anthropic.json() as { error: { type: string } };
+        assert.equal(body.error.type, {
+          401: "authentication_error",
+          429: "rate_limit_error",
+          529: "overloaded_error",
+        }[status]);
+      });
+    }
+  });
+
   it("returns a typed 400 for non-empty stop before transport", async () => {
     const provider = new ChatGPTOAuthProvider({ model: "gpt-5.5" });
     let transportCalls = 0;
@@ -509,6 +548,56 @@ describe("server error handling", () => {
   });
 });
 
+describe("pinned Codex transport contract", () => {
+  it("matches a recorded Lite Responses request", async () => {
+    const auth = writeAuthFile();
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const provider = new ChatGPTOAuthProvider({
+          model: "gpt-5.6-sol",
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+
+        await provider.chat([
+          { role: MessageRole.SYSTEM, content: "You are helpful." },
+          { role: MessageRole.USER, content: "Hello" },
+        ], {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "low",
+          responsesLite: true,
+          parallelToolCalls: true,
+        });
+
+        assert.equal(requests.length, 1);
+        const recorded = requests[0];
+        const requestContract = upstreamContract.responses_request;
+        const liteContract = upstreamContract.responses_lite;
+        const originatorContract = upstreamContract.headers.originator;
+        const reasoning = recorded.body.reasoning as Record<string, unknown>;
+
+        assert.equal(recorded.method, requestContract.method);
+        assert.equal(recorded.path, requestContract.path);
+        assert.equal(recorded.headers.accept, requestContract.streaming_accept);
+        assert.equal(recorded.headers[originatorContract.name], originatorContract.value);
+        assert.equal(
+          recorded.headers[liteContract.header.name],
+          liteContract.header.value,
+        );
+        assert.equal(reasoning.context, liteContract.reasoning_context);
+        assert.equal(recorded.body.parallel_tool_calls, liteContract.parallel_tool_calls);
+        assert.ok(
+          (recorded.body.include as unknown[]).includes(
+            requestContract.reasoning_encrypted_content_include,
+          ),
+        );
+      });
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("OpenAI stream translation", () => {
   it("adds stable tool indexes and maps Responses usage fields", async () => {
     const provider = {
@@ -598,8 +687,8 @@ describe("server model defaults", () => {
       const response = await fetch(`${baseUrl}/health`);
       assert.equal(response.status, 200);
       const body = await response.json() as Record<string, unknown>;
-      assert.equal(body.context_window, 372_000);
-      assert.equal(body.auto_compact_token_limit, 334_800);
+      assert.equal(body.context_window, 272_000);
+      assert.equal(body.auto_compact_token_limit, 244_800);
     }, {
       model: "gpt-5.6-sol",
       codexConfig: {
@@ -632,7 +721,7 @@ describe("server model defaults", () => {
         const body = await response.json() as Record<string, unknown>;
         assert.equal(body.model, "gpt-5.6-sol");
         assert.equal(body.reasoning_effort, "low");
-        assert.equal(body.context_window, 372_000);
+        assert.equal(body.context_window, 272_000);
       }, {
         model: null,
         codexConfig: { ...TEST_CONFIG, model: "gpt-5.6-sol" },
@@ -1441,8 +1530,8 @@ describe("Anthropic compatibility helper routes", () => {
       };
 
       const gpt = await count("gpt-5.6");
-      assert.equal(gpt.context_window, 372_000);
-      assert.equal(gpt.auto_compact_token_limit, 334_800);
+      assert.equal(gpt.context_window, 272_000);
+      assert.equal(gpt.auto_compact_token_limit, 244_800);
 
       const claudeFallback = await count("claude-fable-5");
       assert.equal(claudeFallback.context_window, 272_000);
@@ -2371,8 +2460,8 @@ describe("GPT-5.6 HTTP pipeline", () => {
           const health = await healthResponse.json() as Record<string, unknown>;
           assert.equal(health.model, "gpt-5.6-sol");
           assert.equal(health.reasoning_effort, "high");
-          assert.equal(health.context_window, 372_000);
-          assert.equal(health.auto_compact_token_limit, 334_800);
+          assert.equal(health.context_window, 272_000);
+          assert.equal(health.auto_compact_token_limit, 244_800);
 
           const chatResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
             method: "POST",

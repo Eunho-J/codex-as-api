@@ -14,8 +14,8 @@ def test_load_codex_config_parses_reasoning_and_context_settings(tmp_path) -> No
             [
                 'model = "gpt-5.6-sol"',
                 'model_reasoning_effort = "ultra"',
-                "model_context_window = 372_000",
-                "model_auto_compact_token_limit = 330_000",
+                "model_context_window = 272_000",
+                "model_auto_compact_token_limit = 244_800",
             ]
         ),
         encoding="utf-8",
@@ -25,8 +25,8 @@ def test_load_codex_config_parses_reasoning_and_context_settings(tmp_path) -> No
 
     assert config.model == "gpt-5.6-sol"
     assert config.model_reasoning_effort == "ultra"
-    assert config.model_context_window == 372_000
-    assert config.model_auto_compact_token_limit == 330_000
+    assert config.model_context_window == 272_000
+    assert config.model_auto_compact_token_limit == 244_800
 
 
 def test_load_codex_config_rejects_empty_reasoning_effort(tmp_path) -> None:

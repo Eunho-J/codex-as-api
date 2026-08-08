@@ -81,7 +81,7 @@ class AssistantResponse:
             object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
 
 
-class InterruptIdleSignal(Exception):
+class InterruptIdleSignal(Exception):  # noqa: N818 - this is an internal control-flow signal.
     """Raised when an interrupted agent turn should return to idle."""
 
 

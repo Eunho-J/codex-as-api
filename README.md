@@ -131,7 +131,7 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else `gpt-5.5` | Model identifier passed to Codex backend |
 | `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
-| `CODEX_AS_API_CODEX_CLI_VERSION` | latest `@openai/codex` from npm | Override the Codex CLI version used in backend request `User-Agent` headers |
+| `CODEX_AS_API_CODEX_CLI_VERSION` | `0.147.0` | Override the validated Codex compatibility baseline identified in backend request `User-Agent` headers |
 | `CODEX_AS_API_RESPONSES_LITE` | `auto` | Responses Lite mode: `auto`, `on`, or `off` |
 | `CODEX_AS_API_CODEX_METADATA` | `off` | Add Codex-style per-turn `client_metadata` and related backend headers |
 | `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
@@ -143,8 +143,8 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 
 # Optional overrides. Without them, known models use the bundled Codex catalog values.
-model_context_window = 372000
-model_auto_compact_token_limit = 334800
+model_context_window = 272000
+model_auto_compact_token_limit = 244800
 ```
 
 `CODEX_AS_API_MODEL` overrides the Codex config model. A request-level `reasoning_effort` overrides `model_reasoning_effort`; when both are omitted, known models use the Codex catalog default. The effective model, reasoning setting, and context settings are exposed from `/health`; context settings are also returned by Anthropic token-count responses.
@@ -164,7 +164,7 @@ model_auto_compact_token_limit = 334800
 | `gpt-5.3-codex-spark` | Ultra-fast coding model |
 | `gpt-5.2` | Previous generation model |
 
-Model capability behavior is driven by `config/model-capabilities.json` across Python, TypeScript, and Rust. The public `gpt-5.6` alias uses Sol's private Codex capability entry. The GPT-5.6 entries use the official Codex Responses Lite contract and a 372,000-token **Codex OAuth** context-window maximum; do not substitute the larger public API context figures for this backend. Larger config overrides are clamped to 372,000. Unknown models use conservative behavior: classic Responses payloads, no assumed parallel tool support, no automatic verbosity, reasoning-effort, or service-tier fields, and, without config overrides, the legacy 200,000-token context / 160,000-token compact thresholds.
+Model capability behavior is driven by `config/model-capabilities.json` across Python, TypeScript, and Rust. The public `gpt-5.6` alias uses Sol's private Codex capability entry. The GPT-5.6 entries use the official Codex Responses Lite contract and a 272,000-token **Codex OAuth** context-window maximum; do not substitute the larger public API context figures for this backend. Larger config overrides are clamped to 272,000. Unknown models use conservative behavior: classic Responses payloads, no assumed parallel tool support, no automatic verbosity, reasoning-effort, or service-tier fields, and, without config overrides, the legacy 200,000-token context / 160,000-token compact thresholds.
 
 To use a different port:
 
@@ -377,7 +377,7 @@ Health check. Returns auth availability, configured model and reasoning effort, 
 
 ```bash
 curl http://localhost:18080/health
-# {"status":"ok","auth_available":true,"model":"gpt-5.6-sol","reasoning_effort":"high","codex_config_path":"/Users/me/.codex/config.toml","context_window":372000,"auto_compact_token_limit":334800}
+# {"status":"ok","auth_available":true,"model":"gpt-5.6-sol","reasoning_effort":"high","codex_config_path":"/Users/me/.codex/config.toml","context_window":272000,"auto_compact_token_limit":244800}
 ```
 
 ## Codex-Specific Features
@@ -388,7 +388,7 @@ These features are extensions beyond the standard OpenAI API, designed for Codex
 
 `prompt_cache_key` keeps related prefixes in the same backend cache family. Use one stable, privacy-safe key per conversation or application prefix.
 
-Official Codex 0.145.0 and current `main` [default this field to Responses metadata `session_id`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/core/src/client.rs#L483-L486), unless an explicit override is present. This proxy follows the same precedence on Chat requests: explicit `prompt_cache_key`, then a non-empty `client_metadata.session_id`, then omission. It does not generate a process-wide session or reuse `thread_id` as the cache key.
+Official Codex 0.147.0 [defaults this field to its Responses metadata session ID](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/client.rs#L475-L487), and [projects the same value into `client_metadata.session_id`](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/core/src/responses_metadata.rs#L219-L228), unless an explicit override is present. This proxy follows the same precedence on Chat requests: explicit `prompt_cache_key`, then a non-empty `client_metadata.session_id`, then omission. It does not generate a process-wide session or reuse `thread_id` as the cache key.
 
 The private Codex OAuth HTTP and WebSocket request structures do not contain public GPT-5.6 `prompt_cache_options` or content-block `prompt_cache_breakpoint` fields. This proxy treats explicit `null` as omitted and rejects non-null controls with HTTP 400 instead of forwarding a request that the private route rejects or silently pretending the requested cache policy was applied. Use a public Responses API client when explicit cache policy or breakpoints are required. See OpenAI's [public prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-breakpoints).
 
@@ -451,7 +451,7 @@ The mapping is intentionally transport-aware:
 | `service_tier: "fast"` | Send `service_tier: "priority"` |
 | `service_tier: "default"` | Omit the field |
 
-Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the official Codex [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/common.rs#L251-L307).
+Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the Codex 0.147.0 [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/codex-api/src/common.rs#L251-L307).
 
 ### `responses_lite`
 
@@ -505,7 +505,7 @@ The installation ID and process window ID remain stable, while `turn_id` and `x-
 
 Non-streaming responses and the final streaming finish chunk expose the real upstream Responses ID as `response_id`. The provider keeps up to 256 completed chains in a process-local LRU store. Passing a known ID as `previous_response_id` prepends the saved semantic input and exact prior `response.output_item.done` items—including encrypted reasoning and tool items—to the new input, then sends one full private HTTP request. The ID itself is never forwarded and is never converted to `thread_id`.
 
-That event source is intentional: the official Codex SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/sse/responses.rs#L327-L337), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/bd2de422aa287b97b06ca6425a10935bcf1b3731/codex-rs/codex-api/src/sse/responses.rs#L112-L120), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
+That event source is intentional: the Codex 0.147.0 SSE parser [takes semantic items from `response.output_item.done`](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/codex-api/src/sse/responses.rs#L330-L341), while its [`response.completed` shape contains the response ID, usage, and `end_turn`](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/codex-api/src/sse/responses.rs#L112-L160), not replay history. The authenticated private HTTP rollout likewise returned an empty `response.completed.output`; the proxy therefore commits the completed output-item events instead of treating that extra field as conversation state.
 
 Only a real `response.completed` event commits a chain. Branches from an older retained ID are supported. Restarting the server or evicting an old entry removes that local state; an unknown ID returns HTTP 400 before any upstream request.
 
@@ -706,7 +706,7 @@ HTTP Server (FastAPI / Axum / Express)
 ```
 
 The provider handles:
-- Token loading and automatic refresh on 401
+- Token loading, proactive refresh five minutes before expiry, and refresh on 401
 - OpenAI Responses API over SSE
 - `prompt_cache_key` and cache read/write accounting
 - GPT-5.6 reasoning effort/context plus `standard` mode compatibility
@@ -719,20 +719,32 @@ The provider handles:
 
 ## Release & package publishing
 
-- Bump versions in `pyproject.toml`, `src/codex_as_api/__init__.py`, `src/codex_as_api/server.py`, `ts/package.json`, `ts/package-lock.json`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-- Publish a GitHub Release such as `v0.6.4` from the matching commit.
-- The manually-dispatched `Publish npm packages` workflow builds/tests the TypeScript package, runs `npm pack --dry-run`, publishes `codex-as-api` to npmjs when `NPM_TOKEN` is configured, and publishes `@eunho-j/codex-as-api` to GitHub Packages with `GITHUB_TOKEN`.
+The `Release` GitHub Actions workflow runs on a pushed `v*` tag. It rejects a
+tag that does not exactly match every Python, npm, and Rust version surface,
+runs the complete cross-runtime gate, and then publishes PyPI, npmjs, the
+scoped GitHub npm package, platform Rust binaries, and one GitHub Release.
 
-Publishing to npmjs requires an authenticated npm session (`npm login` beforehand; `npm whoami` should succeed). From the repository root, the publish itself is one command:
+The workflow uses registry-supported OIDC for PyPI and npmjs. No `PYPI_TOKEN`,
+`NPM_TOKEN`, personal access token, or repository secret is required. One-time
+registry setup is still required:
+
+- Create GitHub environments named `pypi` and `npm`; add deployment protection
+  rules if desired.
+- On PyPI, add a trusted publisher for project `codex-as-api`, owner `Eunho-J`,
+  repository `codex-as-api`, workflow `release.yml`, environment `pypi`.
+- On npmjs, add a GitHub Actions trusted publisher for package `codex-as-api`,
+  owner `Eunho-J`, repository `codex-as-api`, workflow `release.yml`,
+  environment `npm`, with `npm publish` allowed.
+- GitHub Packages and GitHub Releases use the job-scoped automatic
+  `GITHUB_TOKEN`; repository policy must allow the workflow's declared
+  `packages: write` and `contents: write` permissions.
+
+After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-npm publish ./ts --access public
-```
-
-Publishing to PyPI requires `UV_PUBLISH_TOKEN` and a freshly built distribution:
-
-```bash
-uv build --clear && uv publish dist/*
+python scripts/check_package_versions.py --tag v0.6.5
+git tag v0.6.5
+git push origin v0.6.5
 ```
 
 ## Tests
@@ -762,6 +774,22 @@ npm test
 
 
 ## Release Notes
+
+### v0.6.5
+
+- Align GPT-5.6 alias, Sol, Terra, and Luna context limits with Codex `0.147.0`
+  at 272,000 tokens and derive the 244,800-token automatic compact threshold.
+- Pin the verified upstream request, Responses Lite, header, and model contract
+  to `openai/codex` commit
+  `be6e8eac029b183056b7e4402879f15d2c85f61b`; track its new fractional SSE
+  rollout-budget field without claiming an unapproved facade mapping.
+- Refresh OAuth credentials five minutes before expiry, coalesce concurrent
+  refreshes, reload changed credentials after 401, and preserve upstream HTTP
+  status codes across all three servers.
+- Replace startup npm version discovery with deterministic compatibility and
+  package-version identity in the Codex-style `User-Agent`.
+- Add full cross-runtime CI plus tag-gated OIDC publishing to PyPI and npmjs,
+  `GITHUB_TOKEN` publishing to GitHub Packages, and GitHub Release assets.
 
 ### v0.6.4
 

@@ -6,13 +6,20 @@ import queue
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 
+from codex_as_api.auth import ChatGPTOAuthUpstreamError
 from codex_as_api.codex_config import CodexConfig
+from codex_as_api.messages import Message, MessageRole
 from codex_as_api.model_capabilities import LITE_HEADER_NAME, LITE_HEADER_VALUE, RESPONSES_LITE_ENV
 from codex_as_api.provider import REMOTE_COMPACTION_MARKER, ChatGPTOAuthProvider
+
+_UPSTREAM_CONTRACT = json.loads(
+    (Path(__file__).resolve().parents[1] / "config" / "codex-upstream-contract.json").read_text(encoding="utf-8")
+)
 
 
 def _has_nested_key(value: object, key: str) -> bool:
@@ -55,6 +62,7 @@ def recording_backend() -> Iterator[RecordingBackend]:
             body = json.loads(self.rfile.read(content_length))
             requests.put(
                 {
+                    "method": self.command,
                     "path": self.path,
                     "headers": {key.lower(): value for key, value in self.headers.items()},
                     "body": body,
@@ -169,6 +177,72 @@ def test_health_returns_ok(client):
     assert "reasoning_effort" in body
 
 
+def test_pinned_contract_matches_recorded_lite_responses_request(recording_backend, auth_json_factory):
+    provider = ChatGPTOAuthProvider(
+        model="gpt-5.6-sol",
+        base_url=recording_backend.base_url,
+        auth_json_path=str(auth_json_factory()),
+        timeout=2,
+    )
+
+    provider.chat(
+        [
+            Message(role=MessageRole.SYSTEM, content="You are helpful."),
+            Message(role=MessageRole.USER, content="Hello"),
+        ],
+        model="gpt-5.6-sol",
+        reasoning_effort="low",
+        responses_lite=True,
+        parallel_tool_calls=True,
+    )
+
+    recorded = recording_backend.requests.get(timeout=1)
+    request_contract = _UPSTREAM_CONTRACT["responses_request"]
+    lite_contract = _UPSTREAM_CONTRACT["responses_lite"]
+    originator_contract = _UPSTREAM_CONTRACT["headers"]["originator"]
+
+    assert recorded["method"] == request_contract["method"]
+    assert recorded["path"] == request_contract["path"]
+    assert recorded["headers"]["accept"] == request_contract["streaming_accept"]
+    assert recorded["headers"][originator_contract["name"]] == originator_contract["value"]
+    assert recorded["headers"][lite_contract["header"]["name"]] == lite_contract["header"]["value"]
+    assert recorded["body"]["reasoning"]["context"] == lite_contract["reasoning_context"]
+    assert recorded["body"]["parallel_tool_calls"] is lite_contract["parallel_tool_calls"]
+    assert request_contract["reasoning_encrypted_content_include"] in recorded["body"]["include"]
+
+
+@pytest.mark.parametrize("status", [401, 429, 529])
+def test_openai_and_anthropic_routes_preserve_structured_upstream_status(
+    monkeypatch, status
+):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+
+    class FailingProvider:
+        model = "gpt-5.5"
+
+        def chat(self, *_args, **_kwargs):
+            raise ChatGPTOAuthUpstreamError(status, "upstream status without parseable digits")
+
+    monkeypatch.setattr(server_mod, "_provider", FailingProvider())
+    client = TestClient(server_mod.app, raise_server_exceptions=False)
+    openai = client.post("/v1/chat/completions", json={
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    anthropic = client.post("/v1/messages", json={
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 32,
+    })
+
+    assert openai.status_code == status
+    assert anthropic.status_code == status
+    expected_type = {401: "authentication_error", 429: "rate_limit_error", 529: "overloaded_error"}[status]
+    assert anthropic.json()["error"]["type"] == expected_type
+
+
 def test_model_environment_value_is_trimmed_and_whitespace_uses_default(monkeypatch):
     import codex_as_api.server as server_mod
 
@@ -193,8 +267,8 @@ def test_health_uses_sol_catalog_context_compaction_and_effort(client, monkeypat
 
     assert response.status_code == 200
     body = response.json()
-    assert body["context_window"] == 372_000
-    assert body["auto_compact_token_limit"] == 334_800
+    assert body["context_window"] == 272_000
+    assert body["auto_compact_token_limit"] == 244_800
     assert body["reasoning_effort"] == "low"
 
 
@@ -218,8 +292,8 @@ def test_health_clamps_config_overrides_to_catalog_limits_without_wire_normaliza
 
     assert response.status_code == 200
     body = response.json()
-    assert body["context_window"] == 372_000
-    assert body["auto_compact_token_limit"] == 334_800
+    assert body["context_window"] == 272_000
+    assert body["auto_compact_token_limit"] == 244_800
     assert body["reasoning_effort"] == "ultra"
 
 
@@ -1793,8 +1867,8 @@ def test_messages_count_tokens_reports_effective_request_model_context(client, m
     )
 
     assert known.status_code == 200
-    assert known.json()["context_window"] == 372_000
-    assert known.json()["auto_compact_token_limit"] == 334_800
+    assert known.json()["context_window"] == 272_000
+    assert known.json()["auto_compact_token_limit"] == 244_800
     assert fallback.status_code == 200
     assert fallback.json()["context_window"] == 272_000
     assert fallback.json()["auto_compact_token_limit"] == 244_800

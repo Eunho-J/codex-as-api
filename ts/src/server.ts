@@ -6,6 +6,7 @@ import {
   ChatGPTOAuthError,
   ChatGPTOAuthInvalidRequestError,
   ChatGPTOAuthMissingError,
+  ChatGPTOAuthUpstreamError,
   isAuthLocallyAvailable,
 } from "./auth.js";
 import type {
@@ -17,7 +18,6 @@ import type {
 import { MessageRole } from "./messages.js";
 import {
   ChatGPTOAuthProvider,
-  primeCodexCliVersionCache,
   usageFromResponse,
 } from "./provider.js";
 import type { PromptCacheOptions, ReasoningOptions } from "./provider.js";
@@ -40,6 +40,9 @@ const KNOWN_CODEX_MODELS = new Set(Object.keys(
 ));
 
 function errorStatus(err: unknown): number {
+  if (err instanceof ChatGPTOAuthUpstreamError) {
+    return err.status >= 100 && err.status <= 599 ? err.status : 500;
+  }
   if (err instanceof ChatGPTOAuthMissingError) return 401;
   if (err instanceof ChatGPTOAuthInvalidRequestError) return 400;
   if (
@@ -1593,7 +1596,6 @@ function normalizeStop(stop: unknown): string[] | undefined {
 }
 
 export function main(): void {
-  primeCodexCliVersionCache();
   const app = createApp();
   app.listen(PORT, HOST, () => {
     console.log(`codex-as-api listening on ${HOST}:${PORT}`);

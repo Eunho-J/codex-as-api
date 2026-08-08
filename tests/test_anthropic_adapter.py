@@ -14,12 +14,10 @@ from codex_as_api.anthropic_adapter import (
 )
 from codex_as_api.messages import (
     AssistantResponse,
-    Message,
     MessageRole,
     ToolCall,
     Usage,
 )
-
 
 # ---------------------------------------------------------------------------
 # Request conversion tests
@@ -832,9 +830,8 @@ class TestAnthropicStreamAdapter:
             {"type": "finish", "finish_reason": "stop"},
         ]
         result = self._collect_events(events)
-        types = [e["type"] for e in result]
 
-        # Should have: message_start, thinking block start, thinking delta, signature delta, thinking block stop, text block start, text delta, text block stop, message_delta, message_stop
+        # The reasoning block must precede the text block in the emitted stream.
         block_starts = [e for e in result if e["type"] == "content_block_start"]
         assert len(block_starts) == 2
         assert block_starts[0]["content_block"]["type"] == "thinking"

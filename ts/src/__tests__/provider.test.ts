@@ -21,6 +21,7 @@ import {
   REMOTE_COMPACTION_MARKER,
   ChatGPTOAuthProvider,
   codexCliHeadersForVersion,
+  resolveCodexCliVersion,
 } from "../provider.js";
 import {
   ChatGPTOAuthError,
@@ -1403,14 +1404,24 @@ describe("Codex CLI request headers", () => {
     const headers = codexCliHeadersForVersion("1.2.3\n");
 
     assert.equal(headers.originator, "codex_cli_rs");
-    assert.match(headers["User-Agent"], /^codex_cli_rs\/1\.2\.3 \(.+\) codex-as-api$/);
+    assert.match(headers["User-Agent"], /^codex_cli_rs\/1\.2\.3 \(.+\) codex-as-api\/0\.6\.5$/);
   });
 
-  it("omits User-Agent when the npm version cannot be validated", () => {
-    const headers = codexCliHeadersForVersion("not-a-version");
+  it("rejects an invalid compatibility version", () => {
+    assert.throws(
+      () => codexCliHeadersForVersion("not-a-version"),
+      /semantic version/,
+    );
+  });
 
-    assert.equal(headers.originator, "codex_cli_rs");
-    assert.equal(Object.hasOwn(headers, "User-Agent"), false);
+  it("defaults to the pinned upstream contract version", () => {
+    const previous = process.env.CODEX_AS_API_CODEX_CLI_VERSION;
+    delete process.env.CODEX_AS_API_CODEX_CLI_VERSION;
+    try {
+      assert.equal(resolveCodexCliVersion(), "0.147.0");
+    } finally {
+      if (previous != null) process.env.CODEX_AS_API_CODEX_CLI_VERSION = previous;
+    }
   });
 
   it("adds Codex CLI headers to ChatGPT OAuth requests", () => {
@@ -1421,7 +1432,7 @@ describe("Codex CLI request headers", () => {
       const headers = (provider as unknown as { getHeaders(): Record<string, string> }).getHeaders();
 
       assert.equal(headers.originator, "codex_cli_rs");
-      assert.match(headers["User-Agent"], /^codex_cli_rs\/9\.8\.7 \(.+\) codex-as-api$/);
+      assert.match(headers["User-Agent"], /^codex_cli_rs\/9\.8\.7 \(.+\) codex-as-api\/0\.6\.5$/);
       assert.match(headers.Authorization, /^Bearer /);
     } finally {
       if (previous == null) {

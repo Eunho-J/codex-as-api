@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from codex_as_api.protocol import (
     get_value,
     normalize_openai_chat_completion_chunk,
@@ -9,7 +7,6 @@ from codex_as_api.protocol import (
     reasoning_from_response_items,
     response_failure_message,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_value

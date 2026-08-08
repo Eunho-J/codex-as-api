@@ -312,6 +312,8 @@ fn unknown_capability() -> ModelCapability {
 mod tests {
     use super::*;
 
+    const UPSTREAM_CONTRACT_JSON: &str = include_str!("../../config/codex-upstream-contract.json");
+
     #[test]
     fn embedded_capability_catalog_is_structurally_valid() {
         let catalog: Value = serde_json::from_str(CAPABILITIES_JSON).unwrap();
@@ -320,6 +322,38 @@ mod tests {
         assert_eq!(models.len(), 10);
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert!(models.get(model).is_some_and(Value::is_object));
+        }
+    }
+
+    #[test]
+    fn embedded_catalog_matches_the_pinned_codex_0_147_model_contract() {
+        let catalog: Value = serde_json::from_str(CAPABILITIES_JSON).unwrap();
+        let models = catalog.get("models").and_then(Value::as_object).unwrap();
+        let contract: Value = serde_json::from_str(UPSTREAM_CONTRACT_JSON).unwrap();
+
+        assert_eq!(contract["upstream"]["repository"], json!("openai/codex"));
+        assert_eq!(contract["upstream"]["version"], json!("0.147.0"));
+
+        for upstream_model in contract["models"].as_array().unwrap() {
+            let slug = upstream_model["slug"].as_str().unwrap();
+            let model = models.get(slug).and_then(Value::as_object).unwrap();
+            for field in [
+                "context_window",
+                "max_context_window",
+                "default_reasoning_effort",
+                "use_responses_lite",
+                "support_verbosity",
+                "default_verbosity",
+                "supports_parallel_tool_calls",
+                "supports_image_detail_original",
+                "service_tiers",
+            ] {
+                assert_eq!(
+                    model.get(field),
+                    upstream_model.get(field),
+                    "{slug} {field}"
+                );
+            }
         }
     }
 
@@ -343,8 +377,8 @@ mod tests {
                 capability.default_reasoning_effort.as_deref(),
                 Some(default_effort)
             );
-            assert_eq!(capability.context_window, Some(372_000));
-            assert_eq!(capability.max_context_window, Some(372_000));
+            assert_eq!(capability.context_window, Some(272_000));
+            assert_eq!(capability.max_context_window, Some(272_000));
             assert_eq!(capability.service_tiers, vec!["priority".to_string()]);
         }
     }

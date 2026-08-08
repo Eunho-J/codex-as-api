@@ -14,6 +14,7 @@ export {
   ChatGPTOAuthInvalidRequestError,
   ChatGPTOAuthMissingError,
   ChatGPTOAuthRefreshError,
+  ChatGPTOAuthUpstreamError,
   type ChatGPTTokenData,
   loadTokenData,
   isAuthLocallyAvailable,

@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    name: Validate tag and package versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_package_versions.py --tag "$GITHUB_REF_NAME"
+
+  python:
+    name: Test and package Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install build -e ".[server,dev]"
+      - run: python -m pytest
+      - run: python -m mypy src
+      - run: python -m ruff check .
+      - run: python -m build --outdir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+          if-no-files-found: error
+
+  typescript:
+    name: Test and package TypeScript
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: ts/*.tgz
+          if-no-files-found: error
+
+  rust:
+    name: Build Rust (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+            binary: codex-as-api
+            checks: true
+          - platform: macos
+            runner: macos-latest
+            binary: codex-as-api
+            checks: false
+          - platform: windows
+            runner: windows-latest
+            binary: codex-as-api.exe
+            checks: false
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust with required components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: rustup default stable
+      - name: Check Rust formatting and linting
+        if: matrix.checks
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets
+      - name: Test Rust
+        if: matrix.checks
+        run: cargo test --locked
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.platform }}-binary
+          path: rust/target/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish Python to PyPI
+    needs: [versions, python, typescript, rust]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/codex-as-api
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-npm:
+    name: Publish npm package
+    needs: [versions, python, typescript, rust]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/codex-as-api
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarball
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14.0"
+          registry-url: https://registry.npmjs.org
+      - run: npm install --global npm@^11.15
+      - run: npm publish --access public dist/*.tgz
+
+  publish-github-packages:
+    name: Publish scoped npm package to GitHub Packages
+    needs: [versions, python, typescript, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://npm.pkg.github.com
+          scope: "@eunho-j"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm pkg set name="@eunho-j/codex-as-api"
+      - run: npm publish --registry=https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: [publish-pypi, publish-npm, publish-github-packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Create release with all package artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir release-assets
+          cp release-artifacts/python-dist/* release-assets/
+          cp release-artifacts/npm-tarball/* release-assets/
+          cp release-artifacts/rust-linux-binary/codex-as-api release-assets/codex-as-api-linux
+          cp release-artifacts/rust-macos-binary/codex-as-api release-assets/codex-as-api-macos
+          cp release-artifacts/rust-windows-binary/codex-as-api.exe release-assets/codex-as-api-windows.exe
+          mapfile -d '' files < <(find release-assets -type f -print0)
+          test "${#files[@]}" -gt 0
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "${files[@]}"

@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TomlError } from "smol-toml";
+import upstreamContract from "../../../config/codex-upstream-contract.json";
 import { loadCodexConfig } from "../codex-config.js";
 import { capabilityForModel } from "../model-capabilities.js";
 
@@ -39,8 +40,8 @@ describe("Codex config", () => {
         [
           'model = "gpt-5.6-sol"',
           'model_reasoning_effort = "ultra"',
-          "model_context_window = 372_000",
-          "model_auto_compact_token_limit = 334_800",
+          "model_context_window = 272_000",
+          "model_auto_compact_token_limit = 244_800",
         ].join("\n"),
       );
 
@@ -50,8 +51,8 @@ describe("Codex config", () => {
         configPath: path.join(codexHome, "config.toml"),
         model: "gpt-5.6-sol",
         modelReasoningEffort: "ultra",
-        modelContextWindow: 372_000,
-        modelAutoCompactTokenLimit: 334_800,
+        modelContextWindow: 272_000,
+        modelAutoCompactTokenLimit: 244_800,
       });
     } finally {
       fs.rmSync(codexHome, { recursive: true, force: true });
@@ -132,7 +133,7 @@ describe("Codex config", () => {
   it("requires selected token settings to be positive TOML integers", () => {
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
     try {
-      fs.writeFileSync(path.join(codexHome, "config.toml"), "model_context_window = 372000.0\n");
+      fs.writeFileSync(path.join(codexHome, "config.toml"), "model_context_window = 272000.0\n");
       assert.throws(
         () => loadCodexConfig(codexHome),
         /model_context_window must be a positive TOML integer/,
@@ -159,6 +160,33 @@ describe("Codex config", () => {
 });
 
 describe("model capability catalog", () => {
+  it("matches the pinned Codex 0.147 model contract", () => {
+    for (const upstreamModel of upstreamContract.models) {
+      const capability = capabilityForModel(upstreamModel.slug);
+      assert.deepEqual({
+        context_window: capability.contextWindow,
+        max_context_window: capability.maxContextWindow,
+        default_reasoning_effort: capability.defaultReasoningEffort,
+        use_responses_lite: capability.useResponsesLite,
+        support_verbosity: capability.supportVerbosity,
+        default_verbosity: capability.defaultVerbosity,
+        supports_parallel_tool_calls: capability.supportsParallelToolCalls,
+        supports_image_detail_original: capability.supportsImageDetailOriginal,
+        service_tiers: capability.serviceTiers,
+      }, {
+        context_window: upstreamModel.context_window,
+        max_context_window: upstreamModel.max_context_window,
+        default_reasoning_effort: upstreamModel.default_reasoning_effort,
+        use_responses_lite: upstreamModel.use_responses_lite,
+        support_verbosity: upstreamModel.support_verbosity,
+        default_verbosity: upstreamModel.default_verbosity,
+        supports_parallel_tool_calls: upstreamModel.supports_parallel_tool_calls,
+        supports_image_detail_original: upstreamModel.supports_image_detail_original,
+        service_tiers: upstreamModel.service_tiers,
+      });
+    }
+  });
+
   it("loads GPT-5.6 Lite, context, and default effort fields", () => {
     const expected = [
       ["gpt-5.6-sol", "low"],
@@ -171,8 +199,8 @@ describe("model capability catalog", () => {
       assert.equal(capability.useResponsesLite, true);
       assert.equal(capability.supportsParallelToolCalls, true);
       assert.equal(capability.defaultReasoningEffort, effort);
-      assert.equal(capability.contextWindow, 372_000);
-      assert.equal(capability.maxContextWindow, 372_000);
+      assert.equal(capability.contextWindow, 272_000);
+      assert.equal(capability.maxContextWindow, 272_000);
     }
   });
 

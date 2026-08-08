@@ -1,0 +1,86 @@
+{
+  "upstream": {
+    "repository": "openai/codex",
+    "version": "0.147.0",
+    "tag": "rust-v0.147.0",
+    "commit": "be6e8eac029b183056b7e4402879f15d2c85f61b"
+  },
+  "models": [
+    {
+      "slug": "gpt-5.6",
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "default_reasoning_effort": "low",
+      "use_responses_lite": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
+      "service_tiers": ["priority"]
+    },
+    {
+      "slug": "gpt-5.6-sol",
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "default_reasoning_effort": "low",
+      "use_responses_lite": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
+      "service_tiers": ["priority"]
+    },
+    {
+      "slug": "gpt-5.6-terra",
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "default_reasoning_effort": "medium",
+      "use_responses_lite": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
+      "service_tiers": ["priority"]
+    },
+    {
+      "slug": "gpt-5.6-luna",
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "default_reasoning_effort": "medium",
+      "use_responses_lite": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
+      "service_tiers": ["priority"]
+    }
+  ],
+  "responses_request": {
+    "path": "/responses",
+    "method": "POST",
+    "streaming_accept": "text/event-stream",
+    "reasoning_encrypted_content_include": "reasoning.encrypted_content"
+  },
+  "responses_lite": {
+    "header": {
+      "name": "x-openai-internal-codex-responses-lite",
+      "value": "true"
+    },
+    "reasoning_context": "all_turns",
+    "parallel_tool_calls": false
+  },
+  "headers": {
+    "originator": {
+      "name": "originator",
+      "value": "codex_cli_rs"
+    }
+  },
+  "sse_usage": {
+    "tracking": "upstream-only; this facade has no approved public mapping",
+    "event_type": "response.completed",
+    "usage_path": ["response", "usage"],
+    "field": "codex_rollout_budget_units",
+    "value_type": "number",
+    "minimum": 0
+  }
+}

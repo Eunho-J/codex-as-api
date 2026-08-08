@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Iterator, Sequence
+from collections.abc import Iterator
+from typing import Any
 
-from .messages import Message, MessageRole, ToolCall, ToolSchema, Usage, AssistantResponse
-
+from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema
 
 # ---------------------------------------------------------------------------
 # Request conversion: Anthropic → internal
@@ -278,7 +278,8 @@ def _string_list(value: Any) -> list[str] | None:
 def _anthropic_web_search_parameters(tool: dict[str, Any]) -> dict[str, Any]:
     if _string_list(tool.get("blocked_domains")):
         raise ValueError(
-            "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; use allowed_domains instead"
+            "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; "
+            "use allowed_domains instead"
         )
 
     openai_tool: dict[str, Any] = {"type": "web_search", "external_web_access": True}

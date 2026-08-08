@@ -9,12 +9,14 @@ import pathlib
 import threading
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from typing import Any
 
 CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_AUTH_PATH = "~/.codex/auth.json"
 DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token"
 REFRESH_URL_OVERRIDE_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+REFRESH_WINDOW = _dt.timedelta(minutes=5)
 
 _SECRET_KEYS = (
     "access_token",
@@ -46,6 +48,12 @@ class ChatGPTOAuthRefreshError(ChatGPTOAuthError):
     pass
 
 
+class ChatGPTOAuthUpstreamError(ChatGPTOAuthError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ChatGPTTokenData:
     auth_path: pathlib.Path
@@ -61,6 +69,11 @@ class ChatGPTTokenData:
     @property
     def expired(self) -> bool:
         return self.access_expires_at is not None and self.access_expires_at <= _dt.datetime.now(_dt.timezone.utc)
+
+    def expires_within(self, window: _dt.timedelta = REFRESH_WINDOW) -> bool:
+        return (
+            self.access_expires_at is not None and self.access_expires_at <= _dt.datetime.now(_dt.timezone.utc) + window
+        )
 
 
 def resolve_auth_path(raw: str | None = None) -> pathlib.Path:
@@ -143,9 +156,20 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
     register_token_secrets(access_token, refresh_token, id_token)
     id_auth = _auth_claims(id_token)
     access_auth = _auth_claims(access_token)
-    account_id = tokens.get("account_id") or id_auth.get("chatgpt_account_id") or access_auth.get("chatgpt_account_id")
-    if not isinstance(account_id, str) or account_id == "":
+    account_sources = {
+        "account_id": tokens.get("account_id"),
+        "id_token": id_auth.get("chatgpt_account_id"),
+        "access_token": access_auth.get("chatgpt_account_id"),
+    }
+    for source, value in account_sources.items():
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ChatGPTOAuthError(f"ChatGPT OAuth {source} account id is invalid")
+    account_ids = {value for value in account_sources.values() if isinstance(value, str) and value}
+    if not account_ids:
         raise ChatGPTOAuthError("ChatGPT OAuth account id not available; rerun codex login")
+    if len(account_ids) != 1:
+        raise ChatGPTOAuthError("ChatGPT OAuth token account ids do not match")
+    account_id = account_ids.pop()
     register_token_secrets(account_id)
     plan = id_auth.get("chatgpt_plan_type") or access_auth.get("chatgpt_plan_type")
     user = (
@@ -178,7 +202,10 @@ def _root_tokens_from_latest_auth(data: dict[str, Any]) -> dict[str, Any] | None
 def _unsupported_auth_schema_message(data: dict[str, Any]) -> str:
     token_keys = ("tokens", "access_token", "refresh_token", "id_token")
     if "personal_access_token" in data and not any(key in data for key in token_keys):
-        return "ChatGPT OAuth personal_access_token-only auth is not supported; rerun codex login to create file-backed tokens"
+        return (
+            "ChatGPT OAuth personal_access_token-only auth is not supported; "
+            "rerun codex login to create file-backed tokens"
+        )
     if "agent_identity" in data and not any(key in data for key in token_keys):
         return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens"
     if "bedrock_api_key" in data and not any(key in data for key in token_keys):
@@ -222,23 +249,66 @@ def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
         finally:
             os.close(dir_fd)
     finally:
-        try:
+        with suppress(OSError):
             tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+
+
+def token_for_request(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTokenData:
+    current = load_token_data(auth_json_path)
+    if not current.expires_within():
+        return current
+    return _refresh_token(current, refresh_if_expiring=True)
+
+
+def refresh_after_unauthorized(current: ChatGPTTokenData) -> ChatGPTTokenData:
+    return _refresh_token(current, refresh_if_expiring=False)
 
 
 def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTokenData:
-    current = load_token_data(auth_json_path)
+    return _refresh_token(load_token_data(auth_json_path), refresh_if_expiring=False)
+
+
+def _fail_if_account_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> None:
+    if current.account_id != latest.account_id:
+        raise ChatGPTOAuthRefreshError("ChatGPT OAuth account changed while refreshing credentials")
+
+
+def _access_token_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> bool:
+    return current.access_token != latest.access_token
+
+
+def _other_credentials_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> bool:
+    return current.refresh_token != latest.refresh_token or current.id_token != latest.id_token
+
+
+def _validate_refreshed_token_accounts(payload: dict[str, Any], account_id: str) -> None:
+    for name in ("access_token", "id_token"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value:
+            continue
+        claim_account = _auth_claims(value).get("chatgpt_account_id")
+        if claim_account is not None and (not isinstance(claim_account, str) or claim_account != account_id):
+            raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth refreshed {name} account id does not match current account")
+
+
+def _refresh_token(current: ChatGPTTokenData, *, refresh_if_expiring: bool) -> ChatGPTTokenData:
     lock = _refresh_lock(current.auth_path)
     with lock:
-        current = load_token_data(auth_json_path)
+        latest = load_token_data(current.auth_path)
+        _fail_if_account_changed(current, latest)
+        if _access_token_changed(current, latest):
+            return latest
+        if refresh_if_expiring and not latest.expires_within():
+            return latest
+        current = latest
         endpoint = os.getenv(REFRESH_URL_OVERRIDE_ENV, DEFAULT_REFRESH_URL)
-        body = json.dumps({
-            "client_id": CHATGPT_OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": current.refresh_token,
-        }).encode()
+        body = json.dumps(
+            {
+                "client_id": CHATGPT_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": current.refresh_token,
+            }
+        ).encode()
         request = urllib.request.Request(
             endpoint,
             data=body,
@@ -250,22 +320,64 @@ def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTo
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
-            redacted = redact_text(text, current.access_token, current.refresh_token, current.id_token)
+            redacted = redact_text(
+                text,
+                current.access_token,
+                current.refresh_token,
+                current.id_token,
+                current.account_id,
+            )
             if exc.code == 401:
-                raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth refresh token is invalid; rerun codex login: {redacted}") from exc
+                raise ChatGPTOAuthRefreshError(
+                    f"ChatGPT OAuth refresh token is invalid; rerun codex login: {redacted}"
+                ) from exc
             raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: HTTP {exc.code}: {redacted}") from exc
         except Exception as exc:  # noqa: BLE001
-            raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: {exc}") from exc
+            redacted = redact_text(
+                str(exc),
+                current.access_token,
+                current.refresh_token,
+                current.id_token,
+                current.account_id,
+            )
+            raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh failed: {redacted}") from exc
         if not isinstance(payload, dict):
             raise ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh returned invalid JSON")
-        data = json.loads(current.auth_path.read_text(encoding="utf-8"))
-        tokens = data.setdefault("tokens", {})
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh response is missing access_token")
+        for name in ("id_token", "refresh_token"):
+            if name not in payload:
+                continue
+            value = payload[name]
+            if not isinstance(value, str) or not value:
+                raise ChatGPTOAuthRefreshError(f"ChatGPT OAuth token refresh response has invalid {name}")
+        _validate_refreshed_token_accounts(payload, current.account_id)
+
+        latest = load_token_data(current.auth_path)
+        _fail_if_account_changed(current, latest)
+        if _access_token_changed(current, latest):
+            return latest
+        if _other_credentials_changed(current, latest):
+            raise ChatGPTOAuthRefreshError("ChatGPT OAuth credentials changed while token refresh was in flight")
+        try:
+            data = json.loads(current.auth_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ChatGPTOAuthRefreshError(f"failed to re-read ChatGPT OAuth auth file: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ChatGPTOAuthRefreshError("ChatGPT OAuth auth file root must be an object")
+        nested_tokens = data.get("tokens")
+        if isinstance(nested_tokens, dict):
+            tokens = nested_tokens
+        elif nested_tokens is None:
+            tokens = data
+        else:
+            raise ChatGPTOAuthRefreshError("ChatGPT OAuth auth file tokens must be an object")
         if payload.get("id_token"):
             tokens["id_token"] = payload["id_token"]
-        if payload.get("access_token"):
-            tokens["access_token"] = payload["access_token"]
+        tokens["access_token"] = access_token
         if payload.get("refresh_token"):
             tokens["refresh_token"] = payload["refresh_token"]
         data["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
         _write_auth_json(current.auth_path, data)
-        return load_token_data(auth_json_path)
+        return load_token_data(current.auth_path)

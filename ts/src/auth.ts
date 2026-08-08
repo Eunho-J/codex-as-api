@@ -7,6 +7,8 @@ const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_AUTH_PATH = "~/.codex/auth.json";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const REFRESH_URL_OVERRIDE_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const REFRESH_WINDOW_MS = 5 * 60 * 1000;
+const refreshFlights = new Map<string, Promise<ChatGPTTokenData>>();
 
 const SECRET_KEYS = [
   "access_token",
@@ -46,6 +48,16 @@ export class ChatGPTOAuthRefreshError extends ChatGPTOAuthError {
   }
 }
 
+export class ChatGPTOAuthUpstreamError extends ChatGPTOAuthError {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ChatGPTOAuthUpstreamError";
+    this.status = status;
+  }
+}
+
 export interface ChatGPTTokenData {
   auth_path: string;
   access_token: string;
@@ -60,6 +72,14 @@ export interface ChatGPTTokenData {
 
 export function isTokenExpired(token: ChatGPTTokenData): boolean {
   return token.access_expires_at !== null && token.access_expires_at <= new Date();
+}
+
+export function tokenExpiresWithin(
+  token: ChatGPTTokenData,
+  windowMs = REFRESH_WINDOW_MS,
+): boolean {
+  return token.access_expires_at !== null
+    && token.access_expires_at.getTime() <= Date.now() + windowMs;
 }
 
 function expandHome(p: string): string {
@@ -180,13 +200,26 @@ export function loadTokenData(authJsonPath?: string | null): ChatGPTTokenData {
   }
   const idAuth = authClaims(id_token as string);
   const accessAuth = authClaims(access_token as string);
-  const account_id =
-    t["account_id"] ||
-    idAuth["chatgpt_account_id"] ||
-    accessAuth["chatgpt_account_id"];
-  if (typeof account_id !== "string" || account_id === "") {
+  const accountSources = new Map<string, unknown>([
+    ["account_id", t["account_id"]],
+    ["id_token", idAuth["chatgpt_account_id"]],
+    ["access_token", accessAuth["chatgpt_account_id"]],
+  ]);
+  for (const [source, value] of accountSources) {
+    if (value !== undefined && value !== null && (typeof value !== "string" || value.length === 0)) {
+      throw new ChatGPTOAuthError(`ChatGPT OAuth ${source} account id is invalid`);
+    }
+  }
+  const accountIds = new Set(
+    [...accountSources.values()].filter((value): value is string => typeof value === "string" && value.length > 0),
+  );
+  if (accountIds.size === 0) {
     throw new ChatGPTOAuthError("ChatGPT OAuth account id not available; rerun codex login");
   }
+  if (accountIds.size !== 1) {
+    throw new ChatGPTOAuthError("ChatGPT OAuth token account ids do not match");
+  }
+  const account_id = [...accountIds][0];
   const plan =
     idAuth["chatgpt_plan_type"] || accessAuth["chatgpt_plan_type"];
   const user =
@@ -262,8 +295,71 @@ function writeAuthJson(filePath: string, data: Record<string, unknown>): void {
   }
 }
 
-export async function refreshToken(authJsonPath?: string | null): Promise<ChatGPTTokenData> {
+export async function tokenForRequest(authJsonPath?: string | null): Promise<ChatGPTTokenData> {
   const current = loadTokenData(authJsonPath);
+  if (!tokenExpiresWithin(current)) return current;
+  return refreshToken(authJsonPath, current, true);
+}
+
+export async function refreshAfterUnauthorized(current: ChatGPTTokenData): Promise<ChatGPTTokenData> {
+  return refreshToken(current.auth_path, current, false);
+}
+
+function failIfAccountChanged(current: ChatGPTTokenData, latest: ChatGPTTokenData): void {
+  if (current.account_id !== latest.account_id) {
+    throw new ChatGPTOAuthRefreshError("ChatGPT OAuth account changed while refreshing credentials");
+  }
+}
+
+function accessTokenChanged(current: ChatGPTTokenData, latest: ChatGPTTokenData): boolean {
+  return current.access_token !== latest.access_token;
+}
+
+function otherCredentialsChanged(current: ChatGPTTokenData, latest: ChatGPTTokenData): boolean {
+  return current.refresh_token !== latest.refresh_token || current.id_token !== latest.id_token;
+}
+
+function validateRefreshedTokenAccounts(payload: Record<string, unknown>, accountId: string): void {
+  for (const name of ["access_token", "id_token"] as const) {
+    const value = payload[name];
+    if (typeof value !== "string" || value.length === 0) continue;
+    const claimAccount = authClaims(value)["chatgpt_account_id"];
+    if (claimAccount !== undefined && (typeof claimAccount !== "string" || claimAccount !== accountId)) {
+      throw new ChatGPTOAuthRefreshError(
+        `ChatGPT OAuth refreshed ${name} account id does not match current account`,
+      );
+    }
+  }
+}
+
+export async function refreshToken(
+  authJsonPath?: string | null,
+  observed?: ChatGPTTokenData,
+  refreshIfExpiring = false,
+): Promise<ChatGPTTokenData> {
+  const current = observed ?? loadTokenData(authJsonPath);
+  const authPath = current.auth_path;
+  const existing = refreshFlights.get(authPath);
+  if (existing) return existing;
+
+  const flight = performRefresh(current, refreshIfExpiring);
+  refreshFlights.set(authPath, flight);
+  try {
+    return await flight;
+  } finally {
+    if (refreshFlights.get(authPath) === flight) refreshFlights.delete(authPath);
+  }
+}
+
+async function performRefresh(
+  observed: ChatGPTTokenData,
+  refreshIfExpiring: boolean,
+): Promise<ChatGPTTokenData> {
+  const latest = loadTokenData(observed.auth_path);
+  failIfAccountChanged(observed, latest);
+  if (accessTokenChanged(observed, latest)) return latest;
+  if (refreshIfExpiring && !tokenExpiresWithin(latest)) return latest;
+  const current = latest;
   const endpoint = process.env[REFRESH_URL_OVERRIDE_ENV] || DEFAULT_REFRESH_URL;
   const body = JSON.stringify({
     client_id: CHATGPT_OAUTH_CLIENT_ID,
@@ -280,7 +376,13 @@ export async function refreshToken(authJsonPath?: string | null): Promise<ChatGP
     });
     if (!response.ok) {
       const text = await response.text();
-      const redacted = redactText(text, current.access_token, current.refresh_token, current.id_token);
+      const redacted = redactText(
+        text,
+        current.access_token,
+        current.refresh_token,
+        current.id_token,
+        current.account_id,
+      );
       if (response.status === 401) {
         throw new ChatGPTOAuthRefreshError(
           `ChatGPT OAuth refresh token is invalid; rerun codex login: ${redacted}`
@@ -295,25 +397,63 @@ export async function refreshToken(authJsonPath?: string | null): Promise<ChatGP
     if (err instanceof ChatGPTOAuthRefreshError) {
       throw err;
     }
-    throw new ChatGPTOAuthRefreshError(`ChatGPT OAuth token refresh failed: ${err}`);
+    const redacted = redactText(
+      String(err),
+      current.access_token,
+      current.refresh_token,
+      current.id_token,
+      current.account_id,
+    );
+    throw new ChatGPTOAuthRefreshError(`ChatGPT OAuth token refresh failed: ${redacted}`);
   }
   if (typeof responsePayload !== "object" || responsePayload === null || Array.isArray(responsePayload)) {
     throw new ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh returned invalid JSON");
   }
   const p = responsePayload as Record<string, unknown>;
-  const data = JSON.parse(fs.readFileSync(current.auth_path, "utf-8")) as Record<string, unknown>;
-  const tokens = (data["tokens"] || {}) as Record<string, unknown>;
-  data["tokens"] = tokens;
+  if (typeof p["access_token"] !== "string" || p["access_token"].length === 0) {
+    throw new ChatGPTOAuthRefreshError("ChatGPT OAuth token refresh response is missing access_token");
+  }
+  for (const name of ["id_token", "refresh_token"] as const) {
+    const value = p[name];
+    if (value !== undefined && (typeof value !== "string" || value.length === 0)) {
+      throw new ChatGPTOAuthRefreshError(`ChatGPT OAuth token refresh response has invalid ${name}`);
+    }
+  }
+  validateRefreshedTokenAccounts(p, current.account_id);
+
+  const latestAfterRefresh = loadTokenData(current.auth_path);
+  failIfAccountChanged(current, latestAfterRefresh);
+  if (accessTokenChanged(current, latestAfterRefresh)) return latestAfterRefresh;
+  if (otherCredentialsChanged(current, latestAfterRefresh)) {
+    throw new ChatGPTOAuthRefreshError(
+      "ChatGPT OAuth credentials changed while token refresh was in flight",
+    );
+  }
+  let data: Record<string, unknown>;
+  try {
+    const raw = fs.readFileSync(current.auth_path, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("root must be an object");
+    }
+    data = parsed as Record<string, unknown>;
+  } catch (err) {
+    throw new ChatGPTOAuthRefreshError(`failed to re-read ChatGPT OAuth auth file: ${err}`);
+  }
+  const nestedTokens = data["tokens"];
+  const tokens = nestedTokens == null ? data : nestedTokens;
+  if (typeof tokens !== "object" || tokens === null || Array.isArray(tokens)) {
+    throw new ChatGPTOAuthRefreshError("ChatGPT OAuth auth file tokens must be an object");
+  }
+  const tokenObject = tokens as Record<string, unknown>;
   if (p["id_token"]) {
-    tokens["id_token"] = p["id_token"];
+    tokenObject["id_token"] = p["id_token"];
   }
-  if (p["access_token"]) {
-    tokens["access_token"] = p["access_token"];
-  }
+  tokenObject["access_token"] = p["access_token"];
   if (p["refresh_token"]) {
-    tokens["refresh_token"] = p["refresh_token"];
+    tokenObject["refresh_token"] = p["refresh_token"];
   }
   data["last_refresh"] = new Date().toISOString().replace("+00:00", "Z");
   writeAuthJson(current.auth_path, data);
-  return loadTokenData(authJsonPath);
+  return loadTokenData(current.auth_path);
 }

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from codex_as_api.model_capabilities import (
@@ -7,6 +10,34 @@ from codex_as_api.model_capabilities import (
     capability_for_model,
     resolve_model_for_backend,
 )
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_CATALOG_PATH = _PROJECT_ROOT / "config" / "model-capabilities.json"
+_UPSTREAM_CONTRACT_PATH = _PROJECT_ROOT / "config" / "codex-upstream-contract.json"
+_CONTRACT_FIELDS = (
+    "context_window",
+    "max_context_window",
+    "default_reasoning_effort",
+    "use_responses_lite",
+    "support_verbosity",
+    "default_verbosity",
+    "supports_parallel_tool_calls",
+    "supports_image_detail_original",
+    "service_tiers",
+)
+
+
+def test_catalog_matches_the_pinned_codex_0_147_model_contract() -> None:
+    catalog = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))["models"]
+    contract = json.loads(_UPSTREAM_CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert contract["upstream"]["repository"] == "openai/codex"
+    assert contract["upstream"]["version"] == "0.147.0"
+    for upstream_model in contract["models"]:
+        slug = upstream_model["slug"]
+        assert {field: catalog[slug][field] for field in _CONTRACT_FIELDS} == {
+            field: upstream_model[field] for field in _CONTRACT_FIELDS
+        }
 
 
 @pytest.mark.parametrize(
@@ -23,8 +54,8 @@ def test_gpt_5_6_capabilities_are_loaded(model: str, default_effort: str) -> Non
     assert capability.use_responses_lite is True
     assert capability.supports_parallel_tool_calls is True
     assert capability.default_reasoning_effort == default_effort
-    assert capability.context_window == 372_000
-    assert capability.max_context_window == 372_000
+    assert capability.context_window == 272_000
+    assert capability.max_context_window == 272_000
 
 
 def test_public_gpt_5_6_alias_uses_sol_capabilities_and_wire_model() -> None:
@@ -32,7 +63,7 @@ def test_public_gpt_5_6_alias_uses_sol_capabilities_and_wire_model() -> None:
 
     assert capability.use_responses_lite is True
     assert capability.default_reasoning_effort == "low"
-    assert capability.context_window == 372_000
+    assert capability.context_window == 272_000
     assert resolve_model_for_backend("gpt-5.6") == "gpt-5.6-sol"
 
 

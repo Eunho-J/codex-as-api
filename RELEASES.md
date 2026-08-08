@@ -1,5 +1,45 @@
 # Release Notes
 
+## v0.6.5
+
+### Codex 0.147 compatibility
+
+- Align GPT-5.6 alias, Sol, Terra, and Luna context limits with the stable
+  Codex 0.147 catalog at 272,000 tokens. Automatic compact defaults now derive
+  to 244,800 tokens.
+- Pin a structured compatibility fixture to `openai/codex` 0.147.0 commit
+  `be6e8eac029b183056b7e4402879f15d2c85f61b`, covering the model fields,
+  Responses request path, Lite behavior, and originator header. The fractional
+  `codex_rollout_budget_units` usage field is tracked as upstream-only because
+  this facade has no approved public mapping for it.
+- Replace the moving startup `npm view @openai/codex version` lookup with a
+  deterministic Codex compatibility baseline and `codex-as-api` package
+  version in the request `User-Agent`.
+
+### Authentication and errors
+
+- Refresh OAuth access tokens five minutes before expiry, coalesce concurrent
+  refresh work, and reload credentials changed by another request before
+  rotating a refresh token after HTTP 401.
+- Preserve the existing root or nested auth-file layout, reject account
+  switches and conflicting token claims, and compare the credential snapshot
+  again before persisting a refresh response.
+- Preserve upstream HTTP statuses, including rate-limit and overload responses,
+  in Python and TypeScript to match Rust.
+
+### CI and publishing
+
+- Add pull-request and push CI for Python tests, Ruff, mypy, package builds,
+  TypeScript tests/build/package checks, and Rust format, Clippy, tests, and
+  release builds.
+- Add a tag-triggered release workflow that requires exact tag/package version
+  agreement and the full cross-runtime gate before publishing.
+- Publish PyPI and npmjs through trusted-publisher OIDC, GitHub Packages and
+  GitHub Releases through the automatic repository `GITHUB_TOKEN`, and attach
+  Python/npm distributions plus Linux, macOS, and Windows Rust binaries.
+- Remove the manual npm workflow that could report success after silently
+  skipping npmjs publication when `NPM_TOKEN` was absent.
+
 ## v0.6.4
 
 ### Codex identity and cache affinity

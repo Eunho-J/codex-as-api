@@ -1,12 +1,15 @@
 import * as crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import * as os from "node:os";
+import packageMetadata from "../package.json";
+import upstreamContract from "../../config/codex-upstream-contract.json";
 import {
   ChatGPTOAuthError,
   ChatGPTOAuthInvalidRequestError,
+  ChatGPTOAuthUpstreamError,
   loadTokenData,
   redactText,
-  refreshToken,
+  refreshAfterUnauthorized,
+  tokenForRequest,
 } from "./auth.js";
 import type {
   AssistantResponse,
@@ -39,7 +42,14 @@ export const CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5";
 const REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR = "codex_cli_rs";
 const CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION";
-const CODEX_CLI_NPM_PACKAGE = "@openai/codex";
+const CODEX_COMPATIBILITY_VERSION = requireCodexCliVersion(
+  upstreamContract.upstream.version,
+  "bundled Codex upstream contract version",
+);
+const CODEX_AS_API_VERSION = requireCodexCliVersion(
+  packageMetadata.version,
+  "codex-as-api package version",
+);
 const KNOWN_REASONING_EFFORT_VALUES = new Set([
   "none",
   "minimal",
@@ -55,7 +65,6 @@ const REASONING_MODES = new Set(["standard", "pro"]);
 const REASONING_CONTEXTS = new Set(["auto", "current_turn", "all_turns"]);
 const IMAGE_DETAILS = new Set(["auto", "low", "high", "original"]);
 const RESPONSE_CHAIN_CAPACITY = 256;
-let cachedCodexCliVersion: string | null | undefined;
 
 interface ResponseChain {
   input: Record<string, unknown>[];
@@ -106,37 +115,12 @@ function cloneResponseItems(
   return structuredClone(items);
 }
 
-export function primeCodexCliVersionCache(): void {
-  void resolveCodexCliVersion();
-}
-
-export function resolveCodexCliVersion(): string | undefined {
-  const override = normalizeCodexCliVersion(
-    process.env[CODEX_CLI_VERSION_ENV],
-  );
-  if (override) return override;
-  if (cachedCodexCliVersion !== undefined) {
-    return cachedCodexCliVersion ?? undefined;
+export function resolveCodexCliVersion(): string {
+  const raw = process.env[CODEX_CLI_VERSION_ENV];
+  if (raw == null || raw.trim().length === 0) {
+    return CODEX_COMPATIBILITY_VERSION;
   }
-  cachedCodexCliVersion = fetchLatestCodexCliVersionFromNpm() ?? null;
-  return cachedCodexCliVersion ?? undefined;
-}
-
-function fetchLatestCodexCliVersionFromNpm(): string | undefined {
-  try {
-    const output = execFileSync(
-      "npm",
-      ["view", CODEX_CLI_NPM_PACKAGE, "version"],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 3000,
-      },
-    );
-    return normalizeCodexCliVersion(output);
-  } catch {
-    return undefined;
-  }
+  return requireCodexCliVersion(raw, CODEX_CLI_VERSION_ENV);
 }
 
 function normalizeCodexCliVersion(value: string | undefined): string | undefined {
@@ -147,19 +131,29 @@ function normalizeCodexCliVersion(value: string | undefined): string | undefined
     : undefined;
 }
 
+function requireCodexCliVersion(value: string | undefined, source: string): string {
+  const version = normalizeCodexCliVersion(value);
+  if (version == null) {
+    throw new Error(`${source} must be a semantic version`);
+  }
+  return version;
+}
+
 export function codexCliHeadersForVersion(
   version: string | undefined,
 ): Record<string, string> {
-  const headers: Record<string, string> = {
+  const normalized = requireCodexCliVersion(
+    version == null || version.trim().length === 0
+      ? CODEX_COMPATIBILITY_VERSION
+      : version,
+    "Codex compatibility version",
+  );
+  return {
     originator: CODEX_CLI_ORIGINATOR,
+    "User-Agent": sanitizeHeaderValue(
+      `${CODEX_CLI_ORIGINATOR}/${normalized} (${codexOsInfo()}) codex-as-api/${CODEX_AS_API_VERSION}`,
+    ),
   };
-  const normalized = normalizeCodexCliVersion(version);
-  if (normalized) {
-    headers["User-Agent"] = sanitizeHeaderValue(
-      `${CODEX_CLI_ORIGINATOR}/${normalized} (${codexOsInfo()}) codex-as-api`,
-    );
-  }
-  return headers;
 }
 
 function codexCliHeaders(): Record<string, string> {
@@ -816,8 +810,7 @@ export class ChatGPTOAuthProvider {
     ];
   }
 
-  private getHeaders(): Record<string, string> {
-    const token = loadTokenData(this.authJsonPath);
+  private getHeaders(token = loadTokenData(this.authJsonPath)): Record<string, string> {
     const headers: Record<string, string> = {
       ...codexCliHeaders(),
       Authorization: `Bearer ${token.access_token}`,
@@ -836,11 +829,11 @@ export class ChatGPTOAuthProvider {
   ): Promise<Record<string, unknown>> {
     let tokenValues: (string | null)[] = [null];
     for (let attempt = 0; attempt < 2; attempt++) {
-      const headers = this.getHeaders();
+      const token = await tokenForRequest(this.authJsonPath);
+      const headers = this.getHeaders(token);
       if (isResponsesLitePayload(payload)) {
         headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
       }
-      const token = loadTokenData(this.authJsonPath);
       tokenValues = [
         token.access_token,
         token.refresh_token,
@@ -869,10 +862,11 @@ export class ChatGPTOAuthProvider {
         const body = await response.text();
         const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
-          await refreshToken(this.authJsonPath);
+          await refreshAfterUnauthorized(token);
           continue;
         }
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUpstreamError(
+          response.status,
           `ChatGPT OAuth request failed: HTTP ${response.status}: ${redacted}`,
         );
       }
@@ -899,13 +893,13 @@ export class ChatGPTOAuthProvider {
   ): AsyncGenerator<Record<string, unknown>> {
     let tokenValues: (string | null)[] = [null];
     for (let attempt = 0; attempt < 2; attempt++) {
-      const headers = this.getHeaders();
+      const token = await tokenForRequest(this.authJsonPath);
+      const headers = this.getHeaders(token);
       headers.Accept = "text/event-stream";
       Object.assign(headers, extraHeaders);
       if (isResponsesLitePayload(payload)) {
         headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
       }
-      const token = loadTokenData(this.authJsonPath);
       tokenValues = [
         token.access_token,
         token.refresh_token,
@@ -934,10 +928,11 @@ export class ChatGPTOAuthProvider {
         const body = await response.text();
         const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
-          await refreshToken(this.authJsonPath);
+          await refreshAfterUnauthorized(token);
           continue;
         }
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUpstreamError(
+          response.status,
           `ChatGPT OAuth request failed: HTTP ${response.status}: ${redacted}`,
         );
       }

@@ -8,8 +8,7 @@ use crate::model_capabilities::{
 use crate::protocol::{reasoning_from_response_items, response_failure_message};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, Read};
-use std::process::{Command, Stdio};
+use std::io::BufRead;
 use std::sync::{Mutex, OnceLock};
 
 pub const CHATGPT_OAUTH_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -20,8 +19,9 @@ pub const CHATGPT_OAUTH_DEFAULT_TIMEOUT: std::time::Duration = std::time::Durati
 pub const REMOTE_COMPACTION_MARKER: &str = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_CLI_VERSION_ENV: &str = "CODEX_AS_API_CODEX_CLI_VERSION";
-const CODEX_CLI_NPM_PACKAGE: &str = "@openai/codex";
-static CODEX_CLI_VERSION_CACHE: OnceLock<Option<String>> = OnceLock::new();
+const CODEX_UPSTREAM_CONTRACT_JSON: &str =
+    include_str!("../../config/codex-upstream-contract.json");
+static CODEX_COMPATIBILITY_VERSION: OnceLock<String> = OnceLock::new();
 const RESPONSE_CHAIN_CAPACITY: usize = 256;
 
 fn resolve_prompt_cache_key(
@@ -43,58 +43,28 @@ fn resolve_prompt_cache_key(
         .cloned())
 }
 
-pub fn prime_codex_cli_version_cache() {
-    let _ = resolve_codex_cli_version();
+fn pinned_codex_compatibility_version() -> &'static str {
+    CODEX_COMPATIBILITY_VERSION.get_or_init(|| {
+        let contract: Value = serde_json::from_str(CODEX_UPSTREAM_CONTRACT_JSON)
+            .expect("embedded Codex upstream contract must be valid JSON");
+        let version = contract
+            .get("upstream")
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_str)
+            .expect("embedded Codex upstream contract must contain upstream.version");
+        normalize_codex_cli_version(version)
+            .expect("embedded Codex upstream contract version must be a semantic version")
+    })
 }
 
-fn resolve_codex_cli_version() -> Option<String> {
+fn resolve_codex_cli_version() -> Result<String, String> {
     if let Ok(value) = std::env::var(CODEX_CLI_VERSION_ENV) {
-        if let Some(version) = normalize_codex_cli_version(&value) {
-            return Some(version);
+        if !value.trim().is_empty() {
+            return normalize_codex_cli_version(&value)
+                .ok_or_else(|| format!("{CODEX_CLI_VERSION_ENV} must be a semantic version"));
         }
     }
-    CODEX_CLI_VERSION_CACHE
-        .get_or_init(fetch_latest_codex_cli_version_from_npm)
-        .clone()
-}
-
-fn fetch_latest_codex_cli_version_from_npm() -> Option<String> {
-    let mut child = Command::new("npm")
-        .args(["view", CODEX_CLI_NPM_PACKAGE, "version"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_string(&mut stdout);
-                }
-                return if status.success() {
-                    normalize_codex_cli_version(&stdout)
-                } else {
-                    None
-                };
-            }
-            Ok(None) => {
-                if started.elapsed() >= std::time::Duration::from_secs(3) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
+    Ok(pinned_codex_compatibility_version().to_string())
 }
 
 fn normalize_codex_cli_version(value: &str) -> Option<String> {
@@ -142,23 +112,29 @@ fn normalize_codex_cli_version(value: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-fn codex_cli_headers() -> HashMap<String, String> {
-    codex_cli_headers_for_version(resolve_codex_cli_version().as_deref())
+fn codex_cli_headers() -> Result<HashMap<String, String>, String> {
+    let version = resolve_codex_cli_version()?;
+    codex_cli_headers_for_version(Some(&version))
 }
 
-fn codex_cli_headers_for_version(version: Option<&str>) -> HashMap<String, String> {
+fn codex_cli_headers_for_version(version: Option<&str>) -> Result<HashMap<String, String>, String> {
+    let raw = version
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| pinned_codex_compatibility_version().to_string());
+    let version = normalize_codex_cli_version(&raw)
+        .ok_or_else(|| "Codex compatibility version must be a semantic version".to_string())?;
     let mut headers = HashMap::new();
     headers.insert("originator".to_string(), CODEX_CLI_ORIGINATOR.to_string());
-    if let Some(version) = version.and_then(normalize_codex_cli_version) {
-        headers.insert(
-            "User-Agent".to_string(),
-            sanitize_header_value(&format!(
-                "{CODEX_CLI_ORIGINATOR}/{version} ({}) codex-as-api",
-                codex_os_info()
-            )),
-        );
-    }
-    headers
+    headers.insert(
+        "User-Agent".to_string(),
+        sanitize_header_value(&format!(
+            "{CODEX_CLI_ORIGINATOR}/{version} ({}) codex-as-api/{}",
+            codex_os_info(),
+            env!("CARGO_PKG_VERSION")
+        )),
+    );
+    Ok(headers)
 }
 
 fn codex_os_info() -> String {
@@ -1429,9 +1405,9 @@ impl ChatGPTOAuthProvider {
     }
 
     fn headers(&self) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
-        let token = auth::load_token_data(self.auth_json_path.as_deref())?;
+        let token = auth::token_for_request(self.auth_json_path.as_deref())?;
         let mut headers = HashMap::new();
-        headers.extend(codex_cli_headers());
+        headers.extend(codex_cli_headers().map_err(ProviderError::Request)?);
         headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", token.access_token),
@@ -1526,7 +1502,7 @@ impl ChatGPTOAuthProvider {
                 Ok(response) => {
                     let status = response.status();
                     if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                        auth::do_refresh_token(self.auth_json_path.as_deref())?;
+                        auth::refresh_after_unauthorized(&token)?;
                         continue;
                     }
                     if !status.is_success() {
@@ -1628,7 +1604,7 @@ impl ChatGPTOAuthProvider {
                 Ok(response) => {
                     let status = response.status();
                     if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                        auth::do_refresh_token(self.auth_json_path.as_deref())?;
+                        auth::refresh_after_unauthorized(&token)?;
                         continue;
                     }
                     if !status.is_success() {
@@ -3830,20 +3806,24 @@ mod tests {
 
     #[test]
     fn test_codex_cli_headers_include_official_originator_and_versioned_user_agent() {
-        let headers = codex_cli_headers_for_version(Some("1.2.3\n"));
+        let headers = codex_cli_headers_for_version(Some("1.2.3\n")).unwrap();
 
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
         assert!(user_agent.starts_with("codex_cli_rs/1.2.3 ("));
-        assert!(user_agent.ends_with(") codex-as-api"));
+        assert!(user_agent.ends_with(") codex-as-api/0.6.5"));
     }
 
     #[test]
-    fn test_codex_cli_headers_omit_user_agent_for_invalid_version() {
-        let headers = codex_cli_headers_for_version(Some("not-a-version"));
+    fn test_codex_cli_headers_reject_invalid_version() {
+        let error = codex_cli_headers_for_version(Some("not-a-version")).unwrap_err();
 
-        assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
-        assert!(!headers.contains_key("User-Agent"));
+        assert!(error.contains("semantic version"));
+    }
+
+    #[test]
+    fn test_codex_cli_version_defaults_to_pinned_upstream_contract() {
+        assert_eq!(pinned_codex_compatibility_version(), "0.147.0");
     }
 
     #[test]

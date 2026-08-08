@@ -32,8 +32,6 @@ fn nonempty_trimmed(value: Option<String>) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
-    provider::prime_codex_cli_version_cache();
-
     let host = env_str("CODEX_AS_API_HOST", "127.0.0.1");
     let port = env_int("CODEX_AS_API_PORT", 18080);
     let config = codex_config::load_codex_config(None).unwrap_or_else(|error| {

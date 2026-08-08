@@ -27,6 +27,7 @@ from codex_as_api.provider import (
     _validate_image_content_items,
     _web_search_event_from_response_item,
     codex_cli_headers_for_version,
+    resolve_codex_cli_version,
 )
 
 
@@ -929,13 +930,18 @@ def test_codex_cli_headers_include_official_originator_and_versioned_user_agent(
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/1.2.3 (")
-    assert headers["User-Agent"].endswith(") codex-as-api")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.6.5")
 
 
-def test_codex_cli_headers_omit_user_agent_for_invalid_version():
-    headers = codex_cli_headers_for_version("not-a-version")
+def test_codex_cli_headers_reject_invalid_version():
+    with pytest.raises(ValueError, match="semantic version"):
+        codex_cli_headers_for_version("not-a-version")
 
-    assert headers == {"originator": "codex_cli_rs"}
+
+def test_codex_cli_version_defaults_to_pinned_upstream_contract(monkeypatch):
+    monkeypatch.delenv("CODEX_AS_API_CODEX_CLI_VERSION", raising=False)
+
+    assert resolve_codex_cli_version() == "0.147.0"
 
 
 def test_provider_headers_include_codex_cli_headers(auth_json_factory, monkeypatch):
@@ -946,7 +952,7 @@ def test_provider_headers_include_codex_cli_headers(auth_json_factory, monkeypat
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/9.8.7 (")
-    assert headers["User-Agent"].endswith(") codex-as-api")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.6.5")
     assert headers["Authorization"].startswith("Bearer ")
 
 

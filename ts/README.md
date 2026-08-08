@@ -43,8 +43,9 @@ Claude Code's exact `x-claude-code-session-id` value is hashed as
 only. It is not converted to Codex session or thread metadata. Accepted
 Anthropic cache hints use `type: "ephemeral"` with optional TTL `5m` or `1h`;
 the private Codex transport cannot apply Anthropic breakpoint or TTL semantics.
-This behavior was checked against Codex `0.145.0`, Codex `main` at
-`bd2de422aa287b97b06ca6425a10935bcf1b3731`, and Claude Code `2.1.220`.
+This behavior was rechecked against Codex `0.147.0` at
+`be6e8eac029b183056b7e4402879f15d2c85f61b`; Claude Code compatibility was
+last checked with `2.1.220`.
 
 ## Claude Code with GPT
 

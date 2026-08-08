@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -14,6 +14,7 @@ pub const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const DEFAULT_AUTH_PATH: &str = "~/.codex/auth.json";
 pub const DEFAULT_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const REFRESH_WINDOW_MINUTES: i64 = 5;
 
 static REFRESH_LOCKS: std::sync::LazyLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -45,6 +46,13 @@ impl ChatGPTTokenData {
     pub fn expired(&self) -> bool {
         match self.access_expires_at {
             Some(exp) => exp <= Utc::now(),
+            None => false,
+        }
+    }
+
+    pub fn expires_within_refresh_window(&self) -> bool {
+        match self.access_expires_at {
+            Some(exp) => exp <= Utc::now() + Duration::minutes(REFRESH_WINDOW_MINUTES),
             None => false,
         }
     }
@@ -185,10 +193,17 @@ pub fn load_token_data(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData,
         }
     }
 
+    let nested_tokens = match obj.get("tokens") {
+        Some(Value::Object(tokens)) => Some(tokens),
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            return Err(AuthError::OAuth(
+                "ChatGPT OAuth auth file tokens must be an object".to_string(),
+            ));
+        }
+    };
     let root_tokens = root_tokens_from_latest_auth(obj);
-    let tokens = obj
-        .get("tokens")
-        .and_then(|v| v.as_object())
+    let tokens = nested_tokens
         .or(root_tokens.as_ref())
         .ok_or_else(|| AuthError::OAuth(unsupported_auth_schema_message(obj)))?;
 
@@ -199,22 +214,31 @@ pub fn load_token_data(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData,
     let id_auth = auth_claims(&id_token)?;
     let access_auth = auth_claims(&access_token)?;
 
-    let account_id = tokens
-        .get("account_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            id_auth
-                .get("chatgpt_account_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            access_auth
-                .get("chatgpt_account_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        })
+    let account_sources = [
+        ("account_id", tokens.get("account_id")),
+        ("id_token", id_auth.get("chatgpt_account_id")),
+        ("access_token", access_auth.get("chatgpt_account_id")),
+    ];
+    let mut account_id: Option<&str> = None;
+    for (source, value) in account_sources {
+        let candidate = match value {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(value)) if !value.is_empty() => value.as_str(),
+            _ => {
+                return Err(AuthError::OAuth(format!(
+                    "ChatGPT OAuth {} account id is invalid",
+                    source
+                )))
+            }
+        };
+        if account_id.is_some_and(|existing| existing != candidate) {
+            return Err(AuthError::OAuth(
+                "ChatGPT OAuth token account ids do not match".to_string(),
+            ));
+        }
+        account_id = Some(candidate);
+    }
+    let account_id = account_id
         .ok_or_else(|| {
             AuthError::OAuth(
                 "ChatGPT OAuth account id not available; rerun codex login".to_string(),
@@ -361,12 +385,74 @@ fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
     Ok(())
 }
 
-pub fn do_refresh_token(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData, AuthError> {
+pub fn token_for_request(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData, AuthError> {
     let current = load_token_data(auth_json_path)?;
+    if !current.expires_within_refresh_window() {
+        return Ok(current);
+    }
+    refresh_from_observed(current, true)
+}
+
+pub fn refresh_after_unauthorized(
+    current: &ChatGPTTokenData,
+) -> Result<ChatGPTTokenData, AuthError> {
+    refresh_from_observed(current.clone(), false)
+}
+
+fn fail_if_account_changed(
+    current: &ChatGPTTokenData,
+    latest: &ChatGPTTokenData,
+) -> Result<(), AuthError> {
+    if current.account_id != latest.account_id {
+        return Err(AuthError::Refresh(
+            "ChatGPT OAuth account changed while refreshing credentials".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn access_token_changed(current: &ChatGPTTokenData, latest: &ChatGPTTokenData) -> bool {
+    current.access_token != latest.access_token
+}
+
+fn other_credentials_changed(current: &ChatGPTTokenData, latest: &ChatGPTTokenData) -> bool {
+    current.refresh_token != latest.refresh_token || current.id_token != latest.id_token
+}
+
+fn validate_refreshed_token_accounts(payload: &Value, account_id: &str) -> Result<(), AuthError> {
+    for name in ["access_token", "id_token"] {
+        let Some(value) = payload.get(name).and_then(Value::as_str) else {
+            continue;
+        };
+        let claims = auth_claims(value)?;
+        if let Some(claim_account) = claims.get("chatgpt_account_id") {
+            if claim_account.as_str() != Some(account_id) {
+                return Err(AuthError::Refresh(format!(
+                    "ChatGPT OAuth refreshed {} account id does not match current account",
+                    name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_from_observed(
+    current: ChatGPTTokenData,
+    refresh_if_expiring: bool,
+) -> Result<ChatGPTTokenData, AuthError> {
     let lock = refresh_lock(&current.auth_path);
     let _guard = lock.lock().unwrap();
 
-    let current = load_token_data(auth_json_path)?;
+    let latest = load_token_data(current.auth_path.to_str())?;
+    fail_if_account_changed(&current, &latest)?;
+    if access_token_changed(&current, &latest) {
+        return Ok(latest);
+    }
+    if refresh_if_expiring && !latest.expires_within_refresh_window() {
+        return Ok(latest);
+    }
+    let current = latest;
     let endpoint =
         std::env::var(REFRESH_URL_OVERRIDE_ENV).unwrap_or(DEFAULT_REFRESH_URL.to_string());
 
@@ -387,9 +473,18 @@ pub fn do_refresh_token(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData
     let response = match response {
         Ok(resp) => resp,
         Err(e) => {
+            let redacted = redact_text(
+                &e.to_string(),
+                &[
+                    &current.access_token,
+                    &current.refresh_token,
+                    &current.id_token,
+                    &current.account_id,
+                ],
+            );
             return Err(AuthError::Refresh(format!(
                 "ChatGPT OAuth token refresh failed: {}",
-                e
+                redacted
             )));
         }
     };
@@ -403,6 +498,7 @@ pub fn do_refresh_token(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData
                 &current.access_token,
                 &current.refresh_token,
                 &current.id_token,
+                &current.account_id,
             ],
         );
         if status.as_u16() == 401 {
@@ -427,13 +523,66 @@ pub fn do_refresh_token(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData
             "ChatGPT OAuth token refresh returned invalid JSON".to_string(),
         ));
     }
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AuthError::Refresh(
+                "ChatGPT OAuth token refresh response is missing access_token".to_string(),
+            )
+        })?;
+    for name in ["id_token", "refresh_token"] {
+        if payload.get(name).is_some()
+            && payload
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            return Err(AuthError::Refresh(format!(
+                "ChatGPT OAuth token refresh response has invalid {}",
+                name
+            )));
+        }
+    }
+    persist_refresh_payload(&current, &payload, access_token)
+}
+
+fn persist_refresh_payload(
+    current: &ChatGPTTokenData,
+    payload: &Value,
+    access_token: &str,
+) -> Result<ChatGPTTokenData, AuthError> {
+    validate_refreshed_token_accounts(payload, &current.account_id)?;
+
+    let latest = load_token_data(current.auth_path.to_str())?;
+    fail_if_account_changed(current, &latest)?;
+    if access_token_changed(current, &latest) {
+        return Ok(latest);
+    }
+    if other_credentials_changed(current, &latest) {
+        return Err(AuthError::Refresh(
+            "ChatGPT OAuth credentials changed while token refresh was in flight".to_string(),
+        ));
+    }
 
     let auth_raw = fs::read_to_string(&current.auth_path)
         .map_err(|e| AuthError::Refresh(format!("failed to re-read auth file: {}", e)))?;
     let mut data: Value = serde_json::from_str(&auth_raw)
         .map_err(|e| AuthError::Refresh(format!("failed to parse auth file: {}", e)))?;
 
-    apply_refresh_payload(&mut data, &payload)?;
+    apply_refresh_payload(&mut data, payload)?;
+    debug_assert_eq!(
+        data.get("tokens")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| data
+                .as_object()
+                .expect("auth data was validated as an object"))
+            .get("access_token")
+            .and_then(Value::as_str),
+        Some(access_token)
+    );
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.fZ").to_string();
     if let Some(obj) = data.as_object_mut() {
@@ -441,19 +590,30 @@ pub fn do_refresh_token(auth_json_path: Option<&str>) -> Result<ChatGPTTokenData
     }
 
     write_auth_json(&current.auth_path, &data)?;
-    load_token_data(auth_json_path)
+    load_token_data(current.auth_path.to_str())
 }
 
 fn apply_refresh_payload(data: &mut Value, payload: &Value) -> Result<(), AuthError> {
     let obj = data
         .as_object_mut()
         .ok_or_else(|| AuthError::Refresh("auth file root must be an object".to_string()))?;
-    let tokens_value = obj
-        .entry("tokens".to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let tokens = tokens_value
-        .as_object_mut()
-        .ok_or_else(|| AuthError::Refresh("auth file tokens must be an object".to_string()))?;
+    let has_nested_tokens = matches!(obj.get("tokens"), Some(Value::Object(_)));
+    let has_invalid_nested_tokens = !matches!(
+        obj.get("tokens"),
+        None | Some(Value::Null | Value::Object(_))
+    );
+    if has_invalid_nested_tokens {
+        return Err(AuthError::Refresh(
+            "auth file tokens must be an object".to_string(),
+        ));
+    }
+    let tokens = if has_nested_tokens {
+        obj.get_mut("tokens")
+            .and_then(Value::as_object_mut)
+            .expect("nested tokens were validated as an object")
+    } else {
+        obj
+    };
 
     for name in ["id_token", "access_token", "refresh_token"] {
         if let Some(value) = payload.get(name).and_then(|v| v.as_str()) {
@@ -608,7 +768,39 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_refresh_payload_creates_tokens_for_root_auth() {
+    fn test_root_auth_rejects_present_non_object_tokens_field() {
+        let dir = std::env::temp_dir().join(format!("codex_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc-root"},
+            "exp": 9999999999i64,
+        });
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let auth_path = dir.join("auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": ["invalid"],
+                "access_token": token,
+                "refresh_token": "refresh-root",
+                "id_token": token,
+                "account_id": "acc-root",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_token_data(auth_path.to_str()).unwrap_err();
+
+        assert!(error.to_string().contains("tokens must be an object"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_refresh_payload_preserves_root_auth_layout() {
         let auth_claims_payload = serde_json::json!({
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "acc-new",
@@ -633,7 +825,7 @@ mod tests {
         });
 
         apply_refresh_payload(&mut data, &payload).unwrap();
-        let tokens = data.get("tokens").and_then(|v| v.as_object()).unwrap();
+        let tokens = data.as_object().unwrap();
 
         assert_eq!(
             tokens.get("access_token").unwrap().as_str(),
@@ -647,6 +839,274 @@ mod tests {
             tokens.get("id_token").unwrap().as_str(),
             Some(refreshed.as_str())
         );
+        assert!(!tokens.contains_key("tokens"));
+    }
+
+    #[test]
+    fn test_partial_refresh_preserves_root_auth_credentials() {
+        let mut data = serde_json::json!({
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "id_token": "old-id",
+        });
+        apply_refresh_payload(
+            &mut data,
+            &serde_json::json!({"access_token": "new-access"}),
+        )
+        .unwrap();
+        let tokens = data.as_object().unwrap();
+
+        assert_eq!(tokens["access_token"], "new-access");
+        assert_eq!(tokens["refresh_token"], "old-refresh");
+        assert_eq!(tokens["id_token"], "old-id");
+        assert!(!tokens.contains_key("tokens"));
+    }
+
+    #[test]
+    fn test_load_rejects_mismatched_account_claims() {
+        let dir = std::env::temp_dir().join(format!("codex_accounts_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        let access = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "exp": 9999999999i64,
+                    "https://api.openai.com/auth": {"chatgpt_account_id": "acc-new"}
+                }))
+                .unwrap()
+            )
+        );
+        let id = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "https://api.openai.com/auth": {"chatgpt_account_id": "acc-old"}
+                }))
+                .unwrap()
+            )
+        );
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {"access_token": access, "refresh_token": "refresh", "id_token": id}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_token_data(auth_path.to_str()).unwrap_err();
+
+        assert!(error.to_string().contains("account ids do not match"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_persist_refresh_payload_compare_and_set_and_account_validation() {
+        let dir = std::env::temp_dir().join(format!("codex_cas_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc-shared"}
+        });
+        let id = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let access = |version: &str, account: &str| {
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&serde_json::json!({
+                        "exp": 9999999999i64,
+                        "version": version,
+                        "https://api.openai.com/auth": {"chatgpt_account_id": account}
+                    }))
+                    .unwrap()
+                )
+            )
+        };
+        let old_access = access("old", "acc-shared");
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": old_access,
+                    "refresh_token": "refresh-old",
+                    "id_token": id
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let observed = load_token_data(auth_path.to_str()).unwrap();
+
+        let external_access = access("external", "acc-shared");
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": external_access,
+                    "refresh_token": observed.refresh_token,
+                    "id_token": observed.id_token
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let response_access = access("response", "acc-shared");
+        let reused = persist_refresh_payload(
+            &observed,
+            &serde_json::json!({"access_token": response_access}),
+            &response_access,
+        )
+        .unwrap();
+        assert_eq!(reused.access_token, external_access);
+
+        let mismatched_access = access("wrong", "acc-other");
+        let error = persist_refresh_payload(
+            &reused,
+            &serde_json::json!({"access_token": mismatched_access}),
+            &mismatched_access,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match current account"));
+
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": reused.access_token,
+                    "refresh_token": "refresh-raced",
+                    "id_token": reused.id_token
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = persist_refresh_payload(
+            &reused,
+            &serde_json::json!({"access_token": response_access}),
+            &response_access,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed while token refresh was in flight"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_account_switch_and_unchanged_access_token_changes_are_distinct() {
+        let observed = ChatGPTTokenData {
+            auth_path: PathBuf::from("auth.json"),
+            access_token: "access".to_string(),
+            refresh_token: "refresh-old".to_string(),
+            id_token: "id-old".to_string(),
+            account_id: "acc-old".to_string(),
+            plan_type: None,
+            user_id: None,
+            fedramp: false,
+            access_expires_at: None,
+        };
+        let mut latest = observed.clone();
+        latest.refresh_token = "refresh-latest".to_string();
+        latest.id_token = "id-latest".to_string();
+        assert!(!access_token_changed(&observed, &latest));
+        assert!(other_credentials_changed(&observed, &latest));
+        assert!(fail_if_account_changed(&observed, &latest).is_ok());
+        latest.account_id = "acc-new".to_string();
+        assert!(fail_if_account_changed(&observed, &latest).is_err());
+    }
+
+    #[test]
+    fn test_refresh_error_redaction_includes_account_id() {
+        let redacted = redact_text(
+            "request failed for account acc-secret",
+            &["access", "refresh", "id", "acc-secret"],
+        );
+        assert_eq!(redacted, "request failed for account ***");
+    }
+
+    #[test]
+    fn test_refresh_window_and_matching_account_change_detection() {
+        let mut observed = ChatGPTTokenData {
+            auth_path: PathBuf::from("auth.json"),
+            access_token: "old-access".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            id_token: "old-id".to_string(),
+            account_id: "acc-shared".to_string(),
+            plan_type: None,
+            user_id: None,
+            fedramp: false,
+            access_expires_at: Some(Utc::now() + Duration::minutes(4)),
+        };
+        assert!(observed.expires_within_refresh_window());
+        observed.access_expires_at = Some(Utc::now() + Duration::minutes(6));
+        assert!(!observed.expires_within_refresh_window());
+
+        let mut latest = observed.clone();
+        latest.access_token = "new-access".to_string();
+        assert!(access_token_changed(&observed, &latest));
+        latest.account_id = "different-account".to_string();
+        assert!(fail_if_account_changed(&observed, &latest).is_err());
+    }
+
+    #[test]
+    fn test_refresh_after_unauthorized_reloads_coalesced_matching_file_update() {
+        let dir = std::env::temp_dir().join(format!("codex_refresh_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        let id_claims = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc-shared"},
+        });
+        let id_token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&id_claims).unwrap())
+        );
+        let old_access = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&serde_json::json!({"exp": 9999999999i64})).unwrap())
+        );
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": old_access,
+                    "refresh_token": "refresh-old",
+                    "id_token": id_token.clone(),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let observed = load_token_data(auth_path.to_str()).unwrap();
+        let lock = refresh_lock(&auth_path);
+        let guard = lock.lock().unwrap();
+        let worker = std::thread::spawn(move || refresh_after_unauthorized(&observed).unwrap());
+        let new_access = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&serde_json::json!({"exp": 9999999999i64})).unwrap())
+        ) + "-new";
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": new_access,
+                    "refresh_token": "refresh-from-file",
+                    "id_token": id_token,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        drop(guard);
+
+        let refreshed = worker.join().unwrap();
+        assert_eq!(refreshed.refresh_token, "refresh-from-file");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

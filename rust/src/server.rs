@@ -17,7 +17,7 @@ use crate::anthropic_adapter::{
     anthropic_request_to_internal, format_anthropic_error, internal_response_to_anthropic,
     AnthropicStreamAdapter,
 };
-use crate::auth;
+use crate::auth::{self, AuthError};
 use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::model_capabilities::capability_for_model;
@@ -170,7 +170,8 @@ fn anthropic_stream_error_event(status: u16, message: &str) -> Event {
 
 fn map_error_status(e: &ProviderError) -> StatusCode {
     match e {
-        ProviderError::Auth(_) => StatusCode::UNAUTHORIZED,
+        ProviderError::Auth(AuthError::Missing(_)) => StatusCode::UNAUTHORIZED,
+        ProviderError::Auth(_) => StatusCode::INTERNAL_SERVER_ERROR,
         ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         ProviderError::UpstreamHttp { status, .. } => {
             StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
@@ -2038,7 +2039,7 @@ mod tests {
     use super::*;
     use crate::messages::{Message, MessageRole};
     use axum::body::{Body, Bytes};
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{header::CONTENT_TYPE, Method, Uri};
     use futures::StreamExt;
     use serde_json::json;
     use std::path::PathBuf;
@@ -2046,6 +2047,28 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn auth_status_mapping_only_treats_missing_credentials_as_unauthorized() {
+        assert_eq!(
+            map_error_status(&ProviderError::Auth(AuthError::Missing(
+                "missing".to_string()
+            ))),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            map_error_status(&ProviderError::Auth(AuthError::Refresh(
+                "failed".to_string()
+            ))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            map_error_status(&ProviderError::Auth(AuthError::OAuth(
+                "invalid".to_string()
+            ))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     fn has_nested_key(value: &Value, key: &str) -> bool {
         match value {
@@ -2066,6 +2089,8 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RecordedRequest {
         endpoint: RecordedEndpoint,
+        method: Method,
+        path: String,
         headers: HeaderMap,
         body: Value,
     }
@@ -2102,9 +2127,18 @@ mod tests {
     }
 
     impl RecordingState {
-        fn record(&self, endpoint: RecordedEndpoint, headers: HeaderMap, body: Value) {
+        fn record(
+            &self,
+            endpoint: RecordedEndpoint,
+            method: Method,
+            path: String,
+            headers: HeaderMap,
+            body: Value,
+        ) {
             self.requests.lock().unwrap().push(RecordedRequest {
                 endpoint,
+                method,
+                path,
                 headers,
                 body,
             });
@@ -2157,10 +2191,18 @@ mod tests {
 
     async fn record_responses_request(
         State(state): State<RecordingState>,
+        method: Method,
+        uri: Uri,
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> impl IntoResponse {
-        state.record(RecordedEndpoint::Responses, headers, body);
+        state.record(
+            RecordedEndpoint::Responses,
+            method,
+            uri.path().to_string(),
+            headers,
+            body,
+        );
         let completed = json!({
             "type": "response.completed",
             "response": {
@@ -2194,10 +2236,18 @@ mod tests {
 
     async fn record_compact_request(
         State(state): State<RecordingState>,
+        method: Method,
+        uri: Uri,
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
-        state.record(RecordedEndpoint::Compact, headers, body);
+        state.record(
+            RecordedEndpoint::Compact,
+            method,
+            uri.path().to_string(),
+            headers,
+            body,
+        );
         Json(json!({
             "output": [
                 {"type": "additional_tools", "role": "developer", "tools": []},
@@ -2840,8 +2890,8 @@ mod tests {
             .unwrap();
         assert_eq!(requested.status(), reqwest::StatusCode::OK);
         let requested_body: Value = requested.json().await.unwrap();
-        assert_eq!(requested_body["context_window"], json!(372_000));
-        assert_eq!(requested_body["auto_compact_token_limit"], json!(334_800));
+        assert_eq!(requested_body["context_window"], json!(272_000));
+        assert_eq!(requested_body["auto_compact_token_limit"], json!(244_800));
 
         let fallback = client
             .post(format!("{api_url}/v1/messages/count_tokens"))
@@ -3352,8 +3402,8 @@ mod tests {
             effective_reasoning_effort(&state, None, &state.model),
             Some("low".to_string())
         );
-        assert_eq!(context_window(&state), 372_000);
-        assert_eq!(auto_compact_token_limit(&state), 334_800);
+        assert_eq!(context_window(&state), 272_000);
+        assert_eq!(auto_compact_token_limit(&state), 244_800);
     }
 
     #[test]
@@ -3408,8 +3458,8 @@ mod tests {
             test_codex_config(None, Some(500_000), Some(450_000)),
         );
 
-        assert_eq!(context_window(&state), 372_000);
-        assert_eq!(auto_compact_token_limit(&state), 334_800);
+        assert_eq!(context_window(&state), 272_000);
+        assert_eq!(auto_compact_token_limit(&state), 244_800);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3454,26 +3504,56 @@ mod tests {
         let requests = recording.requests();
         assert_eq!(requests.len(), 1);
         let recorded = &requests[0];
+        let contract: Value =
+            serde_json::from_str(include_str!("../../config/codex-upstream-contract.json"))
+                .unwrap();
+        let request_contract = &contract["responses_request"];
+        let lite_contract = &contract["responses_lite"];
+        let originator_contract = &contract["headers"]["originator"];
         assert_eq!(recorded.endpoint, RecordedEndpoint::Responses);
+        assert_eq!(
+            recorded.method.as_str(),
+            request_contract["method"].as_str().unwrap()
+        );
+        assert_eq!(recorded.path, request_contract["path"].as_str().unwrap());
+        assert_eq!(
+            recorded.headers.get("accept").unwrap().to_str().unwrap(),
+            request_contract["streaming_accept"].as_str().unwrap()
+        );
         assert_eq!(
             recorded
                 .headers
-                .get(crate::model_capabilities::LITE_HEADER_NAME)
+                .get(originator_contract["name"].as_str().unwrap())
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            crate::model_capabilities::LITE_HEADER_VALUE
+            originator_contract["value"].as_str().unwrap()
+        );
+        assert_eq!(
+            recorded
+                .headers
+                .get(lite_contract["header"]["name"].as_str().unwrap())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            lite_contract["header"]["value"].as_str().unwrap()
         );
         assert_eq!(recorded.body["model"], json!("gpt-5.6-sol"));
         assert_eq!(recorded.body["reasoning"]["effort"], json!("max"));
-        assert_eq!(recorded.body["reasoning"]["context"], json!("all_turns"));
         assert_eq!(
-            recorded.body["include"],
-            json!(["reasoning.encrypted_content"])
+            recorded.body["reasoning"]["context"],
+            lite_contract["reasoning_context"]
         );
+        assert!(recorded.body["include"]
+            .as_array()
+            .unwrap()
+            .contains(&request_contract["reasoning_encrypted_content_include"]));
         assert_eq!(recorded.body["text"], json!({"verbosity": "low"}));
         assert_eq!(recorded.body["tool_choice"], json!("auto"));
-        assert_eq!(recorded.body["parallel_tool_calls"], json!(false));
+        assert_eq!(
+            recorded.body["parallel_tool_calls"],
+            lite_contract["parallel_tool_calls"]
+        );
         assert!(recorded.body.get("instructions").is_none());
         assert!(recorded.body.get("tools").is_none());
         assert_eq!(
@@ -4146,7 +4226,7 @@ mod tests {
         assert_eq!(events.last().unwrap().0, "error");
         assert_eq!(
             events.last().unwrap().1["error"]["type"],
-            json!("authentication_error")
+            json!("api_error")
         );
         assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 3);
         assert_eq!(upstream_state.authorizations.lock().unwrap().len(), 5);

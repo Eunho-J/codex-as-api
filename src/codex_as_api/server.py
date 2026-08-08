@@ -12,13 +12,14 @@ from .auth import (
     ChatGPTOAuthError,
     ChatGPTOAuthInvalidRequestError,
     ChatGPTOAuthMissingError,
+    ChatGPTOAuthUpstreamError,
     is_auth_locally_available,
 )
 from .codex_config import load_codex_config
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import capability_for_model, load_model_capabilities
 from .o200k_tokenizer import count_ordinary
-from .provider import ChatGPTOAuthProvider, prime_codex_cli_version_cache
+from .provider import ChatGPTOAuthProvider
 
 
 def _env_int(name: str, default: int) -> int:
@@ -62,6 +63,8 @@ def _is_context_window_error(exc: BaseException | str) -> bool:
 
 
 def _error_status(exc: BaseException) -> int:
+    if isinstance(exc, ChatGPTOAuthUpstreamError):
+        return exc.status if 100 <= exc.status <= 599 else 500
     if isinstance(exc, ChatGPTOAuthInvalidRequestError):
         return 400
     if isinstance(exc, ChatGPTOAuthMissingError):
@@ -214,7 +217,7 @@ try:
     app = FastAPI(
         title="codex-as-api",
         description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-        version="0.6.4",
+        version="0.6.5",
     )
 
     @app.exception_handler(ChatGPTOAuthError)
@@ -1319,7 +1322,6 @@ try:
     def main() -> None:
         import uvicorn
 
-        prime_codex_cli_version_cache()
         uvicorn.run("codex_as_api.server:app", host=HOST, port=PORT, log_level="info")
 
 except ImportError as _import_exc:

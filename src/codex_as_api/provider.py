@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import platform
 import re
-import subprocess
 import threading
 import urllib.error
 import urllib.request
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
+from contextlib import suppress
 from copy import deepcopy
 from typing import Any, cast
 
+from . import __version__
 from .auth import (
     ChatGPTOAuthError,
     ChatGPTOAuthInvalidRequestError,
-    load_token_data,
+    ChatGPTOAuthUpstreamError,
     redact_text,
-    refresh_token,
+    refresh_after_unauthorized,
     register_token_secrets,
+    token_for_request,
 )
 from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .model_capabilities import (
@@ -47,7 +50,6 @@ CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5"
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
 CODEX_CLI_ORIGINATOR = "codex_cli_rs"
 CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION"
-CODEX_CLI_NPM_PACKAGE = "@openai/codex"
 KNOWN_REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 KNOWN_REASONING_MODES = frozenset({"standard", "pro"})
 KNOWN_REASONING_CONTEXTS = frozenset({"auto", "current_turn", "all_turns"})
@@ -55,9 +57,24 @@ KNOWN_IMAGE_DETAILS = frozenset({"auto", "low", "high", "original"})
 KNOWN_VERBOSITY_VALUES = frozenset({"low", "medium", "high"})
 RESPONSE_CHAIN_CAPACITY = 256
 _CODEX_CLI_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$")
-_CODEX_CLI_VERSION_UNSET = object()
-_codex_cli_version_cache: str | None | object = _CODEX_CLI_VERSION_UNSET
-_codex_cli_version_lock = threading.Lock()
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_UPSTREAM_CONTRACT_PATH = _PROJECT_ROOT / "config" / "codex-upstream-contract.json"
+_PACKAGE_UPSTREAM_CONTRACT_PATH = pathlib.Path(__file__).resolve().with_name("codex-upstream-contract.json")
+
+
+def _load_codex_compatibility_version() -> str:
+    path = _UPSTREAM_CONTRACT_PATH if _UPSTREAM_CONTRACT_PATH.exists() else _PACKAGE_UPSTREAM_CONTRACT_PATH
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        version = document["upstream"]["version"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"invalid bundled Codex upstream contract: {exc}") from exc
+    if not isinstance(version, str) or _CODEX_CLI_VERSION_RE.fullmatch(version) is None:
+        raise RuntimeError("bundled Codex upstream contract has an invalid version")
+    return version
+
+
+CODEX_COMPATIBILITY_VERSION = _load_codex_compatibility_version()
 
 
 class _ResponseChainStore:
@@ -97,36 +114,14 @@ class _ResponseChainStore:
                 self._chains.popitem(last=False)
 
 
-def prime_codex_cli_version_cache() -> None:
-    resolve_codex_cli_version()
-
-
-def resolve_codex_cli_version() -> str | None:
-    override = _normalize_codex_cli_version(os.getenv(CODEX_CLI_VERSION_ENV))
-    if override:
-        return override
-    global _codex_cli_version_cache
-    with _codex_cli_version_lock:
-        if _codex_cli_version_cache is not _CODEX_CLI_VERSION_UNSET:
-            return _codex_cli_version_cache if isinstance(_codex_cli_version_cache, str) else None
-        _codex_cli_version_cache = _fetch_latest_codex_cli_version_from_npm()
-        return _codex_cli_version_cache if isinstance(_codex_cli_version_cache, str) else None
-
-
-def _fetch_latest_codex_cli_version_from_npm() -> str | None:
-    try:
-        completed = subprocess.run(  # noqa: S603 - fixed executable and arguments.
-            ["npm", "view", CODEX_CLI_NPM_PACKAGE, "version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    return _normalize_codex_cli_version(completed.stdout)
+def resolve_codex_cli_version() -> str:
+    raw = os.getenv(CODEX_CLI_VERSION_ENV)
+    if raw is None or not raw.strip():
+        return CODEX_COMPATIBILITY_VERSION
+    override = _normalize_codex_cli_version(raw)
+    if override is None:
+        raise ValueError(f"{CODEX_CLI_VERSION_ENV} must be a semantic version")
+    return override
 
 
 def _normalize_codex_cli_version(value: str | None) -> str | None:
@@ -137,13 +132,16 @@ def _normalize_codex_cli_version(value: str | None) -> str | None:
 
 
 def codex_cli_headers_for_version(version: str | None) -> dict[str, str]:
-    headers = {"originator": CODEX_CLI_ORIGINATOR}
-    normalized = _normalize_codex_cli_version(version)
-    if normalized:
-        headers["User-Agent"] = _sanitize_header_value(
-            f"{CODEX_CLI_ORIGINATOR}/{normalized} ({_codex_os_info()}) codex-as-api"
-        )
-    return headers
+    raw = CODEX_COMPATIBILITY_VERSION if version is None or not version.strip() else version
+    normalized = _normalize_codex_cli_version(raw)
+    if normalized is None:
+        raise ValueError("Codex compatibility version must be a semantic version")
+    return {
+        "originator": CODEX_CLI_ORIGINATOR,
+        "User-Agent": _sanitize_header_value(
+            f"{CODEX_CLI_ORIGINATOR}/{normalized} ({_codex_os_info()}) codex-as-api/{__version__}"
+        ),
+    }
 
 
 def _codex_cli_headers() -> dict[str, str]:
@@ -194,10 +192,8 @@ class ChatGPTOAuthProvider:
         with self._active_response_lock:
             responses = list(self._active_responses)
         for response in responses:
-            try:
+            with suppress(Exception):
                 response.close()
-            except Exception:
-                pass
 
     def preflight_chat(
         self,
@@ -790,8 +786,8 @@ class ChatGPTOAuthProvider:
         )
         return payload
 
-    def _headers(self) -> dict[str, str]:
-        token = load_token_data(self.auth_json_path)
+    def _headers(self, token: Any | None = None) -> dict[str, str]:
+        token = token or token_for_request(self.auth_json_path)
         register_token_secrets(token.access_token, token.refresh_token, token.id_token, token.account_id)
         headers = {
             **_codex_cli_headers(),
@@ -825,11 +821,11 @@ class ChatGPTOAuthProvider:
     ) -> Iterator[dict[str, Any]]:
         token_values: tuple[str | None, ...] = (None,)
         for attempt in range(2):
-            headers = self._headers()
+            token = token_for_request(self.auth_json_path)
+            headers = self._headers(token)
             headers["Accept"] = "text/event-stream"
             if extra_headers:
                 headers.update(extra_headers)
-            token = load_token_data(self.auth_json_path)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             req = urllib.request.Request(
                 self.base_url + path,
@@ -866,9 +862,12 @@ class ChatGPTOAuthProvider:
                 body = exc.read().decode("utf-8", "replace")
                 redacted = redact_text(body, *token_values)
                 if exc.code == 401 and attempt == 0:
-                    refresh_token(self.auth_json_path)
+                    refresh_after_unauthorized(token)
                     continue
-                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
+                raise ChatGPTOAuthUpstreamError(
+                    exc.code,
+                    f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}",
+                ) from exc
             except Exception as exc:  # noqa: BLE001
                 raise ChatGPTOAuthError(
                     f"ChatGPT OAuth request failed: {redact_text(str(exc), *token_values)}"
@@ -883,10 +882,10 @@ class ChatGPTOAuthProvider:
     ) -> bytes:
         token_values: tuple[str | None, ...] = (None,)
         for attempt in range(2):
-            headers = self._headers()
+            token = token_for_request(self.auth_json_path)
+            headers = self._headers(token)
             if extra_headers:
                 headers.update(extra_headers)
-            token = load_token_data(self.auth_json_path)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             req = urllib.request.Request(
                 self.base_url + path,
@@ -901,9 +900,12 @@ class ChatGPTOAuthProvider:
                 body = exc.read().decode("utf-8", "replace")
                 redacted = redact_text(body, *token_values)
                 if exc.code == 401 and attempt == 0:
-                    refresh_token(self.auth_json_path)
+                    refresh_after_unauthorized(token)
                     continue
-                raise ChatGPTOAuthError(f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}") from exc
+                raise ChatGPTOAuthUpstreamError(
+                    exc.code,
+                    f"ChatGPT OAuth request failed: HTTP {exc.code}: {redacted}",
+                ) from exc
             except Exception as exc:  # noqa: BLE001
                 raise ChatGPTOAuthError(
                     f"ChatGPT OAuth request failed: {redact_text(str(exc), *token_values)}"
