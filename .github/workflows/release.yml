@@ -142,7 +142,7 @@ jobs:
           node-version: "22.14.0"
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@^11.15
-      - run: npm publish --access public dist/*.tgz
+      - run: npm publish --access public ./dist/*.tgz
 
   publish-github-packages:
     name: Publish scoped npm package to GitHub Packages
