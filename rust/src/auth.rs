@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -361,11 +362,11 @@ fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
         .map_err(|e| AuthError::OAuth(format!("failed to serialize auth data: {}", e)))?
         + "\n";
 
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
         .open(&tmp)
         .map_err(|e| AuthError::OAuth(format!("failed to write temp auth file: {}", e)))?;
     let mut writer = std::io::BufWriter::new(file);
@@ -688,6 +689,21 @@ mod tests {
         let text = "abc abcdef";
         let redacted = redact_text(text, &["abc", "abcdef"]);
         assert_eq!(redacted, "*** ***");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_auth_json_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("codex_auth_mode_{}", uuid::Uuid::new_v4()));
+        let auth_path = dir.join("auth.json");
+
+        write_auth_json(&auth_path, &serde_json::json!({"tokens": {}})).unwrap();
+
+        let mode = fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
