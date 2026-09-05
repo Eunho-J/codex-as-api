@@ -101,6 +101,22 @@ function testCatalogSnapshot(): ModelCatalogSnapshot {
   });
 }
 
+function useTestCatalog(provider: ChatGPTOAuthProvider): ChatGPTOAuthProvider {
+  const snapshot = testCatalogSnapshot();
+  provider.prepareModel = async (requested?: string): Promise<PreparedModel> => {
+    const slug = requested ?? snapshot.defaultModel?.slug;
+    if (slug == null) {
+      throw new ChatGPTOAuthCatalogUnavailableError(
+        "authenticated model catalog has no visible default model",
+      );
+    }
+    const capability = modelFromSnapshot(snapshot, slug);
+    if (capability == null) throw new ChatGPTOAuthModelNotFoundError(slug);
+    return { slug, accountId: "test-account", capability, snapshot };
+  };
+  return provider;
+}
+
 function adaptMockProvider(
   provider: Record<string, unknown>,
   configuredModel: string | undefined,
@@ -917,7 +933,7 @@ describe("server error handling", () => {
   });
 
   it("rejects an invalid Responses Lite mode or type before opening an OpenAI stream", async () => {
-    const provider = new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" });
+    const provider = useTestCatalog(new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" }));
     await withServer(provider, async (baseUrl) => {
       for (const responsesLite of ["bogus", 42]) {
         const response = await fetch(`${baseUrl}/v1/chat/completions`, {
@@ -946,7 +962,7 @@ describe("server error handling", () => {
   });
 
   it("maps an unsupported Lite tool choice to a structured 400 before streaming", async () => {
-    const provider = new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" });
+    const provider = useTestCatalog(new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" }));
     await withServer(provider, async (baseUrl) => {
       const response = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",

@@ -2052,7 +2052,14 @@ mod tests {
     #[test]
     fn test_resolve_auth_path_expands_exact_tilde_for_explicit_and_codex_home() {
         let _guard = AUTH_PATH_ENV_LOCK.lock().unwrap();
+        #[cfg(not(windows))]
         let home = PathBuf::from(std::env::var_os("HOME").expect("test requires HOME"));
+        #[cfg(windows)]
+        let home = PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .expect("test requires HOME or USERPROFILE"),
+        );
         assert_eq!(resolve_auth_path(Some("~")).unwrap(), home);
 
         let previous = std::env::var_os("CODEX_HOME");
