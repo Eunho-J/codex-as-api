@@ -17,6 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/check_package_versions.py
+      - run: python scripts/check_no_static_model_catalog.py config src ts/src rust/src
 
   python:
     name: Python checks
@@ -25,14 +26,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.11"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install build -e ".[server,dev]"
+      - run: python -m pip install build==1.5.0 -e ".[dev]"
       - run: python -m pytest
-      - run: python -m mypy src
+      - run: python -m mypy src scripts/check_registry_release.py
       - run: python -m ruff check .
       - run: python -m build --outdir dist
+      - name: Verify base wheel installs a runnable server
+        run: |
+          python -m venv /tmp/codex-as-api-wheel
+          /tmp/codex-as-api-wheel/bin/python -m pip install --disable-pip-version-check dist/*.whl
+          /tmp/codex-as-api-wheel/bin/python -c "from codex_as_api.server import app; assert app is not None"
+          test -x /tmp/codex-as-api-wheel/bin/codex-as-api
+          set +e
+          CODEX_AS_API_PORT=0 /tmp/codex-as-api-wheel/bin/codex-as-api
+          smoke_status=$?
+          set -e
+          test "$smoke_status" -eq 1
+      - name: Inspect Python release artifacts
+        run: |
+          python scripts/check_no_static_model_catalog.py dist/*.whl dist/*.tar.gz
+          python scripts/check_release_artifacts.py \
+            --version "$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')" \
+            --python-dist dist/*.whl dist/*.tar.gz
+      - name: Run release validators from the source distribution
+        run: |
+          extract_dir="$(mktemp -d)"
+          python -m tarfile -e dist/codex_as_api-*.tar.gz "$extract_dir"
+          python -m pytest -q \
+            "$extract_dir"/codex_as_api-*/tests/test_no_static_model_catalog.py \
+            "$extract_dir"/codex_as_api-*/tests/test_package_versions.py \
+            "$extract_dir"/codex_as_api-*/tests/test_registry_release.py \
+            "$extract_dir"/codex_as_api-*/tests/test_release_artifacts.py \
+            "$extract_dir"/codex_as_api-*/tests/test_rust_third_party_notices.py
 
   typescript:
     name: TypeScript checks
@@ -44,13 +72,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.14.0"
           cache: npm
           cache-dependency-path: ts/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install --global npm@11.19.1
       - run: npm ci
       - run: npm test
+      - run: npm run typecheck
       - run: npm run build
-      - run: npm pack --dry-run
+      - name: Pack and inspect the npm artifact
+        run: |
+          npm pack --ignore-scripts --pack-destination ..
+          python ../scripts/check_no_static_model_catalog.py ../codex-as-api-*.tgz
+          python ../scripts/check_release_artifacts.py \
+            --version "$(node --print 'require("./package.json").version')" \
+            --npm-tarball ../codex-as-api-*.tgz
 
   rust:
     name: Rust checks
@@ -60,10 +99,47 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust with required components
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - run: rustup default stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned Rust with required components
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - run: rustup default 1.96.0
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets
-      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: python ../scripts/generate_rust_third_party_notices.py --check
       - run: cargo build --locked --release
+      - name: Package and inspect the Linux Rust release archive
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          set +e
+          CODEX_AS_API_PORT=0 target/release/codex-as-api
+          smoke_status=$?
+          set -e
+          test "$smoke_status" -eq 2
+          python ../scripts/package_rust_release.py \
+            --binary target/release/codex-as-api \
+            --platform linux \
+            --version "$version" \
+            --output-dir ../dist/rust
+          python ../scripts/check_no_static_model_catalog.py \
+            "../dist/rust/codex-as-api-${version}-linux.zip"
+          python ../scripts/check_release_artifacts.py \
+            --version "$version" \
+            --rust-archive linux "../dist/rust/codex-as-api-${version}-linux.zip"
+
+  rust-windows:
+    name: Rust Windows check
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - run: rustup default 1.96.0
+      - run: cargo check --locked --all-targets --all-features
+      - name: Verify Windows auth path and persistence behavior
+        run: cargo test --locked auth::tests

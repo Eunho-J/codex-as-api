@@ -1,9 +1,8 @@
 regex
 
+fastapi>=0.100
+pydantic>=2.0
+uvicorn>=0.23
+
 # Python 3.10 compatibility for the stdlib tomllib parser.
 tomli>=2; python_version < "3.11"
-
-# Server dependencies (install with: pip install -r requirements-server.txt)
-# fastapi>=0.100
-# uvicorn>=0.23
-# pydantic>=2.0

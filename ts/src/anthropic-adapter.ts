@@ -5,15 +5,22 @@ import type {
   Message,
   ToolCall,
   ToolSchema,
+  Usage,
 } from "./messages.js";
 import { MessageRole } from "./messages.js";
+import { normalizeFinishReason } from "./protocol.js";
+import {
+  ChatGPTOAuthInvalidRequestError,
+  ChatGPTOAuthProtocolError,
+} from "./auth.js";
+import { parseJsonStrict } from "./utf8-json.js";
 
 // ---------------------------------------------------------------------------
 // Request conversion: Anthropic → internal
 // ---------------------------------------------------------------------------
 
 export function anthropicRequestToInternal(opts: {
-  model: string;
+  model?: string;
   messages: Record<string, unknown>[];
   system?: string | Record<string, unknown>[];
   maxTokens?: number;
@@ -27,34 +34,51 @@ export function anthropicRequestToInternal(opts: {
   messages: Message[];
   tools: ToolSchema[] | null;
   toolChoice: string | Record<string, unknown> | null;
+  parallelToolCalls: boolean | undefined;
   stop: string[] | null;
   reasoningEffort: string | null;
   text: Record<string, unknown> | null;
 } {
   const internalMessages: Message[] = [];
 
-  if (opts.system != null) {
+  if (!Array.isArray(opts.messages)) {
+    throw new ChatGPTOAuthInvalidRequestError("messages must be an array");
+  }
+
+  if (opts.system !== undefined) {
     const sysText = extractSystemText(opts.system);
     if (sysText) {
       internalMessages.push({ role: MessageRole.SYSTEM, content: sysText });
     }
   }
 
-  for (const msg of opts.messages) {
-    const role = String(msg.role ?? "user");
+  for (const [messageIndex, msg] of opts.messages.entries()) {
+    if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
+      throw new ChatGPTOAuthInvalidRequestError(`message ${messageIndex} must be an object`);
+    }
+    assertAllowedFields(msg, ["role", "content"], `message ${messageIndex}`);
+    const role = msg.role;
     const content = msg.content;
     if (role === "user") {
       convertUserMessage(content, internalMessages);
     } else if (role === "assistant") {
       convertAssistantMessage(content, internalMessages);
+    } else {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `message ${messageIndex} role must be one of: user, assistant`,
+      );
     }
   }
 
   const internalTools = opts.tools ? convertTools(opts.tools) : null;
-  const internalToolChoice = convertToolChoice(opts.toolChoice ?? null);
+  const {
+    toolChoice: internalToolChoice,
+    parallelToolCalls,
+  } = convertToolChoice(opts.toolChoice ?? null);
   const reasoningEffort = convertReasoningEffort(
     opts.thinking ?? null,
     opts.outputConfig ?? null,
+    opts.maxTokens,
   );
   const text = anthropicOutputFormatToOpenAIText(
     resolveAnthropicOutputFormat(opts.outputFormat, opts.outputConfig),
@@ -64,6 +88,7 @@ export function anthropicRequestToInternal(opts: {
     messages: internalMessages,
     tools: internalTools,
     toolChoice: internalToolChoice,
+    parallelToolCalls,
     stop: opts.stopSequences ?? null,
     reasoningEffort,
     text,
@@ -74,17 +99,23 @@ function extractSystemText(
   system: string | Record<string, unknown>[],
 ): string {
   if (typeof system === "string") return system;
+  if (!Array.isArray(system)) {
+    throw new ChatGPTOAuthInvalidRequestError("system must be a string or an array of text blocks");
+  }
   const parts: string[] = [];
-  for (const block of system) {
+  for (const [index, block] of system.entries()) {
     if (
-      typeof block === "object" &&
-      block !== null &&
-      block.type === "text" &&
-      typeof block.text === "string" &&
-      block.text
+      typeof block !== "object"
+      || block === null
+      || Array.isArray(block)
+      || block.type !== "text"
+      || typeof block.text !== "string"
     ) {
-      parts.push(block.text);
+      throw new ChatGPTOAuthInvalidRequestError(`system block ${index} must be a text block`);
     }
+    validateNullableOmittedField(block, "citations", `system block ${index}`);
+    assertAllowedFields(block, ["type", "text", "citations"], `system block ${index}`);
+    parts.push(block.text);
   }
   return parts.join("\n\n");
 }
@@ -97,41 +128,89 @@ function convertUserMessage(
     out.push({ role: MessageRole.USER, content });
     return;
   }
-  if (!Array.isArray(content)) return;
+  if (!Array.isArray(content)) {
+    throw new ChatGPTOAuthInvalidRequestError("user message content must be a string or array");
+  }
+  if (content.length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError("user message content array must not be empty");
+  }
   const textParts: string[] = [];
   const imageUrls: string[] = [];
-  for (const block of content) {
-    if (typeof block !== "object" || block === null) continue;
+  for (const [blockIndex, block] of content.entries()) {
+    if (typeof block !== "object" || block === null || Array.isArray(block)) {
+      throw new ChatGPTOAuthInvalidRequestError(`user content block ${blockIndex} must be an object`);
+    }
     const b = block as Record<string, unknown>;
     const blockType = b.type;
     if (blockType === "text") {
-      if (typeof b.text === "string") textParts.push(b.text);
+      validateNullableOmittedField(b, "citations", `user text block ${blockIndex}`);
+      assertAllowedFields(b, ["type", "text", "citations"], `user text block ${blockIndex}`);
+      if (typeof b.text !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(`user text block ${blockIndex} requires string text`);
+      }
+      textParts.push(b.text);
     } else if (blockType === "tool_result") {
+      assertAllowedFields(
+        b,
+        ["type", "tool_use_id", "content", "is_error"],
+        `tool_result block ${blockIndex}`,
+      );
       if (textParts.length || imageUrls.length) {
         out.push({ role: MessageRole.USER, content: textParts.join(""), images: [...imageUrls] });
         textParts.length = 0;
         imageUrls.length = 0;
       }
-      const toolUseId = typeof b.tool_use_id === "string" ? b.tool_use_id : "tool-call";
-      let resultContent = b.content ?? "";
+      if (typeof b.tool_use_id !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(`tool_result block ${blockIndex} requires string tool_use_id`);
+      }
+      const toolUseId = b.tool_use_id;
+      let resultContent: unknown = Object.hasOwn(b, "content") ? b.content : "";
       const toolResultImages: string[] = [];
       if (Array.isArray(resultContent)) {
         const textPieces: string[] = [];
-        for (const p of resultContent as Record<string, unknown>[]) {
-          if (typeof p !== "object" || p === null) continue;
+        for (const [partIndex, p] of resultContent.entries()) {
+          if (typeof p !== "object" || p === null || Array.isArray(p)) {
+            throw new ChatGPTOAuthInvalidRequestError(
+              `tool_result block ${blockIndex} content ${partIndex} must be an object`,
+            );
+          }
           if (p.type === "text") {
-            textPieces.push((p.text ?? "") as string);
+            validateNullableOmittedField(
+              p,
+              "citations",
+              `tool_result block ${blockIndex} content ${partIndex}`,
+            );
+            assertAllowedFields(
+              p,
+              ["type", "text", "citations"],
+              `tool_result block ${blockIndex} content ${partIndex}`,
+            );
+            if (typeof p.text !== "string") {
+              throw new ChatGPTOAuthInvalidRequestError(
+                `tool_result block ${blockIndex} text content ${partIndex} requires string text`,
+              );
+            }
+            textPieces.push(p.text);
           } else if (p.type === "image") {
+            assertAllowedFields(
+              p,
+              ["type", "source"],
+              `tool_result block ${blockIndex} content ${partIndex}`,
+            );
             const imageUrl = anthropicImageSourceUrl(p.source);
-            if (imageUrl !== null) toolResultImages.push(imageUrl);
+            toolResultImages.push(imageUrl);
           } else {
-            const rendered = renderAnthropicContentBlock(p);
-            if (rendered) textPieces.push(rendered);
+            throw new ChatGPTOAuthInvalidRequestError(
+              `tool_result block ${blockIndex} has unsupported content type ${String(p.type)}`,
+            );
           }
         }
         resultContent = textPieces.join("");
       } else if (typeof resultContent !== "string") {
-        resultContent = resultContent ? String(resultContent) : "";
+        throw new ChatGPTOAuthInvalidRequestError(`tool_result block ${blockIndex} content must be a string or array`);
+      }
+      if (Object.hasOwn(b, "is_error") && typeof b.is_error !== "boolean") {
+        throw new ChatGPTOAuthInvalidRequestError(`tool_result block ${blockIndex} is_error must be a boolean`);
       }
       if (b.is_error === true) {
         resultContent = `[tool_error]\n${resultContent}`;
@@ -140,17 +219,18 @@ function convertUserMessage(
         role: MessageRole.TOOL,
         content: resultContent as string,
         tool_call_id: toolUseId,
-        name: toolUseId,
       });
       if (toolResultImages.length) {
         out.push({ role: MessageRole.USER, content: "", images: toolResultImages });
       }
     } else if (blockType === "image") {
+      assertAllowedFields(b, ["type", "source"], `user image block ${blockIndex}`);
       const imageUrl = anthropicImageSourceUrl(b.source);
-      if (imageUrl !== null) imageUrls.push(imageUrl);
+      imageUrls.push(imageUrl);
     } else {
-      const rendered = renderAnthropicContentBlock(b);
-      if (rendered) textParts.push(rendered);
+      throw new ChatGPTOAuthInvalidRequestError(
+        `user content block ${blockIndex} has unsupported type ${String(blockType)}`,
+      );
     }
   }
   if (textParts.length || imageUrls.length) {
@@ -158,37 +238,39 @@ function convertUserMessage(
   }
 }
 
-function anthropicImageSourceUrl(sourceValue: unknown): string | null {
+function anthropicImageSourceUrl(sourceValue: unknown): string {
   if (
     typeof sourceValue !== "object"
     || sourceValue === null
     || Array.isArray(sourceValue)
   ) {
-    throw new Error("Anthropic image source must be an object");
+    throw new ChatGPTOAuthInvalidRequestError("Anthropic image source must be an object");
   }
   const source = sourceValue as Record<string, unknown>;
   if (source.type === "base64") {
-    const mediaType = typeof source.media_type === "string"
-      ? source.media_type
-      : "image/png";
+    assertAllowedFields(source, ["type", "media_type", "data"], "Anthropic base64 image source");
+    const mediaType = source.media_type;
     if (
-      typeof source.media_type !== "undefined"
-      && typeof source.media_type !== "string"
+      typeof mediaType !== "string"
+      || !["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)
     ) {
-      throw new Error("Anthropic base64 image source requires a string media_type");
+      throw new ChatGPTOAuthInvalidRequestError(
+        "Anthropic base64 image source media_type must be one of: image/jpeg, image/png, image/gif, image/webp",
+      );
     }
     if (typeof source.data !== "string" || source.data.length === 0) {
-      throw new Error("Anthropic base64 image source requires non-empty data");
+      throw new ChatGPTOAuthInvalidRequestError("Anthropic base64 image source requires non-empty data");
     }
     return `data:${mediaType};base64,${source.data}`;
   }
   if (source.type === "url") {
+    assertAllowedFields(source, ["type", "url"], "Anthropic URL image source");
     if (typeof source.url !== "string" || source.url.length === 0) {
-      throw new Error("Anthropic URL image source requires a non-empty url");
+      throw new ChatGPTOAuthInvalidRequestError("Anthropic URL image source requires a non-empty url");
     }
     return source.url;
   }
-  throw new Error(
+  throw new ChatGPTOAuthInvalidRequestError(
     "Anthropic image source type must be one of: base64, url",
   );
 }
@@ -201,90 +283,174 @@ function convertAssistantMessage(
     out.push({ role: MessageRole.ASSISTANT, content });
     return;
   }
-  if (!Array.isArray(content)) return;
+  if (!Array.isArray(content)) {
+    throw new ChatGPTOAuthInvalidRequestError("assistant message content must be a string or array");
+  }
+  if (content.length === 0) {
+    out.push({ role: MessageRole.ASSISTANT, content: "", tool_calls: [] });
+    return;
+  }
   const textParts: string[] = [];
   const toolCalls: ToolCall[] = [];
-  let reasoningContent: string | null = null;
-  for (const block of content) {
-    if (typeof block !== "object" || block === null) continue;
+  const toolCallIds = new Set<string>();
+  for (const [blockIndex, block] of content.entries()) {
+    if (typeof block !== "object" || block === null || Array.isArray(block)) {
+      throw new ChatGPTOAuthInvalidRequestError(`assistant content block ${blockIndex} must be an object`);
+    }
     const b = block as Record<string, unknown>;
     const blockType = b.type;
     if (blockType === "text") {
-      if (typeof b.text === "string") textParts.push(b.text);
+      validateNullableOmittedField(b, "citations", `assistant text block ${blockIndex}`);
+      assertAllowedFields(b, ["type", "text", "citations"], `assistant text block ${blockIndex}`);
+      if (typeof b.text !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(`assistant text block ${blockIndex} requires string text`);
+      }
+      textParts.push(b.text);
     } else if (blockType === "tool_use") {
+      assertAllowedFields(
+        b,
+        ["type", "id", "name", "input", "caller"],
+        `assistant tool_use block ${blockIndex}`,
+      );
+      if (Object.hasOwn(b, "caller")) {
+        const caller = requireRecord(
+          b.caller,
+          `assistant tool_use block ${blockIndex} caller`,
+        );
+        assertAllowedFields(
+          caller,
+          ["type"],
+          `assistant tool_use block ${blockIndex} caller`,
+        );
+        if (caller.type !== "direct") {
+          throw new ChatGPTOAuthInvalidRequestError(
+            `assistant tool_use block ${blockIndex} caller.type must be direct`,
+          );
+        }
+      }
+      if (typeof b.id !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(`assistant tool_use block ${blockIndex} requires id`);
+      }
+      if (typeof b.name !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(`assistant tool_use block ${blockIndex} requires name`);
+      }
+      if (typeof b.input !== "object" || b.input === null || Array.isArray(b.input)) {
+        throw new ChatGPTOAuthInvalidRequestError(`assistant tool_use block ${blockIndex} input must be an object`);
+      }
+      if (toolCallIds.has(b.id)) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `assistant tool_use blocks contain duplicate id ${JSON.stringify(b.id)}`,
+        );
+      }
+      toolCallIds.add(b.id);
       toolCalls.push({
-        id: typeof b.id === "string" ? b.id : crypto.randomUUID().replace(/-/g, ""),
-        name: typeof b.name === "string" ? b.name : "",
-        arguments: (typeof b.input === "object" && b.input !== null && !Array.isArray(b.input)
-          ? b.input
-          : {}) as Record<string, unknown>,
+        id: b.id,
+        name: b.name,
+        arguments: JSON.stringify(b.input),
       });
     } else if (blockType === "thinking") {
-      if (typeof b.thinking === "string" && b.thinking) {
-        reasoningContent = b.thinking;
-      }
+      throw new ChatGPTOAuthInvalidRequestError(
+        "assistant thinking history cannot be represented by the Codex OAuth transport",
+      );
     } else if (blockType === "redacted_thinking") {
-      if (reasoningContent === null) {
-        reasoningContent = "[redacted_thinking omitted]";
-      }
-    } else if (blockType === "server_tool_use") {
-      textParts.push(renderServerToolUseBlock(b));
-    } else if (blockType === "web_search_tool_result") {
-      textParts.push(renderWebSearchToolResultBlock(b));
+      throw new ChatGPTOAuthInvalidRequestError(
+        "redacted_thinking cannot be represented by the Codex OAuth transport",
+      );
+    } else if (blockType === "server_tool_use" || blockType === "web_search_tool_result") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${String(blockType)} history cannot be represented by the Codex OAuth transport`,
+      );
     } else {
-      const rendered = renderAnthropicContentBlock(b);
-      if (rendered) textParts.push(rendered);
+      throw new ChatGPTOAuthInvalidRequestError(
+        `assistant content block ${blockIndex} has unsupported type ${String(blockType)}`,
+      );
     }
+  }
+  if (textParts.length === 0 && toolCalls.length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "assistant message content array must not be empty",
+    );
   }
   const msg: Message = {
     role: MessageRole.ASSISTANT,
     content: textParts.join(""),
     tool_calls: toolCalls.length ? toolCalls : [],
   };
-  if (reasoningContent !== null) msg.reasoning_content = reasoningContent;
   out.push(msg);
 }
 
 function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
   const result: ToolSchema[] = [];
+  const toolNames = new Set<string>();
   for (const [index, tool] of tools.entries()) {
-    if (typeof tool !== "object" || tool === null) continue;
-    for (const field of ["strict", "defer_loading", "eager_input_streaming"] as const) {
+    if (typeof tool !== "object" || tool === null || Array.isArray(tool)) {
+      throw new ChatGPTOAuthInvalidRequestError(`tool ${index} must be an object`);
+    }
+    for (const field of ["defer_loading", "eager_input_streaming"] as const) {
       const value = tool[field];
-      if (value === true) {
-        throw new Error(`tool ${index} ${field}=true is not supported`);
-      }
-      if (value != null && value !== false) {
-        throw new Error(`tool ${index} ${field} must be a boolean or null`);
+      if ((field === "defer_loading" && Object.hasOwn(tool, field)) || value != null) {
+        throw new ChatGPTOAuthInvalidRequestError(`tool ${index} ${field} is not supported`);
       }
     }
     if (tool.type === "programmatic_tool_calling") {
-      throw new Error(
+      throw new ChatGPTOAuthInvalidRequestError(
         "programmatic_tool_calling tools are not supported by this compatibility API",
       );
     }
     if (Object.hasOwn(tool, "allowed_callers")) {
-      throw new Error(`tool ${index} allowed_callers is not supported`);
+      throw new ChatGPTOAuthInvalidRequestError(`tool ${index} allowed_callers is not supported`);
     }
     if (Object.hasOwn(tool, "output_schema")) {
-      throw new Error(`tool ${index} output_schema is not supported`);
+      throw new ChatGPTOAuthInvalidRequestError(`tool ${index} output_schema is not supported`);
     }
+    const webSearch = isAnthropicWebSearchTool(tool);
+    if (webSearch) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "Anthropic hosted web_search cannot be represented losslessly by this facade",
+      );
+    }
+    if (Object.hasOwn(tool, "strict") && typeof tool.strict !== "boolean") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tool ${index} strict must be a boolean`,
+      );
+    }
+    assertAllowedFields(
+      tool,
+      [
+        "type",
+        "name",
+        "description",
+        "input_schema",
+        "strict",
+        "defer_loading",
+        "eager_input_streaming",
+        "allowed_callers",
+        "output_schema",
+      ],
+      `tool ${index}`,
+    );
     const name = tool.name;
-    if (!name) continue;
-    if (isAnthropicWebSearchTool(tool)) {
-      result.push({
-        name: "web_search",
-        description: "Anthropic hosted web search",
-        parameters: anthropicWebSearchParameters(tool),
-      });
-      continue;
+    if (typeof name !== "string" || name.length === 0) {
+      throw new ChatGPTOAuthInvalidRequestError(`tool ${index} name must be a non-empty string`);
+    }
+    if (toolNames.has(name)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tools contains duplicate name ${JSON.stringify(name)}`,
+      );
+    }
+    toolNames.add(name);
+    if (tool.type !== undefined && tool.type !== null && tool.type !== "custom") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tool ${index} type must be custom or null`,
+      );
     }
     result.push({
-      name: String(name),
-      description: String(tool.description ?? ""),
-      parameters: (typeof tool.input_schema === "object" && tool.input_schema !== null
-        ? tool.input_schema
-        : {}) as Record<string, unknown>,
+      name,
+      parameters: requireRecord(tool.input_schema, `tool ${index} input_schema`),
+      ...(!Object.hasOwn(tool, "description")
+        ? {}
+        : { description: requireString(tool.description, `tool ${index} description`) }),
+      ...(!Object.hasOwn(tool, "strict") ? {} : { strict: tool.strict as boolean }),
     });
   }
   return result;
@@ -293,93 +459,163 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
 function isAnthropicWebSearchTool(tool: Record<string, unknown>): boolean {
   return tool.name === "web_search" &&
     typeof tool.type === "string" &&
-    (tool.type === "web_search" || tool.type.startsWith("web_search_"));
-}
-
-function stringArray(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const result = value.filter((v): v is string => typeof v === "string" && v.length > 0);
-  return result.length ? result : null;
-}
-
-function anthropicWebSearchParameters(tool: Record<string, unknown>): Record<string, unknown> {
-  const blockedDomains = stringArray(tool.blocked_domains);
-  if (blockedDomains) {
-    throw new Error(
-      "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; use allowed_domains instead",
-    );
-  }
-
-  const openaiTool: Record<string, unknown> = {
-    type: "web_search",
-    external_web_access: true,
-  };
-  const allowedDomains = stringArray(tool.allowed_domains);
-  if (allowedDomains) {
-    openaiTool.filters = { allowed_domains: allowedDomains };
-  }
-  if (
-    typeof tool.user_location === "object" &&
-    tool.user_location !== null &&
-    !Array.isArray(tool.user_location)
-  ) {
-    openaiTool.user_location = tool.user_location;
-  }
-
-  return {
-    __codex_as_api_tool_type: "web_search",
-    openai_tool: openaiTool,
-    anthropic: {
-      type: tool.type,
-      max_uses: tool.max_uses,
-    },
-  };
+    ["web_search", "web_search_20250305", "web_search_20260209"].includes(tool.type);
 }
 
 function convertToolChoice(
   tc: Record<string, unknown> | null,
-): string | Record<string, unknown> | null {
-  if (tc === null) return null;
-  const tcType = tc.type;
-  if (tcType === "auto") return "auto";
-  if (tcType === "any") return "required";
-  if (tcType === "tool") {
-    if (tc.name === "web_search") return { type: "web_search" };
-    return { type: "function", name: tc.name };
+): {
+  toolChoice: string | Record<string, unknown> | null;
+  parallelToolCalls: boolean | undefined;
+} {
+  if (tc === null) {
+    return { toolChoice: null, parallelToolCalls: undefined };
   }
-  if (tcType === "none") return "none";
-  return "auto";
+  const tcType = tc.type;
+  assertAllowedFields(
+    tc,
+    tcType === "tool"
+      ? ["type", "name", "disable_parallel_tool_use"]
+      : tcType === "none"
+      ? ["type"]
+      : ["type", "disable_parallel_tool_use"],
+    "tool_choice",
+  );
+  const hasParallelControl = Object.hasOwn(tc, "disable_parallel_tool_use");
+  if (hasParallelControl && typeof tc.disable_parallel_tool_use !== "boolean") {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "tool_choice.disable_parallel_tool_use must be a boolean when provided",
+    );
+  }
+  const parallelToolCalls = !hasParallelControl
+    ? undefined
+    : !tc.disable_parallel_tool_use;
+  if (tcType === "auto") return { toolChoice: "auto", parallelToolCalls };
+  if (tcType === "any") return { toolChoice: "required", parallelToolCalls };
+  if (tcType === "tool") {
+    if (typeof tc.name !== "string" || tc.name.length === 0) {
+      throw new ChatGPTOAuthInvalidRequestError("tool_choice type tool requires a non-empty name");
+    }
+    if (tc.name === "web_search") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "Anthropic hosted web_search cannot be represented losslessly by this facade",
+      );
+    }
+    return {
+      toolChoice: { type: "function", name: tc.name },
+      parallelToolCalls,
+    };
+  }
+  if (tcType === "none") return { toolChoice: "none", parallelToolCalls };
+  throw new ChatGPTOAuthInvalidRequestError("tool_choice.type must be one of: auto, any, tool, none");
 }
 
-function convertThinking(thinking: Record<string, unknown> | null): string | null {
+function convertThinking(
+  thinking: Record<string, unknown> | null,
+  maxTokens: number | undefined,
+): string | null {
   if (thinking === null) return null;
-  if (thinking.type === "enabled") return "high";
-  if (thinking.type === "adaptive") return "medium";
-  if (thinking.type === "disabled") return "none";
-  return null;
+  if (thinking.type === "enabled") {
+    assertAllowedFields(thinking, ["type", "budget_tokens", "display"], "thinking");
+    if (thinking.display != null && thinking.display !== "omitted") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "thinking.display must be omitted when provided",
+      );
+    }
+    if (
+      typeof thinking.budget_tokens !== "number"
+      || !Number.isSafeInteger(thinking.budget_tokens)
+      || thinking.budget_tokens < 1024
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "thinking.budget_tokens must be an integer greater than or equal to 1024",
+      );
+    }
+    if (maxTokens != null && thinking.budget_tokens >= maxTokens) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "thinking.budget_tokens must be less than max_tokens",
+      );
+    }
+    return "high";
+  }
+  if (thinking.type === "adaptive") {
+    assertAllowedFields(thinking, ["type", "display"], "thinking");
+    if (thinking.display != null && thinking.display !== "omitted") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "thinking.display must be omitted when provided",
+      );
+    }
+    return "medium";
+  }
+  if (thinking.type === "disabled") {
+    assertAllowedFields(thinking, ["type"], "thinking");
+    return "none";
+  }
+  throw new ChatGPTOAuthInvalidRequestError("thinking.type must be one of: enabled, adaptive, disabled");
+}
+
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(`${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new ChatGPTOAuthInvalidRequestError(`${field} must be a string`);
+  }
+  return value;
+}
+
+function assertAllowedFields(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  field: string,
+): void {
+  const allowedSet = new Set(allowed);
+  const unknown = Object.keys(value).find((key) => !allowedSet.has(key));
+  if (unknown != null) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${field} does not support field ${JSON.stringify(unknown)}`,
+    );
+  }
+}
+
+function validateNullableOmittedField(
+  value: Record<string, unknown>,
+  field: string,
+  location: string,
+): void {
+  if (Object.hasOwn(value, field) && value[field] !== null) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${location}.${field} cannot be preserved by this facade`,
+    );
+  }
 }
 
 function convertReasoningEffort(
   thinking: Record<string, unknown> | null,
   outputConfigValue: unknown,
+  maxTokens: number | undefined,
 ): string | null {
-  const thinkingEffort = convertThinking(thinking);
+  const thinkingEffort = convertThinking(thinking, maxTokens);
   if (outputConfigValue == null) return thinkingEffort;
   if (
     typeof outputConfigValue !== "object"
     || Array.isArray(outputConfigValue)
   ) {
-    throw new Error("output_config must be an object");
+    throw new ChatGPTOAuthInvalidRequestError("output_config must be an object");
   }
 
   const outputConfig = outputConfigValue as Record<string, unknown>;
   for (const key of Object.keys(outputConfig)) {
     if (!["effort", "format", "task_budget"].includes(key)) {
-      throw new Error(`output_config.${key} is not supported`);
+      throw new ChatGPTOAuthInvalidRequestError(`output_config.${key} is not supported`);
     }
   }
   if (outputConfig.task_budget != null) {
-    throw new Error(
+    throw new ChatGPTOAuthInvalidRequestError(
       "output_config.task_budget is not supported by the Codex OAuth backend",
     );
   }
@@ -390,7 +626,7 @@ function convertReasoningEffort(
       outputConfig.effort,
     )
   ) {
-    throw new Error(
+    throw new ChatGPTOAuthInvalidRequestError(
       "output_config.effort must be one of: low, medium, high, xhigh, max",
     );
   }
@@ -408,18 +644,18 @@ export function anthropicOutputFormatToOpenAIText(
   const type = outputFormat.type;
   if (type === "json_schema") {
     const schema = outputFormat.schema as Record<string, unknown>;
-    const name = sanitizeJsonSchemaName(
-      typeof outputFormat.name === "string" ? outputFormat.name : "structured_output",
-    );
+    const name = typeof outputFormat.name === "string"
+      ? outputFormat.name
+      : "codex_output_schema";
     const format: Record<string, unknown> = {
       type: "json_schema",
       name,
       schema,
     };
-    if (Object.hasOwn(outputFormat, "description")) {
+    if (typeof outputFormat.description === "string") {
       format.description = outputFormat.description;
     }
-    if (Object.hasOwn(outputFormat, "strict")) {
+    if (typeof outputFormat.strict === "boolean") {
       format.strict = outputFormat.strict;
     }
     return { format };
@@ -427,7 +663,7 @@ export function anthropicOutputFormatToOpenAIText(
   if (type === "json_object") {
     return { format: { type: "json_object" } };
   }
-  throw new Error(
+  throw new ChatGPTOAuthInvalidRequestError(
     "output_format.type must be one of: json_schema, json_object",
   );
 }
@@ -443,7 +679,7 @@ function resolveAnthropicOutputFormat(
       typeof outputConfigValue !== "object"
       || Array.isArray(outputConfigValue)
     ) {
-      throw new Error("output_config must be an object");
+      throw new ChatGPTOAuthInvalidRequestError("output_config must be an object");
     }
     nestedFormat = outputFormatRecord(
       (outputConfigValue as Record<string, unknown>).format,
@@ -455,7 +691,7 @@ function resolveAnthropicOutputFormat(
     && nestedFormat !== null
     && !isDeepStrictEqual(outputFormat, nestedFormat)
   ) {
-    throw new Error("output_format conflicts with output_config.format");
+    throw new ChatGPTOAuthInvalidRequestError("output_format conflicts with output_config.format");
   }
   const selected = outputFormat ?? nestedFormat;
   if (selected === null) return null;
@@ -472,7 +708,7 @@ function outputFormatRecord(
 ): Record<string, unknown> | null {
   if (value == null) return null;
   if (typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${field} must be an object`);
+    throw new ChatGPTOAuthInvalidRequestError(`${field} must be an object`);
   }
   return value as Record<string, unknown>;
 }
@@ -483,7 +719,7 @@ function validateAnthropicOutputFormat(
 ): void {
   const type = outputFormat.type;
   if (typeof type !== "string") {
-    throw new Error(`${field}.type must be a string`);
+    throw new ChatGPTOAuthInvalidRequestError(`${field}.type must be a string`);
   }
 
   let allowedFields: ReadonlySet<string>;
@@ -498,116 +734,38 @@ function validateAnthropicOutputFormat(
       "strict",
     ]);
   } else {
-    throw new Error(`${field}.type must be one of: json_object, json_schema`);
+    throw new ChatGPTOAuthInvalidRequestError(`${field}.type must be one of: json_object, json_schema`);
   }
 
   const unknownField = Object.keys(outputFormat).find(
     (key) => !allowedFields.has(key),
   );
   if (unknownField !== undefined) {
-    throw new Error(`${field}.${unknownField} is not supported`);
+    throw new ChatGPTOAuthInvalidRequestError(`${field}.${unknownField} is not supported`);
   }
 
   if (type === "json_schema") {
     const schema = outputFormat.schema;
     if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
-      throw new Error(`${field}.schema must be an object`);
+      throw new ChatGPTOAuthInvalidRequestError(`${field}.schema must be an object`);
     }
-  }
-  if (
-    Object.hasOwn(outputFormat, "name")
-    && (typeof outputFormat.name !== "string" || outputFormat.name.length === 0)
-  ) {
-    throw new Error(`${field}.name must be a non-empty string`);
+    if (
+      outputFormat.name !== undefined
+      && (typeof outputFormat.name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(outputFormat.name))
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${field}.name must contain only ASCII letters, digits, underscores, or hyphens and be at most 64 characters`,
+      );
+    }
   }
   if (
     Object.hasOwn(outputFormat, "description")
     && typeof outputFormat.description !== "string"
   ) {
-    throw new Error(`${field}.description must be a string`);
+    throw new ChatGPTOAuthInvalidRequestError(`${field}.description must be a string`);
   }
-  if (
-    Object.hasOwn(outputFormat, "strict")
-    && typeof outputFormat.strict !== "boolean"
-  ) {
-    throw new Error(`${field}.strict must be a boolean`);
-  }
-}
-
-function sanitizeJsonSchemaName(name: string): string {
-  const cleaned = name.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
-  return cleaned || "structured_output";
-}
-
-function renderAnthropicContentBlock(block: Record<string, unknown>): string {
-  const type = typeof block.type === "string" ? block.type : "unknown";
-  if (type === "document") return renderDocumentBlock(block);
-  if (type === "search_result") return renderSearchResultBlock(block);
-  if (type.endsWith("_tool_result")) return renderGenericToolResultBlock(block);
-  try {
-    return `\n\n[${type}] ${JSON.stringify(block)}\n`;
-  } catch {
-    return `\n\n[${type}]\n`;
-  }
-}
-
-function renderDocumentBlock(block: Record<string, unknown>): string {
-  const title = typeof block.title === "string" ? block.title : typeof block.name === "string" ? block.name : "document";
-  const source = block.source;
-  let body = "";
-  if (typeof source === "object" && source !== null && !Array.isArray(source)) {
-    const src = source as Record<string, unknown>;
-    if (src.type === "text" && typeof src.data === "string") body = src.data;
-    else if (src.type === "url" && typeof src.url === "string") body = src.url;
-    else if (typeof src.media_type === "string") body = `[${src.media_type}]`;
-  }
-  return `\n\n[document: ${title}]${body ? `\n${body}` : ""}\n`;
-}
-
-function renderSearchResultBlock(block: Record<string, unknown>): string {
-  const title = typeof block.title === "string" ? block.title : "search result";
-  const url = typeof block.url === "string" ? block.url : "";
-  const content = typeof block.content === "string" ? block.content : "";
-  return `\n\n[search_result] ${title}${url ? ` (${url})` : ""}${content ? `\n${content}` : ""}\n`;
-}
-
-function renderServerToolUseBlock(block: Record<string, unknown>): string {
-  const name = typeof block.name === "string" ? block.name : "server_tool";
-  const input = block.input ?? {};
-  return `\n\n[server_tool_use: ${name}] ${safeJson(input)}\n`;
-}
-
-function renderWebSearchToolResultBlock(block: Record<string, unknown>): string {
-  return renderGenericToolResultBlock({ ...block, type: "web_search_tool_result" });
-}
-
-function renderGenericToolResultBlock(block: Record<string, unknown>): string {
-  const type = typeof block.type === "string" ? block.type : "tool_result";
-  const content = block.content;
-  if (Array.isArray(content)) {
-    const rendered = content.map((item) => {
-      if (typeof item !== "object" || item === null) return String(item);
-      const i = item as Record<string, unknown>;
-      const title = typeof i.title === "string" ? i.title : undefined;
-      const url = typeof i.url === "string" ? i.url : undefined;
-      const text = typeof i.text === "string" ? i.text : typeof i.content === "string" ? i.content : undefined;
-      if (title || url || text) {
-        return `- ${title ?? "result"}${url ? ` (${url})` : ""}${text ? `: ${text}` : ""}`;
-      }
-      return safeJson(i);
-    }).join("\n");
-    return `\n\n[${type}]${rendered ? `\n${rendered}` : ""}\n`;
-  }
-  if (typeof content === "object" && content !== null) return `\n\n[${type}] ${safeJson(content)}\n`;
-  if (typeof content === "string") return `\n\n[${type}]\n${content}\n`;
-  return `\n\n[${type}]\n`;
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
+  if (outputFormat.strict != null && typeof outputFormat.strict !== "boolean") {
+    throw new ChatGPTOAuthInvalidRequestError(`${field}.strict must be a boolean`);
   }
 }
 
@@ -622,114 +780,164 @@ export function internalResponseToAnthropic(
 ): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
 
-  if (response.reasoning_content) {
-    content.push({
-      type: "thinking",
-      thinking: response.reasoning_content,
-      signature: "sig-placeholder",
-    });
-  }
-
-  const webSearchBlocks = webSearchBlocksFromRaw(response.raw);
-  content.push(...webSearchBlocks);
+  rejectUnrepresentableResponseEvents(response.raw);
 
   if (response.content) {
-    content.push({ type: "text", text: response.content });
+    content.push({ type: "text", text: response.content, citations: null });
   }
 
   for (const tc of response.tool_calls) {
+    const input = parseAnthropicToolArguments(tc.arguments);
     content.push({
       type: "tool_use",
       id: tc.id,
       name: tc.name,
-      input: tc.arguments,
+      input,
+      caller: { type: "direct" },
     });
   }
 
   const stopReason = mapStopReason(response.finish_reason, response.tool_calls.length > 0);
 
-  let usageDict: Record<string, unknown> = { input_tokens: 0, output_tokens: 0 };
-  if (response.usage) {
-    usageDict = {
-      input_tokens: response.usage.prompt_tokens,
-      output_tokens: response.usage.completion_tokens,
-      cache_creation_input_tokens: response.usage.cache_write_tokens ?? 0,
-      cache_read_input_tokens: response.usage.cached_tokens,
-    };
+  if (response.usage == null) {
+    throw new ChatGPTOAuthProtocolError("provider response requires authoritative usage");
   }
-  usageDict = mergeServerToolUsage(usageDict, response.raw, webSearchBlocks.length / 2);
-
-  if (!content.length) {
-    content.push({ type: "text", text: "" });
-  }
+  const usageDict = mergeUsageExtensions(
+    usageFromInternalResponse(response.usage),
+    response.raw,
+  );
 
   return {
     id: requestId,
     type: "message",
     role: "assistant",
     model,
+    container: null,
     content,
+    context_management: null,
     stop_reason: stopReason,
     stop_sequence: null,
     usage: usageDict,
+    ...(response.reasoning_content == null
+      ? {}
+      : { codex_reasoning: response.reasoning_content }),
   };
 }
 
-function webSearchBlocksFromRaw(raw: Record<string, unknown> | null): Record<string, unknown>[] {
-  const events = Array.isArray(raw?.events) ? raw.events : [];
-  const blocks: Record<string, unknown>[] = [];
-  for (const event of events) {
-    if (typeof event !== "object" || event === null) continue;
-    const e = event as Record<string, unknown>;
-    if (e.type !== "web_search_call") continue;
-    const id = String(e.id || `srvtoolu_${blocks.length / 2}`);
-    const input = (typeof e.input === "object" && e.input !== null && !Array.isArray(e.input))
-      ? e.input
-      : { query: "" };
-    const content = Array.isArray(e.content) ? e.content : [];
-    blocks.push({ type: "server_tool_use", id, name: "web_search", input });
-    blocks.push({ type: "web_search_tool_result", tool_use_id: id, content });
+function parseAnthropicToolArguments(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") {
+    throw new ChatGPTOAuthProtocolError("tool call arguments must be a JSON object string");
   }
-  return blocks;
+  let parsed: unknown;
+  try {
+    parsed = parseJsonStrict(value);
+  } catch (error) {
+    throw new ChatGPTOAuthProtocolError(
+      `tool call arguments must contain valid JSON: ${String(error)}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ChatGPTOAuthProtocolError("tool call arguments JSON must be an object");
+  }
+  return parsed as Record<string, unknown>;
 }
 
-function mergeServerToolUsage(
+function rejectUnrepresentableResponseEvents(raw: Record<string, unknown> | null): void {
+  const events = rawEvents(raw);
+  for (const [index, event] of events.entries()) {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) {
+      throw new ChatGPTOAuthProtocolError(`provider raw event ${index} must be an object`);
+    }
+    const e = event as Record<string, unknown>;
+    if (e.type !== "web_search_call") continue;
+    throw new ChatGPTOAuthProtocolError(
+      "provider web_search_call output cannot be represented losslessly by the Anthropic facade",
+    );
+  }
+}
+
+function mergeUsageExtensions(
   usage: Record<string, unknown>,
   raw: Record<string, unknown> | null,
-  webSearchRequests: number,
 ): Record<string, unknown> {
-  const events = Array.isArray(raw?.events) ? raw.events : [];
-  for (const event of events) {
-    if (typeof event !== "object" || event === null) continue;
+  const events = rawEvents(raw);
+  for (const [index, event] of events.entries()) {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) {
+      throw new ChatGPTOAuthProtocolError(`provider raw event ${index} must be an object`);
+    }
     const e = event as Record<string, unknown>;
     if (e.type !== "finish") continue;
     const rawUsage = e.usage;
-    if (typeof rawUsage !== "object" || rawUsage === null || Array.isArray(rawUsage)) continue;
-    const serverToolUse = (rawUsage as Record<string, unknown>).server_tool_use;
-    if (serverToolUse !== undefined) {
-      usage.server_tool_use = serverToolUse;
-      return usage;
+    if (rawUsage == null) continue;
+    if (typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
+      throw new ChatGPTOAuthProtocolError("provider finish event usage must be an object");
     }
-  }
-  if (webSearchRequests > 0 && usage.server_tool_use === undefined) {
-    usage.server_tool_use = { web_search_requests: webSearchRequests };
+    const u = rawUsage as Record<string, unknown>;
+    for (const [key, required] of [
+      ["cache_creation", ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"]],
+      ["server_tool_use", ["web_search_requests", "web_fetch_requests"]],
+    ] as const) {
+      if (u[key] != null) {
+        usage[key] = requireUsageBreakdown(u[key], key, required);
+      }
+    }
+    if (u.service_tier != null) {
+      if (
+        typeof u.service_tier !== "string"
+        || !["standard", "priority", "batch"].includes(u.service_tier)
+      ) {
+        throw new ChatGPTOAuthProtocolError(
+          "provider usage service_tier must be standard, priority, batch, or null",
+        );
+      }
+      usage.service_tier = u.service_tier;
+    }
+    return usage;
   }
   return usage;
 }
 
-function mapStopReason(finishReason: string, hasToolCalls: boolean): string {
-  if (hasToolCalls) return "tool_use";
-  const mapping: Record<string, string> = {
-    stop: "end_turn",
-    length: "max_tokens",
-    max_tokens: "max_tokens",
-    tool_calls: "tool_use",
-    tool_use: "tool_use",
-    stop_sequence: "stop_sequence",
-    pause_turn: "pause_turn",
-    refusal: "refusal",
-  };
-  return mapping[finishReason] ?? "end_turn";
+function rawEvents(raw: Record<string, unknown> | null): unknown[] {
+  if (raw == null) return [];
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ChatGPTOAuthProtocolError("provider raw response must be an object");
+  }
+  if (!Array.isArray(raw.events)) {
+    throw new ChatGPTOAuthProtocolError("provider raw response requires an events array");
+  }
+  for (const [index, event] of raw.events.entries()) {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) {
+      throw new ChatGPTOAuthProtocolError(`provider raw event ${index} must be an object`);
+    }
+    const type = (event as Record<string, unknown>).type;
+    if (typeof type !== "string" || type.length === 0) {
+      throw new ChatGPTOAuthProtocolError(
+        `provider raw event ${index} requires a non-empty string type`,
+      );
+    }
+  }
+  return raw.events;
+}
+
+function mapStopReason(value: unknown, hasToolCalls: boolean): string {
+  const finishReason = normalizeFinishReason(value);
+  if (finishReason == null) {
+    throw new ChatGPTOAuthProtocolError("provider response requires a non-null finish_reason");
+  }
+  if (finishReason === "tool_calls") {
+    if (!hasToolCalls) {
+      throw new ChatGPTOAuthProtocolError(
+        "provider finish_reason tool_calls requires at least one tool call",
+      );
+    }
+    return "tool_use";
+  }
+  if (hasToolCalls) {
+    throw new ChatGPTOAuthProtocolError(
+      "provider finish_reason stop conflicts with emitted tool calls",
+    );
+  }
+  return "end_turn";
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +949,7 @@ export async function* anthropicStreamAdapter(
   model: string,
   requestId: string,
 ): AsyncGenerator<string> {
-  yield messageStartSse(model, requestId, { input_tokens: 0, output_tokens: 0 });
+  yield messageStartSse(model, requestId);
   for await (const chunk of renderAnthropicStreamEvents(eventIterator)) {
     yield chunk;
   }
@@ -750,7 +958,6 @@ export async function* anthropicStreamAdapter(
 function messageStartSse(
   model: string,
   requestId: string,
-  usage: Record<string, unknown>,
 ): string {
   return sse("message_start", {
     type: "message_start",
@@ -759,98 +966,188 @@ function messageStartSse(
       type: "message",
       role: "assistant",
       model,
+      container: null,
       content: [],
+      context_management: null,
       stop_reason: null,
       stop_sequence: null,
-      usage,
     },
   });
 }
 
+function usageFromInternalResponse(usage: Usage): Record<string, unknown> {
+  const inputTokens = requireUsageNumber(usage.prompt_tokens, "prompt_tokens");
+  const outputTokens = requireUsageNumber(usage.completion_tokens, "completion_tokens");
+  const totalTokens = requireUsageNumber(usage.total_tokens, "total_tokens");
+  if (totalTokens !== inputTokens + outputTokens) {
+    throw new ChatGPTOAuthProtocolError(
+      "upstream response usage total_tokens must equal prompt_tokens plus completion_tokens",
+    );
+  }
+  const result: Record<string, unknown> = {
+    cache_creation: null,
+    cache_creation_input_tokens: usage.cache_write_tokens == null
+      ? null
+      : requireUsageNumber(usage.cache_write_tokens, "cache_write_tokens"),
+    cache_read_input_tokens: usage.cached_tokens == null
+      ? null
+      : requireUsageNumber(usage.cached_tokens, "cached_tokens"),
+    inference_geo: null,
+    input_tokens: inputTokens,
+    iterations: null,
+    output_tokens: outputTokens,
+    server_tool_use: null,
+    service_tier: null,
+    speed: null,
+  };
+  return result;
+}
+
 function usageFromProviderEvent(usageEvent: unknown): Record<string, unknown> {
-  if (typeof usageEvent !== "object" || usageEvent === null || Array.isArray(usageEvent)) {
-    return { input_tokens: 0, output_tokens: 0 };
+  if (usageEvent == null) {
+    throw new ChatGPTOAuthProtocolError("finish event requires authoritative usage");
+  }
+  if (typeof usageEvent !== "object" || Array.isArray(usageEvent)) {
+    throw new ChatGPTOAuthProtocolError("finish event usage must be an object");
   }
   const u = usageEvent as Record<string, unknown>;
-  const inputTokens = numeric(u.input_tokens ?? u.prompt_tokens);
-  const outputTokens = numeric(u.output_tokens ?? u.completion_tokens);
-  const tokenDetails = u.input_tokens_details ?? u.prompt_tokens_details;
-  let cacheRead = numeric(u.cache_read_input_tokens ?? u.cached_input_tokens);
-  let cacheWrite = numeric(
-    u.cache_creation_input_tokens
-    ?? u.cache_write_tokens
-    ?? u.cache_write_input_tokens,
-  );
-  if (
-    typeof tokenDetails === "object"
-    && tokenDetails !== null
-    && !Array.isArray(tokenDetails)
-  ) {
-    const details = tokenDetails as Record<string, unknown>;
-    if (cacheRead === 0) cacheRead = numeric(details.cached_tokens);
-    if (cacheWrite === 0) cacheWrite = numeric(details.cache_write_tokens);
+  const unsupportedAlias = [
+    "prompt_tokens",
+    "completion_tokens",
+    "prompt_tokens_details",
+    "cached_input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+  ].find((field) => Object.hasOwn(u, field));
+  if (unsupportedAlias != null) {
+    throw new ChatGPTOAuthProtocolError(
+      `finish event usage does not support Chat Completions field ${unsupportedAlias}`,
+    );
   }
-
+  const inputTokens = requireUsageNumber(u.input_tokens, "input_tokens");
+  const outputTokens = requireUsageNumber(u.output_tokens, "output_tokens");
+  const totalTokens = requireUsageNumber(u.total_tokens, "total_tokens");
+  if (totalTokens !== inputTokens + outputTokens) {
+    throw new ChatGPTOAuthProtocolError(
+      "finish event usage total_tokens must equal input_tokens plus output_tokens",
+    );
+  }
+  const tokenDetails = u.input_tokens_details;
   const result: Record<string, unknown> = {
+    cache_creation_input_tokens: null,
+    cache_read_input_tokens: null,
     input_tokens: inputTokens,
+    iterations: null,
     output_tokens: outputTokens,
-    cache_creation_input_tokens: cacheWrite,
-    cache_read_input_tokens: cacheRead,
+    server_tool_use: null,
   };
-  for (const key of ["cache_creation", "server_tool_use", "service_tier"] as const) {
-    if (u[key] !== undefined) result[key] = u[key];
+  if (tokenDetails != null) {
+    if (typeof tokenDetails !== "object" || Array.isArray(tokenDetails)) {
+      throw new ChatGPTOAuthProtocolError("finish event usage input token details must be an object");
+    }
+    const details = tokenDetails as Record<string, unknown>;
+    result.cache_read_input_tokens = requireUsageNumber(
+      details.cached_tokens,
+      "input_tokens_details.cached_tokens",
+    );
+    const cacheWriteValue = details.cache_write_tokens;
+    if (cacheWriteValue != null) {
+      result.cache_creation_input_tokens = requireUsageNumber(
+        cacheWriteValue,
+        "input_tokens_details.cache_write_tokens",
+      );
+    }
+  }
+  if (u.server_tool_use != null) {
+    result.server_tool_use = requireUsageBreakdown(
+      u.server_tool_use,
+      "server_tool_use",
+      ["web_search_requests", "web_fetch_requests"],
+    );
+  }
+  if (u.cache_creation != null) {
+    requireUsageBreakdown(
+      u.cache_creation,
+      "cache_creation",
+      ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"],
+    );
+  }
+  if (u.service_tier != null) {
+    if (
+      typeof u.service_tier !== "string"
+      || !["standard", "priority", "batch"].includes(u.service_tier)
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "finish event usage service_tier must be standard, priority, batch, or null",
+      );
+    }
   }
   return result;
 }
 
-function numeric(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+function requireUsageBreakdown(
+  value: unknown,
+  field: string,
+  allowed: readonly string[],
+): Record<string, number> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ChatGPTOAuthProtocolError(`finish event usage ${field} must be an object`);
+  }
+  const result: Record<string, number> = {};
+  for (const [key, count] of Object.entries(value as Record<string, unknown>)) {
+    if (!allowed.includes(key)) {
+      throw new ChatGPTOAuthProtocolError(
+        `finish event usage ${field} contains an unsupported field`,
+      );
+    }
+    result[key] = requireUsageNumber(count, `${field}.${key}`);
+  }
+  const missing = allowed.filter((key) => !Object.hasOwn(result, key));
+  if (missing.length > 0) {
+    throw new ChatGPTOAuthProtocolError(
+      `finish event usage ${field} is missing required fields: ${missing.join(", ")}`,
+    );
+  }
+  return result;
+}
+
+function requireUsageNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new ChatGPTOAuthProtocolError(`finish event usage ${field} must be a non-negative integer`);
+  }
+  return value;
 }
 
 async function* renderAnthropicStreamEvents(
   events: AsyncIterable<Record<string, unknown>>,
 ): AsyncGenerator<string> {
   let blockIndex = 0;
-  let currentBlock: "thinking" | "text" | "tool_use" | null = null;
-  let hasAnyContent = false;
-  let webSearchRequests = 0;
+  let currentBlock: "text" | "tool_use" | null = null;
+  let sawFinish = false;
+  let hasToolCalls = false;
 
   for await (const event of events) {
+    if (sawFinish) {
+      throw new ChatGPTOAuthProtocolError("provider emitted an event after finish");
+    }
     const typ = event.type;
 
     if (typ === "reasoning_delta" || typ === "reasoning_raw_delta") {
-      hasAnyContent = true;
-      const text = String(event.text ?? "");
-      if (currentBlock !== "thinking") {
-        if (currentBlock !== null) {
-          yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-          blockIndex++;
-        }
-        yield sse("content_block_start", {
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: { type: "thinking", thinking: "", signature: "" },
-        });
-        currentBlock = "thinking";
+      if (typeof event.text !== "string") {
+        throw new ChatGPTOAuthProtocolError("reasoning event text must be a string");
       }
-      yield sse("content_block_delta", {
-        type: "content_block_delta",
-        index: blockIndex,
-        delta: { type: "thinking_delta", thinking: text },
+      yield sse("codex_reasoning_delta", {
+        type: "codex_reasoning_delta",
+        delta: event.text,
       });
+      continue;
+    } else if (typ === "reasoning_section_break") {
+      continue;
     } else if (typ === "content") {
-      hasAnyContent = true;
-      const text = String(event.text ?? "");
-      if (currentBlock === "thinking") {
-        yield sse("content_block_delta", {
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "signature_delta", signature: "sig-placeholder" },
-        });
-        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-        blockIndex++;
-        currentBlock = null;
+      if (typeof event.text !== "string") {
+        throw new ChatGPTOAuthProtocolError("content event text must be a string");
       }
+      const text = event.text;
       if (currentBlock !== "text") {
         if (currentBlock !== null) {
           yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
@@ -859,7 +1156,7 @@ async function* renderAnthropicStreamEvents(
         yield sse("content_block_start", {
           type: "content_block_start",
           index: blockIndex,
-          content_block: { type: "text", text: "" },
+          content_block: { type: "text", text: "", citations: null },
         });
         currentBlock = "text";
       }
@@ -869,122 +1166,71 @@ async function* renderAnthropicStreamEvents(
         delta: { type: "text_delta", text },
       });
     } else if (typ === "tool_call") {
-      hasAnyContent = true;
+      hasToolCalls = true;
       if (currentBlock !== null) {
-        if (currentBlock === "thinking") {
-          yield sse("content_block_delta", {
-            type: "content_block_delta",
-            index: blockIndex,
-            delta: { type: "signature_delta", signature: "sig-placeholder" },
-          });
-        }
         yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
         blockIndex++;
       }
-      const toolId = String(event.id ?? "");
-      const toolName = String(event.name ?? "");
-      const toolArgs = (typeof event.arguments === "object" && event.arguments !== null
-        ? event.arguments
-        : {}) as Record<string, unknown>;
+      if (typeof event.id !== "string") {
+        throw new ChatGPTOAuthProtocolError("tool_call event requires a string id");
+      }
+      if (typeof event.name !== "string") {
+        throw new ChatGPTOAuthProtocolError("tool_call event requires a string name");
+      }
+      parseAnthropicToolArguments(event.arguments);
+      const toolId = event.id;
+      const toolName = event.name;
+      const toolArgs = event.arguments as string;
       yield sse("content_block_start", {
         type: "content_block_start",
         index: blockIndex,
-        content_block: { type: "tool_use", id: toolId, name: toolName, input: {} },
+        content_block: {
+          type: "tool_use",
+          id: toolId,
+          name: toolName,
+          input: {},
+          caller: { type: "direct" },
+        },
       });
       yield sse("content_block_delta", {
         type: "content_block_delta",
         index: blockIndex,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(toolArgs) },
+        delta: { type: "input_json_delta", partial_json: toolArgs },
       });
       yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
       blockIndex++;
       currentBlock = null;
     } else if (typ === "web_search_call") {
-      hasAnyContent = true;
-      webSearchRequests++;
-      if (currentBlock !== null) {
-        if (currentBlock === "thinking") {
-          yield sse("content_block_delta", {
-            type: "content_block_delta",
-            index: blockIndex,
-            delta: { type: "signature_delta", signature: "sig-placeholder" },
-          });
-        }
-        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-        blockIndex++;
-      }
-      const toolId = String(event.id ?? "");
-      const toolInput = (typeof event.input === "object" && event.input !== null
-        ? event.input
-        : { query: "" }) as Record<string, unknown>;
-      const resultContent = Array.isArray(event.content) ? event.content : [];
-      yield sse("content_block_start", {
-        type: "content_block_start",
-        index: blockIndex,
-        content_block: { type: "server_tool_use", id: toolId, name: "web_search", input: {} },
-      });
-      yield sse("content_block_delta", {
-        type: "content_block_delta",
-        index: blockIndex,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(toolInput) },
-      });
-      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-      blockIndex++;
-      yield sse("content_block_start", {
-        type: "content_block_start",
-        index: blockIndex,
-        content_block: {
-          type: "web_search_tool_result",
-          tool_use_id: toolId,
-          content: resultContent,
-        },
-      });
-      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-      blockIndex++;
-      currentBlock = null;
+      throw new ChatGPTOAuthProtocolError(
+        "provider web_search_call output cannot be represented losslessly by the Anthropic facade",
+      );
     } else if (typ === "finish") {
       if (currentBlock !== null) {
-        if (currentBlock === "thinking") {
-          yield sse("content_block_delta", {
-            type: "content_block_delta",
-            index: blockIndex,
-            delta: { type: "signature_delta", signature: "sig-placeholder" },
-          });
-        }
         yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
         currentBlock = null;
       }
 
-      if (!hasAnyContent) {
-        yield sse("content_block_start", {
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: { type: "text", text: "" },
-        });
-        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
-      }
+      const stopReason = mapStopReason(event.finish_reason, hasToolCalls);
+      sawFinish = true;
 
-      const finishReason = String(event.finish_reason ?? "stop");
-      const stopReason = mapStopReason(finishReason, false);
-
+      const usage = usageFromProviderEvent(event.usage);
       yield sse("message_delta", {
         type: "message_delta",
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: usageWithSynthesizedWebSearch(usageFromProviderEvent(event.usage), webSearchRequests),
+        context_management: null,
+        delta: { container: null, stop_reason: stopReason, stop_sequence: null },
+        usage,
       });
       yield sse("message_stop", { type: "message_stop" });
+      return;
+    } else {
+      throw new ChatGPTOAuthProtocolError(
+        "provider emitted an unsupported event type",
+      );
     }
   }
-}
-
-function usageWithSynthesizedWebSearch(
-  usage: Record<string, unknown>,
-  webSearchRequests: number,
-): Record<string, unknown> {
-  if (webSearchRequests > 0 && usage.server_tool_use === undefined) {
-    usage.server_tool_use = { web_search_requests: webSearchRequests };
+  if (!sawFinish) {
+    throw new ChatGPTOAuthProtocolError("provider stream ended before finish");
   }
-  return usage;
 }
 function sse(eventType: string, data: Record<string, unknown>): string {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;

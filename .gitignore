@@ -11,3 +11,4 @@ rust/target/
 uv.lock
 ts/node_modules/
 ts/dist/
+.pnpm-store/

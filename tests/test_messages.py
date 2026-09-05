@@ -46,13 +46,14 @@ def test_message_tool_role_valid():
 
 
 def test_message_tool_missing_tool_call_id_raises():
-    with pytest.raises(ValueError, match="tool messages require"):
+    with pytest.raises(TypeError, match="tool messages require"):
         Message(role=MessageRole.TOOL, content="x", name="fn")
 
 
-def test_message_tool_missing_name_raises():
-    with pytest.raises(ValueError, match="tool messages require"):
-        Message(role=MessageRole.TOOL, content="x", tool_call_id="tc-1")
+def test_message_tool_name_is_optional():
+    message = Message(role=MessageRole.TOOL, content="x", tool_call_id="tc-1")
+
+    assert message.name is None
 
 
 def test_message_non_tool_with_tool_call_id_raises():
@@ -66,20 +67,20 @@ def test_message_non_tool_with_name_raises():
 
 
 def test_message_tool_calls_only_on_assistant():
-    tc = ToolCall(id="id1", name="fn", arguments={})
+    tc = ToolCall(id="id1", name="fn", arguments="{}")
     with pytest.raises(ValueError, match="only allowed on assistant messages"):
         Message(role=MessageRole.USER, content="x", tool_calls=(tc,))
 
 
 def test_message_assistant_with_tool_calls():
-    tc = ToolCall(id="id1", name="fn", arguments={"key": "val"})
+    tc = ToolCall(id="id1", name="fn", arguments='{"key":"val"}')
     m = Message(role=MessageRole.ASSISTANT, content="", tool_calls=(tc,))
     assert len(m.tool_calls) == 1
     assert m.tool_calls[0].name == "fn"
 
 
 def test_message_tool_calls_list_coerced_to_tuple():
-    tc = ToolCall(id="id1", name="fn", arguments={})
+    tc = ToolCall(id="id1", name="fn", arguments="{}")
     m = Message(role=MessageRole.ASSISTANT, content="", tool_calls=[tc])
     assert isinstance(m.tool_calls, tuple)
 
@@ -89,29 +90,17 @@ def test_message_tool_calls_list_coerced_to_tuple():
 # ---------------------------------------------------------------------------
 
 
-def test_usage_auto_calculates_total():
-    u = Usage(prompt_tokens=10, completion_tokens=5)
+def test_usage_requires_actual_consistent_total():
+    u = Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
     assert u.total_tokens == 15
 
-
-def test_usage_explicit_total_preserved():
-    u = Usage(prompt_tokens=10, completion_tokens=5, total_tokens=20)
-    assert u.total_tokens == 20
+    with pytest.raises(TypeError):
+        Usage(prompt_tokens=10, completion_tokens=5)
 
 
-def test_usage_cache_hit_rate_zero_when_no_cache():
-    u = Usage(prompt_tokens=100, completion_tokens=50)
-    assert u.cache_hit_rate == 0.0
-
-
-def test_usage_cache_hit_rate_correct():
-    u = Usage(prompt_tokens=100, completion_tokens=50, cached_tokens=40)
-    assert u.cache_hit_rate == pytest.approx(0.4)
-
-
-def test_usage_cache_hit_rate_zero_when_no_prompt_tokens():
-    u = Usage(prompt_tokens=0, completion_tokens=0)
-    assert u.cache_hit_rate == 0.0
+def test_usage_rejects_inconsistent_explicit_total():
+    with pytest.raises(ValueError, match="must equal"):
+        Usage(prompt_tokens=10, completion_tokens=5, total_tokens=20)
 
 
 # ---------------------------------------------------------------------------
@@ -119,24 +108,28 @@ def test_usage_cache_hit_rate_zero_when_no_prompt_tokens():
 # ---------------------------------------------------------------------------
 
 
-def test_assistant_response_defaults():
-    r = AssistantResponse(content="hello")
+def test_assistant_response_requires_actual_finish_reason():
+    r = AssistantResponse(content="hello", finish_reason="stop")
     assert r.finish_reason == "stop"
     assert r.tool_calls == ()
     assert r.usage is None
     assert r.reasoning_content is None
 
 
+def test_assistant_response_preserves_absent_finish_reason():
+    assert AssistantResponse(content="hello", finish_reason=None).finish_reason is None
+
+
 def test_assistant_response_list_tool_calls_coerced_to_tuple():
-    tc = ToolCall(id="x", name="fn", arguments={})
-    r = AssistantResponse(content="", tool_calls=[tc])
+    tc = ToolCall(id="x", name="fn", arguments="{}")
+    r = AssistantResponse(content="", finish_reason="tool_calls", tool_calls=[tc])
     assert isinstance(r.tool_calls, tuple)
     assert r.tool_calls[0].name == "fn"
 
 
 def test_assistant_response_with_usage():
-    u = Usage(prompt_tokens=5, completion_tokens=3)
-    r = AssistantResponse(content="text", usage=u)
+    u = Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8)
+    r = AssistantResponse(content="text", finish_reason="stop", usage=u)
     assert r.usage.total_tokens == 8
 
 
@@ -146,10 +139,10 @@ def test_assistant_response_with_usage():
 
 
 def test_tool_call_construction():
-    tc = ToolCall(id="abc", name="search", arguments={"q": "hello"})
+    tc = ToolCall(id="abc", name="search", arguments='{"q":"hello"}')
     assert tc.id == "abc"
     assert tc.name == "search"
-    assert tc.arguments == {"q": "hello"}
+    assert tc.arguments == '{"q":"hello"}'
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +155,19 @@ def test_tool_schema_construction():
     assert ts.name == "my_fn"
     assert ts.description == "does stuff"
     assert ts.parameters == {"type": "object"}
+    assert ts.strict is False
+
+
+def test_tool_schema_accepts_missing_description_and_explicit_strict():
+    ts = ToolSchema(
+        name="my_fn",
+        description=None,
+        parameters={"type": "object"},
+        strict=True,
+    )
+
+    assert ts.description is None
+    assert ts.strict is True
 
 
 # ---------------------------------------------------------------------------

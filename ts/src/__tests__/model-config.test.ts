@@ -4,9 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TomlError } from "smol-toml";
-import upstreamContract from "../../../config/codex-upstream-contract.json";
 import { loadCodexConfig } from "../codex-config.js";
-import { capabilityForModel } from "../model-capabilities.js";
 
 describe("Codex config", () => {
   it("treats only a missing config file as absent", () => {
@@ -62,11 +60,39 @@ describe("Codex config", () => {
   it("rejects an explicitly empty configured effort", () => {
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
     try {
-      fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_reasoning_effort = ""\n');
-      assert.throws(
-        () => loadCodexConfig(codexHome),
-        /model_reasoning_effort must be a non-empty TOML string/,
-      );
+      for (const value of ["", "   "]) {
+        fs.writeFileSync(
+          path.join(codexHome, "config.toml"),
+          `model_reasoning_effort = ${JSON.stringify(value)}\n`,
+        );
+        assert.throws(
+          () => loadCodexConfig(codexHome),
+          /model_reasoning_effort must be a non-empty TOML string/,
+        );
+      }
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects surrounding whitespace in configured model identifiers and efforts", () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
+    try {
+      for (const [field, value] of [
+        ["model", " gpt-5.6-sol"],
+        ["model", "gpt-5.6-sol "],
+        ["model_reasoning_effort", " ultra"],
+        ["model_reasoning_effort", "ultra "],
+      ]) {
+        fs.writeFileSync(
+          path.join(codexHome, "config.toml"),
+          `${field} = ${JSON.stringify(value)}\n`,
+        );
+        assert.throws(
+          () => loadCodexConfig(codexHome),
+          /must not contain surrounding whitespace/,
+        );
+      }
     } finally {
       fs.rmSync(codexHome, { recursive: true, force: true });
     }
@@ -143,6 +169,32 @@ describe("Codex config", () => {
     }
   });
 
+  it("accepts zero as an immediate configured auto-compaction limit", () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
+    try {
+      fs.writeFileSync(
+        path.join(codexHome, "config.toml"),
+        "model_auto_compact_token_limit = 0\n",
+      );
+      assert.equal(loadCodexConfig(codexHome).modelAutoCompactTokenLimit, 0);
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves negative configured auto-compaction limits", () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
+    try {
+      fs.writeFileSync(
+        path.join(codexHome, "config.toml"),
+        "model_auto_compact_token_limit = -1\n",
+      );
+      assert.equal(loadCodexConfig(codexHome).modelAutoCompactTokenLimit, -1);
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it("ignores reasoning effort from an inactive profile table", () => {
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-as-api-config-"));
     try {
@@ -155,97 +207,6 @@ describe("Codex config", () => {
       assert.equal(config.modelReasoningEffort, undefined);
     } finally {
       fs.rmSync(codexHome, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("model capability catalog", () => {
-  it("matches the pinned Codex 0.147 model contract", () => {
-    for (const upstreamModel of upstreamContract.models) {
-      const capability = capabilityForModel(upstreamModel.slug);
-      assert.deepEqual({
-        context_window: capability.contextWindow,
-        max_context_window: capability.maxContextWindow,
-        default_reasoning_effort: capability.defaultReasoningEffort,
-        use_responses_lite: capability.useResponsesLite,
-        support_verbosity: capability.supportVerbosity,
-        default_verbosity: capability.defaultVerbosity,
-        supports_parallel_tool_calls: capability.supportsParallelToolCalls,
-        supports_image_detail_original: capability.supportsImageDetailOriginal,
-        service_tiers: capability.serviceTiers,
-      }, {
-        context_window: upstreamModel.context_window,
-        max_context_window: upstreamModel.max_context_window,
-        default_reasoning_effort: upstreamModel.default_reasoning_effort,
-        use_responses_lite: upstreamModel.use_responses_lite,
-        support_verbosity: upstreamModel.support_verbosity,
-        default_verbosity: upstreamModel.default_verbosity,
-        supports_parallel_tool_calls: upstreamModel.supports_parallel_tool_calls,
-        supports_image_detail_original: upstreamModel.supports_image_detail_original,
-        service_tiers: upstreamModel.service_tiers,
-      });
-    }
-  });
-
-  it("loads GPT-5.6 Lite, context, and default effort fields", () => {
-    const expected = [
-      ["gpt-5.6-sol", "low"],
-      ["gpt-5.6-terra", "medium"],
-      ["gpt-5.6-luna", "medium"],
-    ] as const;
-
-    for (const [model, effort] of expected) {
-      const capability = capabilityForModel(model);
-      assert.equal(capability.useResponsesLite, true);
-      assert.equal(capability.supportsParallelToolCalls, true);
-      assert.equal(capability.defaultReasoningEffort, effort);
-      assert.equal(capability.contextWindow, 272_000);
-      assert.equal(capability.maxContextWindow, 272_000);
-    }
-  });
-
-  it("keeps unknown model capability fields absent", () => {
-    const capability = capabilityForModel("provider/future-model");
-    assert.equal(capability.defaultReasoningEffort, undefined);
-    assert.equal(capability.contextWindow, undefined);
-    assert.equal(capability.supportsImageDetailOriginal, false);
-  });
-
-  it("loads original image detail support conservatively", () => {
-    for (const model of [
-      "gpt-5.6",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-    ]) {
-      assert.equal(capabilityForModel(model).supportsImageDetailOriginal, true);
-    }
-    for (const model of [
-      "gpt-5.2",
-      "gpt-5.3-codex",
-      "gpt-5.3-codex-spark",
-      "provider/future-model",
-    ]) {
-      assert.equal(capabilityForModel(model).supportsImageDetailOriginal, false);
-    }
-  });
-
-  it("loads current existing-model context and effort defaults", () => {
-    const expected = [
-      ["gpt-5.5", 272_000],
-      ["gpt-5.4", 1_000_000],
-      ["gpt-5.4-mini", 272_000],
-      ["gpt-5.2", 272_000],
-    ] as const;
-
-    for (const [model, maximum] of expected) {
-      const capability = capabilityForModel(model);
-      assert.equal(capability.defaultReasoningEffort, "medium");
-      assert.equal(capability.contextWindow, 272_000);
-      assert.equal(capability.maxContextWindow, maximum);
     }
   });
 });

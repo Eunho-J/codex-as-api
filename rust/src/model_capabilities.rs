@@ -1,6 +1,6 @@
+use crate::model_catalog::ModelInfo;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub const RESPONSES_LITE_ENV: &str = "CODEX_AS_API_RESPONSES_LITE";
@@ -14,25 +14,7 @@ pub const SESSION_ID_KEY: &str = "session_id";
 pub const THREAD_ID_KEY: &str = "thread_id";
 pub const TURN_ID_KEY: &str = "turn_id";
 
-static CAPABILITIES_JSON: &str = include_str!("model-capabilities.json");
 static WINDOW_ID: OnceLock<String> = OnceLock::new();
-
-#[derive(Debug, Clone)]
-pub struct ModelCapability {
-    pub use_responses_lite: bool,
-    pub supports_parallel_tool_calls: bool,
-    pub supports_image_detail_original: bool,
-    pub support_verbosity: bool,
-    pub default_verbosity: Option<String>,
-    pub default_reasoning_effort: Option<String>,
-    pub context_window: Option<i64>,
-    pub max_context_window: Option<i64>,
-    pub service_tiers: Vec<String>,
-    #[allow(dead_code)]
-    pub default_service_tier: Option<String>,
-    #[allow(dead_code)]
-    pub source: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponsesLiteMode {
@@ -41,71 +23,86 @@ enum ResponsesLiteMode {
     Auto,
 }
 
-pub fn capability_for_model(model: &str) -> ModelCapability {
-    let parsed: Value = serde_json::from_str(CAPABILITIES_JSON)
-        .expect("embedded model-capabilities.json must be valid");
-    parsed
-        .get("models")
-        .and_then(|v| v.as_object())
-        .and_then(|models| models.get(model))
-        .and_then(capability_from_value)
-        .unwrap_or_else(unknown_capability)
-}
-
-pub fn use_responses_lite(model: &str, value: Option<&Value>) -> Result<bool, String> {
+pub fn use_responses_lite(model: &ModelInfo, value: Option<&Value>) -> Result<bool, String> {
     let mode = resolve_responses_lite_mode(value)?;
     Ok(match mode {
         ResponsesLiteMode::On => true,
         ResponsesLiteMode::Off => false,
-        ResponsesLiteMode::Auto => capability_for_model(model).use_responses_lite,
+        ResponsesLiteMode::Auto => model.use_responses_lite,
     })
 }
 
 pub fn should_enable_parallel_tool_calls(
-    model: &str,
     requested: Option<bool>,
     responses_lite: bool,
-) -> bool {
-    if responses_lite || requested != Some(true) {
-        return false;
+) -> Result<bool, String> {
+    if requested != Some(true) {
+        return Ok(false);
     }
-    capability_for_model(model).supports_parallel_tool_calls
+    if responses_lite {
+        return Err("parallel_tool_calls=true is not supported by Responses Lite".to_string());
+    }
+    Ok(true)
 }
 
 pub fn resolve_codex_metadata_enabled(value: Option<bool>) -> Result<bool, String> {
     if let Some(v) = value {
         return Ok(v);
     }
-    let raw = std::env::var(CODEX_METADATA_ENV).unwrap_or_else(|_| "off".to_string());
+    let raw = environment_value(CODEX_METADATA_ENV)?.unwrap_or_else(|| "off".to_string());
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" | "" => Ok(false),
+        "0" | "false" | "no" | "off" => Ok(false),
         _ => Err("codex_metadata must be on or off".to_string()),
     }
 }
 
+pub fn validate_model_capability_environment() -> Result<(), String> {
+    resolve_codex_metadata_enabled(None)?;
+    resolve_responses_lite_mode(None)?;
+    Ok(())
+}
+
 pub fn apply_model_capability_fields(
     payload: &mut serde_json::Map<String, Value>,
-    model: &str,
+    model: &ModelInfo,
     text: Option<&Value>,
     service_tier: Option<&str>,
 ) -> Result<(), String> {
-    let capability = capability_for_model(model);
-    if capability.support_verbosity {
-        let mut merged = text
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
+    let mut text = match text {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(object)) => Some(object.clone()),
+        Some(_) => return Err("text must be an object when provided".to_string()),
+    };
+    if let Some(object) = text.as_mut() {
+        if object.get("verbosity").is_some_and(Value::is_null) {
+            object.remove("verbosity");
+        }
+        if let Some(verbosity) = object.get("verbosity") {
+            if !model.support_verbosity {
+                return Err("text.verbosity is not supported for the requested model".to_string());
+            }
+            if !matches!(verbosity.as_str(), Some("low" | "medium" | "high")) {
+                return Err("text.verbosity must be one of: low, medium, high".to_string());
+            }
+        }
+    }
+
+    if model.support_verbosity {
+        let mut merged = text.unwrap_or_default();
         if !merged.contains_key("verbosity") {
-            if let Some(default_verbosity) = capability.default_verbosity {
-                merged.insert("verbosity".to_string(), Value::String(default_verbosity));
+            if let Some(default_verbosity) = model.default_verbosity.as_ref() {
+                merged.insert(
+                    "verbosity".to_string(),
+                    Value::String(default_verbosity.clone()),
+                );
             }
         }
         if !merged.is_empty() {
             payload.insert("text".to_string(), Value::Object(merged));
         }
-    } else if let Some(t) = text {
-        payload.insert("text".to_string(), t.clone());
+    } else if let Some(text) = text {
+        payload.insert("text".to_string(), Value::Object(text));
     }
 
     if let Some(requested_tier) = service_tier {
@@ -115,14 +112,12 @@ pub fn apply_model_capability_fields(
             value => Some(value),
         };
         if let Some(wire_tier) = wire_tier {
-            if !capability
+            if !model
                 .service_tiers
                 .iter()
-                .any(|value| value == wire_tier)
+                .any(|value| value.id == wire_tier)
             {
-                return Err(format!(
-                    "service_tier {requested_tier:?} is not supported for model {model}"
-                ));
+                return Err("service_tier is not supported for the requested model".to_string());
             }
             payload.insert(
                 "service_tier".to_string(),
@@ -154,22 +149,17 @@ pub fn build_codex_client_metadata(
         Some(value) => value.clone(),
         None => session_id.clone(),
     };
-    let raw_path = auth_json_path.unwrap_or("~/.codex/auth.json");
-    let expanded = if let Some(rest) = raw_path.strip_prefix("~/") {
-        std::env::var("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .unwrap_or_else(|_| PathBuf::from(raw_path))
-    } else {
-        PathBuf::from(raw_path)
-    };
+    let expanded =
+        crate::auth::resolve_auth_path(auth_json_path).map_err(|error| error.to_string())?;
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?
             .join(expanded)
     };
-    let namespace = uuid::Uuid::parse_str("d2c81270-8f15-5e8d-a5c4-4cdbf2c21fd0").unwrap();
+    let namespace = uuid::Uuid::parse_str("d2c81270-8f15-5e8d-a5c4-4cdbf2c21fd0")
+        .expect("constant installation namespace must be a UUID");
     let installation_id = uuid::Uuid::new_v5(
         &namespace,
         format!("codex-as-api:{}", absolute.display()).as_bytes(),
@@ -196,29 +186,6 @@ pub fn build_codex_client_metadata(
     Ok(metadata)
 }
 
-pub fn strip_image_detail_fields(value: Value) -> Value {
-    match value {
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_image_detail_fields).collect())
-        }
-        Value::Object(map) => {
-            let is_image = map.get("type").and_then(|v| v.as_str()) == Some("input_image");
-            Value::Object(
-                map.into_iter()
-                    .filter_map(|(key, child)| {
-                        if is_image && key == "detail" {
-                            None
-                        } else {
-                            Some((key, strip_image_detail_fields(child)))
-                        }
-                    })
-                    .collect(),
-            )
-        }
-        other => other,
-    }
-}
-
 fn resolve_responses_lite_mode(value: Option<&Value>) -> Result<ResponsesLiteMode, String> {
     let raw = match value {
         Some(Value::Bool(v)) => {
@@ -230,7 +197,7 @@ fn resolve_responses_lite_mode(value: Option<&Value>) -> Result<ResponsesLiteMod
         }
         Some(Value::String(value)) => value.clone(),
         Some(_) => return Err("responses_lite must be one of: off, on, auto".to_string()),
-        None => std::env::var(RESPONSES_LITE_ENV).unwrap_or_else(|_| "auto".to_string()),
+        None => environment_value(RESPONSES_LITE_ENV)?.unwrap_or_else(|| "auto".to_string()),
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(ResponsesLiteMode::On),
@@ -240,280 +207,227 @@ fn resolve_responses_lite_mode(value: Option<&Value>) -> Result<ResponsesLiteMod
     }
 }
 
-fn capability_from_value(value: &Value) -> Option<ModelCapability> {
-    let obj = value.as_object()?;
-    let tiers = obj
-        .get("service_tiers")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(ModelCapability {
-        use_responses_lite: obj
-            .get("use_responses_lite")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        supports_parallel_tool_calls: obj
-            .get("supports_parallel_tool_calls")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        supports_image_detail_original: obj
-            .get("supports_image_detail_original")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        support_verbosity: obj
-            .get("support_verbosity")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        default_verbosity: obj
-            .get("default_verbosity")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        default_reasoning_effort: obj
-            .get("default_reasoning_effort")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        context_window: obj.get("context_window").and_then(|v| v.as_i64()),
-        max_context_window: obj.get("max_context_window").and_then(|v| v.as_i64()),
-        service_tiers: tiers,
-        default_service_tier: obj
-            .get("default_service_tier")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        source: obj
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-    })
-}
-
-fn unknown_capability() -> ModelCapability {
-    ModelCapability {
-        use_responses_lite: false,
-        supports_parallel_tool_calls: false,
-        supports_image_detail_original: false,
-        support_verbosity: false,
-        default_verbosity: None,
-        default_reasoning_effort: None,
-        context_window: None,
-        max_context_window: None,
-        service_tiers: vec![],
-        default_service_tier: None,
-        source: "unknown".to_string(),
+fn environment_value(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => {
+            Err(format!("{name} must not be empty when provided"))
+        }
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must contain valid Unicode")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_catalog::parse_models_response;
 
-    const UPSTREAM_CONTRACT_JSON: &str = include_str!("../../config/codex-upstream-contract.json");
+    fn parsed_live_model() -> std::sync::Arc<ModelInfo> {
+        let body = json!({"models":[{
+            "slug":"live-model","display_name":"Live","description":null,
+            "default_reasoning_level":"medium",
+            "supported_reasoning_levels":[{"effort":"medium","description":"Medium"}],
+            "visibility":"list","supported_in_api":true,"priority":1,
+            "service_tiers":[{"id":"priority","name":"Fast","description":"Fast"}],
+            "default_service_tier":null,"support_verbosity":true,"default_verbosity":"low",
+            "supports_image_detail_original":true,
+            "context_window":100000,"max_context_window":100000,
+            "auto_compact_token_limit":90000,"effective_context_window_percent":95,
+            "input_modalities":["text","image"],"use_responses_lite":false
+        }]});
+        parse_models_response(&serde_json::to_vec(&body).unwrap())
+            .unwrap()
+            .remove(0)
+    }
 
-    #[test]
-    fn embedded_capability_catalog_is_structurally_valid() {
-        let catalog: Value = serde_json::from_str(CAPABILITIES_JSON).unwrap();
-        let models = catalog.get("models").and_then(Value::as_object).unwrap();
-
-        assert_eq!(models.len(), 10);
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert!(models.get(model).is_some_and(Value::is_object));
+    fn live_model(use_responses_lite: bool, support_verbosity: bool) -> ModelInfo {
+        ModelInfo {
+            slug: "live-model".to_string(),
+            display_name: "Live Model".to_string(),
+            description: Some("test fixture".to_string()),
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![crate::model_catalog::ReasoningLevel {
+                effort: "medium".to_string(),
+                description: "Medium".to_string(),
+            }],
+            multi_agent_reasoning_effort: None,
+            visibility: "list".to_string(),
+            supported_in_api: true,
+            priority: 0,
+            service_tiers: vec![crate::model_catalog::ServiceTier {
+                id: "priority".to_string(),
+                name: "Priority".to_string(),
+                description: "Priority".to_string(),
+            }],
+            default_service_tier: None,
+            support_verbosity,
+            default_verbosity: support_verbosity.then(|| "low".to_string()),
+            supports_reasoning_summary_parameter: true,
+            default_reasoning_summary: "auto".to_string(),
+            comp_hash: None,
+            supports_image_detail_original: true,
+            context_window: Some(100_000),
+            max_context_window: Some(120_000),
+            auto_compact_token_limit: Some(90_000),
+            effective_context_window_percent: 95,
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            use_responses_lite,
         }
     }
 
     #[test]
-    fn embedded_catalog_matches_the_pinned_codex_0_147_model_contract() {
-        let catalog: Value = serde_json::from_str(CAPABILITIES_JSON).unwrap();
-        let models = catalog.get("models").and_then(Value::as_object).unwrap();
-        let contract: Value = serde_json::from_str(UPSTREAM_CONTRACT_JSON).unwrap();
-
-        assert_eq!(contract["upstream"]["repository"], json!("openai/codex"));
-        assert_eq!(contract["upstream"]["version"], json!("0.147.0"));
-
-        for upstream_model in contract["models"].as_array().unwrap() {
-            let slug = upstream_model["slug"].as_str().unwrap();
-            let model = models.get(slug).and_then(Value::as_object).unwrap();
-            for field in [
-                "context_window",
-                "max_context_window",
-                "default_reasoning_effort",
-                "use_responses_lite",
-                "support_verbosity",
-                "default_verbosity",
-                "supports_parallel_tool_calls",
-                "supports_image_detail_original",
-                "service_tiers",
-            ] {
-                assert_eq!(
-                    model.get(field),
-                    upstream_model.get(field),
-                    "{slug} {field}"
-                );
-            }
-        }
+    fn live_model_controls_are_applied_without_static_fallback() {
+        let model = parsed_live_model();
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(&mut payload, &model, None, Some("fast")).unwrap();
+        assert_eq!(payload["service_tier"], "priority");
+        assert_eq!(payload["text"]["verbosity"], "low");
+        assert!(should_enable_parallel_tool_calls(Some(true), false).unwrap());
     }
 
     #[test]
-    fn parses_gpt_5_6_model_capabilities() {
-        let cases = [
-            ("gpt-5.6", "low"),
-            ("gpt-5.6-sol", "low"),
-            ("gpt-5.6-terra", "medium"),
-            ("gpt-5.6-luna", "medium"),
-        ];
-
-        for (model, default_effort) in cases {
-            let capability = capability_for_model(model);
-
-            assert!(capability.use_responses_lite);
-            assert!(capability.supports_parallel_tool_calls);
-            assert!(capability.support_verbosity);
-            assert_eq!(capability.default_verbosity.as_deref(), Some("low"));
-            assert_eq!(
-                capability.default_reasoning_effort.as_deref(),
-                Some(default_effort)
-            );
-            assert_eq!(capability.context_window, Some(272_000));
-            assert_eq!(capability.max_context_window, Some(272_000));
-            assert_eq!(capability.service_tiers, vec!["priority".to_string()]);
-        }
+    fn explicit_invalid_responses_lite_type_fails() {
+        assert!(use_responses_lite(&live_model(false, true), Some(&json!(42))).is_err());
     }
 
     #[test]
-    fn unknown_model_has_no_catalog_reasoning_or_context_defaults() {
-        let capability = capability_for_model("unknown-model");
-
-        assert_eq!(capability.default_reasoning_effort, None);
-        assert_eq!(capability.context_window, None);
-        assert!(!capability.supports_image_detail_original);
+    fn responses_lite_auto_uses_the_live_capability() {
+        assert!(use_responses_lite(&live_model(true, true), Some(&json!("auto")),).unwrap());
+        assert!(!use_responses_lite(&live_model(false, true), Some(&json!("auto")),).unwrap());
     }
 
     #[test]
-    fn original_image_detail_support_matches_the_official_catalog() {
-        for model in [
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-        ] {
-            assert!(capability_for_model(model).supports_image_detail_original);
-        }
-        for model in [
-            "gpt-5.2",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            "unknown-model",
-        ] {
-            assert!(!capability_for_model(model).supports_image_detail_original);
-        }
+    fn classic_responses_preserve_explicit_parallel_tools() {
+        assert!(should_enable_parallel_tool_calls(Some(true), false).unwrap());
     }
 
     #[test]
-    fn explicit_invalid_responses_lite_type_fails_instead_of_using_environment() {
-        assert!(use_responses_lite("gpt-5.6-sol", Some(&json!(42))).is_err());
+    fn omitted_or_false_parallel_tools_stay_disabled() {
+        assert!(!should_enable_parallel_tool_calls(None, false).unwrap());
+        assert!(!should_enable_parallel_tool_calls(Some(false), false).unwrap());
     }
 
     #[test]
-    fn service_tier_fast_maps_to_priority_and_default_is_omitted() {
-        let mut fast_payload = serde_json::Map::new();
-        apply_model_capability_fields(&mut fast_payload, "gpt-5.6-sol", None, Some("fast"))
-            .unwrap();
-        assert_eq!(fast_payload.get("service_tier"), Some(&json!("priority")));
-
-        let mut default_payload = serde_json::Map::new();
-        apply_model_capability_fields(&mut default_payload, "gpt-5.6-sol", None, Some("default"))
-            .unwrap();
-        assert!(!default_payload.contains_key("service_tier"));
+    fn responses_lite_rejects_parallel_tools() {
+        assert!(should_enable_parallel_tool_calls(Some(true), true).is_err());
     }
 
     #[test]
-    fn service_tier_rejects_unknown_or_model_unsupported_values() {
-        for (model, tier) in [
-            ("gpt-5.6-sol", "flex"),
-            ("gpt-5.4-mini", "priority"),
-            ("unknown-model", "fast"),
-        ] {
-            let mut payload = serde_json::Map::new();
-            assert!(apply_model_capability_fields(&mut payload, model, None, Some(tier)).is_err());
-            assert!(!payload.contains_key("service_tier"));
-        }
+    fn service_tier_fast_maps_to_live_priority() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(&mut payload, &model, None, Some("fast")).unwrap();
+        assert_eq!(payload.get("service_tier"), Some(&json!("priority")));
     }
 
     #[test]
-    fn current_existing_models_have_official_context_and_effort_defaults() {
-        let cases = [
-            ("gpt-5.5", 272_000),
-            ("gpt-5.4", 1_000_000),
-            ("gpt-5.4-mini", 272_000),
-            ("gpt-5.2", 272_000),
-        ];
+    fn default_service_tier_is_omitted() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(&mut payload, &model, None, Some("default")).unwrap();
+        assert!(!payload.contains_key("service_tier"));
+    }
 
-        for (model, maximum) in cases {
-            let capability = capability_for_model(model);
-            assert_eq!(
-                capability.default_reasoning_effort.as_deref(),
-                Some("medium")
-            );
-            assert_eq!(capability.context_window, Some(272_000));
-            assert_eq!(capability.max_context_window, Some(maximum));
-        }
+    #[test]
+    fn service_tier_not_in_live_catalog_is_rejected() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        assert!(apply_model_capability_fields(&mut payload, &model, None, Some("flex")).is_err());
+        assert!(!payload.contains_key("service_tier"));
+    }
+
+    #[test]
+    fn live_default_verbosity_is_applied() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(&mut payload, &model, None, None).unwrap();
+        assert_eq!(payload["text"]["verbosity"], "low");
+    }
+
+    #[test]
+    fn unsupported_explicit_verbosity_is_rejected() {
+        let model = live_model(false, false);
+        let mut payload = serde_json::Map::new();
+        assert!(apply_model_capability_fields(
+            &mut payload,
+            &model,
+            Some(&json!({"verbosity": "high"})),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn models_without_verbosity_support_preserve_other_text_controls() {
+        let model = live_model(false, false);
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(
+            &mut payload,
+            &model,
+            Some(&json!({
+                "format": {"type": "json_object"},
+                "verbosity": null
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(payload["text"], json!({"format": {"type": "json_object"}}));
+    }
+
+    #[test]
+    fn null_verbosity_is_omitted_before_applying_a_live_default() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        apply_model_capability_fields(
+            &mut payload,
+            &model,
+            Some(&json!({
+                "format": {"type": "text"},
+                "verbosity": null
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            payload["text"],
+            json!({"format": {"type": "text"}, "verbosity": "low"})
+        );
+    }
+
+    #[test]
+    fn non_object_text_controls_are_rejected() {
+        let model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        assert!(
+            apply_model_capability_fields(&mut payload, &model, Some(&json!("high")), None,)
+                .is_err()
+        );
     }
 
     #[test]
     fn codex_metadata_requires_explicit_session_identity() {
         assert!(build_codex_client_metadata(None, None).is_err());
-
         let metadata = HashMap::from([(SESSION_ID_KEY.to_string(), "   ".to_string())]);
         assert!(build_codex_client_metadata(None, Some(&metadata)).is_err());
     }
 
     #[test]
-    fn codex_metadata_defaults_root_thread_and_refreshes_only_turn_identity() {
+    fn codex_metadata_preserves_session_and_thread_identity() {
         let existing = HashMap::from([
             (SESSION_ID_KEY.to_string(), "session-root".to_string()),
+            (THREAD_ID_KEY.to_string(), "thread-child".to_string()),
             ("custom".to_string(), "preserved".to_string()),
         ]);
-
         let first =
             build_codex_client_metadata(Some("/tmp/codex-auth.json"), Some(&existing)).unwrap();
         let second =
             build_codex_client_metadata(Some("/tmp/codex-auth.json"), Some(&existing)).unwrap();
-
         assert_eq!(first[SESSION_ID_KEY], "session-root");
-        assert_eq!(first[THREAD_ID_KEY], "session-root");
+        assert_eq!(first[THREAD_ID_KEY], "thread-child");
         assert_eq!(first["custom"], "preserved");
         assert_eq!(first[INSTALLATION_ID_KEY], second[INSTALLATION_ID_KEY]);
         assert_eq!(first[WINDOW_ID_KEY], second[WINDOW_ID_KEY]);
         assert_ne!(first[TURN_ID_KEY], second[TURN_ID_KEY]);
-
-        let turn_metadata: Value = serde_json::from_str(&first[TURN_METADATA_KEY]).unwrap();
-        assert_eq!(turn_metadata["session_id"], "session-root");
-        assert_eq!(turn_metadata["thread_id"], "session-root");
-        assert_eq!(turn_metadata["turn_id"], first[TURN_ID_KEY]);
-    }
-
-    #[test]
-    fn codex_metadata_preserves_explicit_subagent_thread() {
-        let existing = HashMap::from([
-            (SESSION_ID_KEY.to_string(), "session-root".to_string()),
-            (THREAD_ID_KEY.to_string(), "thread-child".to_string()),
-        ]);
-
-        let metadata = build_codex_client_metadata(None, Some(&existing)).unwrap();
-        assert_eq!(metadata[SESSION_ID_KEY], "session-root");
-        assert_eq!(metadata[THREAD_ID_KEY], "thread-child");
-
-        let invalid = HashMap::from([
-            (SESSION_ID_KEY.to_string(), "session-root".to_string()),
-            (THREAD_ID_KEY.to_string(), " ".to_string()),
-        ]);
-        assert!(build_codex_client_metadata(None, Some(&invalid)).is_err());
     }
 }

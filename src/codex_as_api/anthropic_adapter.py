@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-import uuid
+import re
 from collections.abc import Iterator
 from typing import Any
 
-from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema
+from .auth import ChatGPTOAuthProtocolError
+from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
+from .strict_json import as_js_safe_integer, strict_json_loads
 
 # ---------------------------------------------------------------------------
 # Request conversion: Anthropic → internal
@@ -14,14 +16,14 @@ from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSch
 
 def anthropic_request_to_internal(
     *,
-    model: str,
-    messages: list[dict[str, Any]],
+    model: object,
+    messages: object,
     system: str | list[dict[str, Any]] | None = None,
-    max_tokens: int = 4096,
-    tools: list[dict[str, Any]] | None = None,
+    tools: object = None,
     tool_choice: dict[str, Any] | None = None,
     stop_sequences: list[str] | None = None,
     thinking: dict[str, Any] | None = None,
+    max_tokens: int | None = None,
     output_format: dict[str, Any] | None = None,
     output_config: object = None,
 ) -> tuple[
@@ -31,6 +33,14 @@ def anthropic_request_to_internal(
 
     Returns (messages, tools, tool_choice, stop, reasoning_effort, text).
     """
+    if not isinstance(model, str) or not model:
+        raise ValueError("model must be a non-empty string")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty array")
+    if stop_sequences is not None and (
+        not isinstance(stop_sequences, list) or any(not isinstance(value, str) or not value for value in stop_sequences)
+    ):
+        raise ValueError("stop_sequences must be an array of non-empty strings")
     internal_messages: list[Message] = []
 
     # System prompt → SYSTEM message
@@ -40,21 +50,26 @@ def anthropic_request_to_internal(
             internal_messages.append(Message(role=MessageRole.SYSTEM, content=sys_text))
 
     # Convert messages
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            raise ValueError(f"messages[{index}] must be an object")
+        _reject_unknown_fields(msg, {"role", "content"}, f"messages[{index}]")
+        role = msg.get("role")
+        content = msg.get("content")
         if role == "user":
             _convert_user_message(content, internal_messages)
         elif role == "assistant":
             _convert_assistant_message(content, internal_messages)
+        else:
+            raise ValueError(f"messages[{index}].role must be user or assistant")
 
     # Convert tools
-    internal_tools = _convert_tools(tools) if tools else None
+    internal_tools = _convert_tools(tools) if tools is not None else None
 
     # Convert tool_choice
     internal_tool_choice = _convert_tool_choice(tool_choice)
 
-    reasoning_effort = _convert_reasoning_effort(thinking, output_config)
+    reasoning_effort = _convert_reasoning_effort(thinking, output_config, max_tokens)
     text = _convert_output_format(output_format, output_config)
 
     return internal_messages, internal_tools, internal_tool_choice, stop_sequences, reasoning_effort, text
@@ -63,30 +78,56 @@ def anthropic_request_to_internal(
 def _extract_system_text(system: str | list[dict[str, Any]]) -> str:
     if isinstance(system, str):
         return system
+    if not isinstance(system, list):
+        raise ValueError("system must be a string or array")
     parts: list[str] = []
-    for block in system:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
+    for index, block in enumerate(system):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            raise ValueError(f"system[{index}] must be a text block")
+        _validate_nullable_unrepresentable_field(block, "citations", f"system[{index}]")
+        _reject_unknown_fields(block, {"type", "text", "citations"}, f"system[{index}]")
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"system[{index}].text must be a string")
+        parts.append(text)
     return "\n\n".join(parts)
 
 
-def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message]) -> None:
+def _convert_user_message(content: object, out: list[Message]) -> None:
     if isinstance(content, str):
         out.append(Message(role=MessageRole.USER, content=content))
         return
+    if not isinstance(content, list):
+        raise ValueError("Anthropic user message content must be a string or array")
+    if not content:
+        raise ValueError("Anthropic user message content blocks must be non-empty")
     text_parts: list[str] = []
     image_urls: list[str] = []
-    for block in content:
+    for index, block in enumerate(content):
         if not isinstance(block, dict):
-            continue
+            raise ValueError(f"Anthropic user content block {index} must be an object")
         block_type = block.get("type")
         if block_type == "text":
+            _validate_nullable_unrepresentable_field(
+                block,
+                "citations",
+                f"Anthropic user content block {index}",
+            )
+            _reject_unknown_fields(
+                block,
+                {"type", "text", "citations"},
+                f"Anthropic user content block {index}",
+            )
             text = block.get("text")
-            if isinstance(text, str):
-                text_parts.append(text)
+            if not isinstance(text, str):
+                raise ValueError(f"Anthropic user text block {index} requires string text")
+            text_parts.append(text)
         elif block_type == "tool_result":
+            _reject_unknown_fields(
+                block,
+                {"type", "tool_use_id", "content", "is_error"},
+                f"Anthropic tool_result block {index}",
+            )
             if text_parts or image_urls:
                 out.append(
                     Message(
@@ -97,27 +138,47 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                 )
                 text_parts = []
                 image_urls = []
-            tool_use_id = block.get("tool_use_id") or "tool-call"
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                raise ValueError(f"Anthropic tool_result block {index} requires string tool_use_id")
             result_content = block.get("content", "")
             tool_result_images: list[str] = []
             if isinstance(result_content, list):
                 text_pieces: list[str] = []
-                for p in result_content:
+                for part_index, p in enumerate(result_content):
                     if not isinstance(p, dict):
-                        continue
+                        raise ValueError(f"Anthropic tool_result block {index} content {part_index} must be an object")
                     if p.get("type") == "text":
-                        text_pieces.append(p.get("text", ""))
+                        _validate_nullable_unrepresentable_field(
+                            p,
+                            "citations",
+                            f"Anthropic tool_result block {index} content {part_index}",
+                        )
+                        _reject_unknown_fields(
+                            p,
+                            {"type", "text", "citations"},
+                            f"Anthropic tool_result block {index} content {part_index}",
+                        )
+                        text = p.get("text")
+                        if not isinstance(text, str):
+                            raise ValueError(f"Anthropic tool_result block {index} text content requires string text")
+                        text_pieces.append(text)
                     elif p.get("type") == "image":
-                        source = p.get("source", {})
+                        _reject_unknown_fields(
+                            p,
+                            {"type", "source"},
+                            f"Anthropic tool_result block {index} content {part_index}",
+                        )
+                        source = p.get("source")
                         image_url = _anthropic_image_url(source)
                         tool_result_images.append(image_url)
                     else:
-                        rendered = _render_anthropic_content_block(p)
-                        if rendered:
-                            text_pieces.append(rendered)
+                        text_pieces.append(_render_anthropic_content_block(p))
                 result_content = "".join(text_pieces)
             elif not isinstance(result_content, str):
-                result_content = str(result_content) if result_content else ""
+                raise ValueError(f"Anthropic tool_result block {index} content must be a string or array")
+            if "is_error" in block and not isinstance(block["is_error"], bool):
+                raise ValueError(f"Anthropic tool_result block {index} is_error must be a boolean")
             if block.get("is_error") is True:
                 result_content = f"[tool_error]\n{result_content}"
             out.append(
@@ -125,7 +186,6 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                     role=MessageRole.TOOL,
                     content=result_content,
                     tool_call_id=tool_use_id,
-                    name=tool_use_id,
                 )
             )
             if tool_result_images:
@@ -137,13 +197,16 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
                     )
                 )
         elif block_type == "image":
-            source = block.get("source", {})
+            _reject_unknown_fields(
+                block,
+                {"type", "source"},
+                f"Anthropic user content block {index}",
+            )
+            source = block.get("source")
             image_url = _anthropic_image_url(source)
             image_urls.append(image_url)
         else:
-            rendered = _render_anthropic_content_block(block)
-            if rendered:
-                text_parts.append(rendered)
+            text_parts.append(_render_anthropic_content_block(block))
     if text_parts or image_urls:
         out.append(
             Message(
@@ -154,89 +217,134 @@ def _convert_user_message(content: str | list[dict[str, Any]], out: list[Message
         )
 
 
-def _convert_assistant_message(content: str | list[dict[str, Any]], out: list[Message]) -> None:
+def _convert_assistant_message(content: object, out: list[Message]) -> None:
     if isinstance(content, str):
         out.append(Message(role=MessageRole.ASSISTANT, content=content))
         return
+    if not isinstance(content, list):
+        raise ValueError("Anthropic assistant message content must be a string or array")
+    if not content:
+        out.append(Message(role=MessageRole.ASSISTANT, content=""))
+        return
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    reasoning_content: str | None = None
-    for block in content:
+    tool_call_ids: set[str] = set()
+    for index, block in enumerate(content):
         if not isinstance(block, dict):
-            continue
+            raise ValueError(f"Anthropic assistant content block {index} must be an object")
         block_type = block.get("type")
         if block_type == "text":
+            _validate_nullable_unrepresentable_field(
+                block,
+                "citations",
+                f"Anthropic assistant content block {index}",
+            )
+            _reject_unknown_fields(
+                block,
+                {"type", "text", "citations"},
+                f"Anthropic assistant content block {index}",
+            )
             text = block.get("text")
-            if isinstance(text, str):
-                text_parts.append(text)
+            if not isinstance(text, str):
+                raise ValueError(f"Anthropic assistant text block {index} requires string text")
+            text_parts.append(text)
         elif block_type == "tool_use":
+            _reject_unknown_fields(
+                block,
+                {"type", "id", "name", "input", "caller"},
+                f"Anthropic tool_use block {index}",
+            )
+            _validate_direct_tool_caller(block, f"Anthropic tool_use block {index}")
+            call_id = block.get("id")
+            name = block.get("name")
+            arguments = block.get("input")
+            if not isinstance(call_id, str):
+                raise ValueError(f"Anthropic tool_use block {index} requires string id")
+            if not isinstance(name, str):
+                raise ValueError(f"Anthropic tool_use block {index} requires string name")
+            if not isinstance(arguments, dict):
+                raise ValueError(f"Anthropic tool_use block {index} input must be an object")
+            if call_id in tool_call_ids:
+                raise ValueError(f"Anthropic assistant tool_use blocks contain duplicate id {call_id!r}")
+            tool_call_ids.add(call_id)
             tool_calls.append(
                 ToolCall(
-                    id=block.get("id") or uuid.uuid4().hex,
-                    name=block.get("name") or "",
-                    arguments=block.get("input") or {},
+                    id=call_id,
+                    name=name,
+                    arguments=json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
                 )
             )
-        elif block_type == "thinking":
-            thinking_text = block.get("thinking")
-            if isinstance(thinking_text, str) and thinking_text:
-                reasoning_content = thinking_text
-        elif block_type == "redacted_thinking":
-            if reasoning_content is None:
-                reasoning_content = "[redacted_thinking omitted]"
-        elif block_type == "server_tool_use":
-            text_parts.append(_render_server_tool_use_block(block))
-        elif block_type == "web_search_tool_result":
-            text_parts.append(_render_generic_tool_result_block(block))
+        elif block_type in {
+            "thinking",
+            "redacted_thinking",
+            "server_tool_use",
+            "web_search_tool_result",
+        }:
+            raise ValueError(
+                f"Anthropic assistant content block type {block_type!r} cannot be preserved by this facade"
+            )
         else:
-            rendered = _render_anthropic_content_block(block)
-            if rendered:
-                text_parts.append(rendered)
+            text_parts.append(_render_anthropic_content_block(block))
     out.append(
         Message(
             role=MessageRole.ASSISTANT,
             content="".join(text_parts),
             tool_calls=tuple(tool_calls) if tool_calls else (),
-            reasoning_content=reasoning_content,
         )
     )
 
 
-def _convert_tools(tools: list[dict[str, Any]]) -> list[ToolSchema]:
+def _convert_tools(tools: object) -> list[ToolSchema]:
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
     result: list[ToolSchema] = []
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
-            continue
+            raise ValueError(f"Anthropic tool {index} must be an object")
         if tool.get("type") == "programmatic_tool_calling":
             raise ValueError(
                 "programmatic_tool_calling requires native Responses program/caller replay "
                 "and is not supported by the Anthropic facade"
             )
-        if any(key in tool for key in ("allowed_callers", "output_schema")):
-            raise ValueError(
-                f"Anthropic tool {index} uses Programmatic Tool Calling fields that cannot be preserved"
-            )
-        for field in ("strict", "defer_loading", "eager_input_streaming"):
+        if "allowed_callers" in tool or "output_schema" in tool:
+            raise ValueError(f"Anthropic tool {index} uses Programmatic Tool Calling fields that cannot be preserved")
+        if "defer_loading" in tool:
+            raise ValueError(f"Anthropic tool {index} field defer_loading is not supported by the Codex OAuth backend")
+        for field in ("eager_input_streaming",):
             value = tool.get(field)
-            if value is not None and value is not False:
+            if value is not None:
                 raise ValueError(f"Anthropic tool {index} field {field} is not supported by the Codex OAuth backend")
         name = tool.get("name")
-        if not name:
-            continue
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Anthropic tool {index} requires a non-empty name")
         if _is_anthropic_web_search_tool(tool):
-            result.append(
-                ToolSchema(
-                    name="web_search",
-                    description="Anthropic hosted web search",
-                    parameters=_anthropic_web_search_parameters(tool),
-                )
+            raise ValueError(
+                "Anthropic hosted web_search cannot be represented losslessly by this facade"
             )
-            continue
+        tool_type = tool.get("type", "custom")
+        if tool_type is not None and tool_type != "custom":
+            raise ValueError(f"Anthropic tool {index} type must be 'custom' or null")
+        _reject_unknown_fields(
+            tool,
+            {
+                "type",
+                "name",
+                "description",
+                "input_schema",
+                "strict",
+                "defer_loading",
+                "eager_input_streaming",
+                "allowed_callers",
+                "output_schema",
+            },
+            f"Anthropic tool {index}",
+        )
         result.append(
             ToolSchema(
-                name=str(name),
-                description=str(tool.get("description") or ""),
-                parameters=tool.get("input_schema") or {},
+                name=name,
+                description=_optional_tool_description(tool, index),
+                parameters=_required_tool_schema(tool, index),
+                strict=_tool_strict(tool, index),
             )
         )
     return result
@@ -247,12 +355,17 @@ def _anthropic_image_url(source: object) -> str:
         raise ValueError("Anthropic image source must be an object")
     source_type = source.get("type")
     if source_type == "base64":
-        media_type = source.get("media_type", "image/png")
+        _reject_unknown_fields(source, {"type", "media_type", "data"}, "Anthropic image source")
+        media_type = source.get("media_type")
         data = source.get("data")
-        if isinstance(media_type, str) and isinstance(data, str) and data:
+        if media_type in {"image/jpeg", "image/png", "image/gif", "image/webp"} and isinstance(data, str) and data:
             return f"data:{media_type};base64,{data}"
-        raise ValueError("Anthropic base64 image source requires non-empty data")
+        raise ValueError(
+            "Anthropic base64 image source media_type must be one of: "
+            "image/jpeg, image/png, image/gif, image/webp, and data must be non-empty"
+        )
     if source_type == "url":
+        _reject_unknown_fields(source, {"type", "url"}, "Anthropic image source")
         url = source.get("url")
         if isinstance(url, str) and url:
             return url
@@ -260,76 +373,117 @@ def _anthropic_image_url(source: object) -> str:
     raise ValueError("Anthropic image source type must be base64 or url")
 
 
+def _optional_tool_description(tool: dict[str, Any], index: int) -> str | None:
+    if "description" not in tool:
+        return None
+    description = tool["description"]
+    if not isinstance(description, str):
+        raise ValueError(f"Anthropic tool {index} description must be a string")
+    return description
+
+
+def _tool_strict(tool: dict[str, Any], index: int) -> bool:
+    if "strict" not in tool:
+        return False
+    strict = tool["strict"]
+    if not isinstance(strict, bool):
+        raise ValueError(f"Anthropic tool {index} strict must be a boolean")
+    return strict
+
+
+def _required_tool_schema(tool: dict[str, Any], index: int) -> dict[str, Any]:
+    schema = tool.get("input_schema")
+    if not isinstance(schema, dict):
+        raise ValueError(f"Anthropic tool {index} input_schema must be an object")
+    return schema
+
+
 def _is_anthropic_web_search_tool(tool: dict[str, Any]) -> bool:
     return (
         tool.get("name") == "web_search"
         and isinstance(tool.get("type"), str)
-        and (tool["type"] == "web_search" or tool["type"].startswith("web_search_"))
+        and tool["type"] in {"web_search", "web_search_20250305", "web_search_20260209"}
     )
-
-
-def _string_list(value: Any) -> list[str] | None:
-    if not isinstance(value, list):
-        return None
-    out = [v for v in value if isinstance(v, str) and v]
-    return out or None
-
-
-def _anthropic_web_search_parameters(tool: dict[str, Any]) -> dict[str, Any]:
-    if _string_list(tool.get("blocked_domains")):
-        raise ValueError(
-            "Anthropic web_search blocked_domains is not supported by OpenAI Responses web_search; "
-            "use allowed_domains instead"
-        )
-
-    openai_tool: dict[str, Any] = {"type": "web_search", "external_web_access": True}
-    allowed_domains = _string_list(tool.get("allowed_domains"))
-    if allowed_domains:
-        openai_tool["filters"] = {"allowed_domains": allowed_domains}
-    user_location = tool.get("user_location")
-    if isinstance(user_location, dict):
-        openai_tool["user_location"] = user_location
-
-    return {
-        "__codex_as_api_tool_type": "web_search",
-        "openai_tool": openai_tool,
-        "anthropic": {
-            "type": tool.get("type"),
-            "max_uses": tool.get("max_uses"),
-        },
-    }
 
 
 def _convert_tool_choice(tc: dict[str, Any] | None) -> str | dict | None:
     if tc is None:
         return None
+    if not isinstance(tc, dict):
+        raise ValueError("tool_choice must be an object")
     tc_type = tc.get("type")
+    if tc_type == "tool":
+        allowed = {"type", "name", "disable_parallel_tool_use"}
+    elif tc_type == "none":
+        allowed = {"type"}
+    else:
+        allowed = {"type", "disable_parallel_tool_use"}
+    _reject_unknown_fields(tc, allowed, "tool_choice")
+    anthropic_parallel_tool_calls(tc)
     if tc_type == "auto":
         return "auto"
     if tc_type == "any":
         return "required"
     if tc_type == "tool":
-        if tc.get("name") == "web_search":
-            return {"type": "web_search"}
-        return {"type": "function", "name": tc.get("name")}
+        name = tc.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.name must be a non-empty string")
+        if name == "web_search":
+            raise ValueError(
+                "Anthropic hosted web_search cannot be represented losslessly by this facade"
+            )
+        return {"type": "function", "name": name}
     if tc_type == "none":
         return "none"
-    return "auto"
+    raise ValueError("tool_choice.type must be one of: auto, any, tool, none")
 
 
-def _convert_thinking(thinking: dict[str, Any] | None) -> str | None:
+def anthropic_parallel_tool_calls(
+    tool_choice: dict[str, Any] | None,
+) -> bool | None:
+    if tool_choice is None or "disable_parallel_tool_use" not in tool_choice:
+        return None
+    value = tool_choice["disable_parallel_tool_use"]
+    if not isinstance(value, bool):
+        raise ValueError("tool_choice.disable_parallel_tool_use must be a boolean")
+    return not value
+
+
+def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -> str | None:
     if thinking is None:
         return None
-    if thinking.get("type") == "enabled":
+    if not isinstance(thinking, dict):
+        raise ValueError("thinking must be an object")
+    thinking_type = thinking.get("type")
+    if thinking_type == "enabled":
+        _reject_unknown_fields(thinking, {"type", "budget_tokens", "display"}, "thinking")
+        display = thinking.get("display")
+        if display is not None and display != "omitted":
+            raise ValueError("thinking.display must be 'omitted' when provided")
+        budget_tokens = thinking.get("budget_tokens")
+        parsed_budget_tokens = as_js_safe_integer(budget_tokens)
+        if parsed_budget_tokens is None or parsed_budget_tokens < 1024:
+            raise ValueError("thinking.budget_tokens must be an integer greater than or equal to 1024")
+        if max_tokens is not None and parsed_budget_tokens >= max_tokens:
+            raise ValueError("thinking.budget_tokens must be less than max_tokens")
         return "high"
-    if thinking.get("type") == "adaptive":
+    if thinking_type == "adaptive":
+        _reject_unknown_fields(thinking, {"type", "display"}, "thinking")
+        display = thinking.get("display")
+        if display is not None and display != "omitted":
+            raise ValueError("thinking.display must be 'omitted' when provided")
         return "medium"
-    if thinking.get("type") == "disabled":
+    if thinking_type == "disabled":
+        _reject_unknown_fields(thinking, {"type"}, "thinking")
         return "none"
-    return None
+    raise ValueError("thinking.type must be one of: enabled, adaptive, disabled")
 
 
-def _convert_reasoning_effort(thinking: dict[str, Any] | None, output_config: object) -> str | None:
+def _convert_reasoning_effort(
+    thinking: dict[str, Any] | None,
+    output_config: object,
+    max_tokens: int | None,
+) -> str | None:
     output_effort: str | None = None
     if output_config is not None:
         if not isinstance(output_config, dict):
@@ -352,7 +506,7 @@ def _convert_reasoning_effort(thinking: dict[str, Any] | None, output_config: ob
                 raise ValueError("output_config.effort must be one of: low, medium, high, xhigh, max")
             output_effort = raw_effort
 
-    thinking_effort = _convert_thinking(thinking)
+    thinking_effort = _convert_thinking(thinking, max_tokens)
     if thinking_effort == "none":
         return "none"
     return output_effort or thinking_effort
@@ -390,7 +544,7 @@ def anthropic_output_format_to_openai_text(output_format: dict[str, Any] | None)
     typ = output_format.get("type")
     if typ == "json_schema":
         schema = output_format.get("schema")
-        name = _sanitize_json_schema_name(str(output_format.get("name") or "structured_output"))
+        name = output_format.get("name", "codex_output_schema")
         fmt: dict[str, Any] = {
             "type": "json_schema",
             "name": name,
@@ -423,102 +577,66 @@ def _validate_anthropic_output_format(output_format: dict[str, Any], field: str)
         raise ValueError(f"{field}.{unknown[0]} is not supported")
     if not isinstance(output_format.get("schema"), dict):
         raise ValueError(f"{field}.schema must be an object")
-    name = output_format.get("name")
-    if name is not None and (not isinstance(name, str) or not name):
-        raise ValueError(f"{field}.name must be a non-empty string when provided")
+    name = output_format.get("name", "codex_output_schema")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise ValueError(
+            f"{field}.name must contain only ASCII letters, digits, underscores, or hyphens "
+            "and be at most 64 characters"
+        )
     description = output_format.get("description")
-    if description is not None and not isinstance(description, str):
+    if "description" in output_format and not isinstance(description, str):
         raise ValueError(f"{field}.description must be a string when provided")
     strict = output_format.get("strict")
     if strict is not None and not isinstance(strict, bool):
         raise ValueError(f"{field}.strict must be a boolean when provided")
 
 
-def _sanitize_json_schema_name(name: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in name)[:64]
-    return cleaned or "structured_output"
-
-
 def _render_anthropic_content_block(block: dict[str, Any]) -> str:
-    typ = block.get("type") if isinstance(block.get("type"), str) else "unknown"
-    if typ == "document":
-        return _render_document_block(block)
-    if typ == "search_result":
-        return _render_search_result_block(block)
-    if isinstance(typ, str) and typ.endswith("_tool_result"):
-        return _render_generic_tool_result_block(block)
-    return f"\n\n[{typ}] {_safe_json(block)}\n"
+    typ = block.get("type")
+    if not isinstance(typ, str) or not typ:
+        raise ValueError("Anthropic content block requires a non-empty type")
+    if typ in {"document", "search_result"}:
+        raise ValueError(f"Anthropic content block type {typ!r} cannot be preserved by this facade")
+    raise ValueError(f"Anthropic content block type {typ!r} is not supported by this facade")
 
 
-def _render_document_block(block: dict[str, Any]) -> str:
-    title = (
-        block.get("title")
-        if isinstance(block.get("title"), str)
-        else block.get("name")
-        if isinstance(block.get("name"), str)
-        else "document"
-    )
-    source = block.get("source")
-    body = ""
-    if isinstance(source, dict):
-        if source.get("type") == "text" and isinstance(source.get("data"), str):
-            body = source["data"]
-        elif source.get("type") == "url" and isinstance(source.get("url"), str):
-            body = source["url"]
-        elif isinstance(source.get("media_type"), str):
-            body = f"[{source['media_type']}]"
-    return f"\n\n[document: {title}]" + (f"\n{body}" if body else "") + "\n"
+def _validate_nullable_unrepresentable_field(
+    value: dict[str, Any],
+    field: str,
+    location: str,
+) -> None:
+    if field in value and value[field] is not None:
+        raise ValueError(f"{location}.{field} cannot be preserved by this facade")
 
 
-def _render_search_result_block(block: dict[str, Any]) -> str:
-    title = block.get("title") if isinstance(block.get("title"), str) else "search result"
-    url = block.get("url") if isinstance(block.get("url"), str) else ""
-    content = block.get("content") if isinstance(block.get("content"), str) else ""
-    return f"\n\n[search_result] {title}" + (f" ({url})" if url else "") + (f"\n{content}" if content else "") + "\n"
+def _validate_direct_tool_caller(block: dict[str, Any], location: str) -> None:
+    if "caller" not in block:
+        return
+    caller = block["caller"]
+    if not isinstance(caller, dict) or caller != {"type": "direct"}:
+        raise ValueError(f"{location}.caller must be exactly {{'type': 'direct'}}")
 
 
-def _render_server_tool_use_block(block: dict[str, Any]) -> str:
-    name = block.get("name") if isinstance(block.get("name"), str) else "server_tool"
-    return f"\n\n[server_tool_use: {name}] {_safe_json(block.get('input') or {})}\n"
+def _reject_unknown_fields(
+    value: dict[str, Any],
+    allowed: set[str],
+    location: str,
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"{location} contains unsupported fields: {', '.join(unknown)}")
 
 
-def _render_generic_tool_result_block(block: dict[str, Any]) -> str:
-    typ = block.get("type") if isinstance(block.get("type"), str) else "tool_result"
-    content = block.get("content")
-    if isinstance(content, list):
-        lines: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                title = item.get("title") if isinstance(item.get("title"), str) else None
-                url = item.get("url") if isinstance(item.get("url"), str) else ""
-                text = (
-                    item.get("text")
-                    if isinstance(item.get("text"), str)
-                    else item.get("content")
-                    if isinstance(item.get("content"), str)
-                    else ""
-                )
-                if title or url or text:
-                    lines.append(
-                        f"- {title or 'result'}" + (f" ({url})" if url else "") + (f": {text}" if text else "")
-                    )
-                else:
-                    lines.append(_safe_json(item))
-            else:
-                lines.append(str(item))
-        return f"\n\n[{typ}]" + (f"\n{chr(10).join(lines)}" if lines else "") + "\n"
-    if isinstance(content, dict):
-        return f"\n\n[{typ}] {_safe_json(content)}\n"
-    if isinstance(content, str):
-        return f"\n\n[{typ}]\n{content}\n"
-    return f"\n\n[{typ}]\n"
-
-
-def _safe_json(value: Any) -> str:
+def _parse_anthropic_tool_arguments(value: object) -> dict[str, Any]:
+    if not isinstance(value, str):
+        raise ChatGPTOAuthProtocolError("tool call arguments must be a JSON object string")
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        return str(value)
+        parsed = strict_json_loads(value)
+    except ValueError as exc:
+        raise ChatGPTOAuthProtocolError("tool call arguments must contain valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ChatGPTOAuthProtocolError("tool call arguments JSON must be an object")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -533,107 +651,134 @@ def internal_response_to_anthropic(
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = []
 
-    if response.reasoning_content:
-        content.append(
-            {
-                "type": "thinking",
-                "thinking": response.reasoning_content,
-                "signature": "sig-placeholder",
-            }
-        )
-
-    web_search_blocks = _web_search_blocks_from_raw(response.raw)
-    content.extend(web_search_blocks)
+    _reject_unrepresentable_response_events(response.raw)
 
     if response.content:
-        content.append({"type": "text", "text": response.content})
+        content.append({"type": "text", "text": response.content, "citations": None})
 
     for tc in response.tool_calls:
+        arguments = _parse_anthropic_tool_arguments(tc.arguments)
         content.append(
             {
                 "type": "tool_use",
                 "id": tc.id,
                 "name": tc.name,
-                "input": tc.arguments,
+                "input": arguments,
+                "caller": {"type": "direct"},
             }
         )
 
     stop_reason = _map_stop_reason(response.finish_reason, bool(response.tool_calls))
+    if response.usage is None:
+        raise ChatGPTOAuthProtocolError("provider response requires authoritative usage")
+    usage_dict = _merge_usage_extensions(
+        _anthropic_usage_from_internal(response.usage),
+        response.raw,
+    )
 
-    usage_dict: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
-    if response.usage:
-        usage_dict = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "cache_creation_input_tokens": response.usage.cache_write_tokens,
-            "cache_read_input_tokens": response.usage.cached_tokens,
-        }
-    usage_dict = _merge_server_tool_usage(usage_dict, response.raw, len(web_search_blocks) // 2)
-
-    if not content:
-        content.append({"type": "text", "text": ""})
-
-    return {
+    result: dict[str, Any] = {
         "id": request_id,
         "type": "message",
         "role": "assistant",
         "model": model,
+        "container": None,
         "content": content,
+        "context_management": None,
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": usage_dict,
     }
+    if response.reasoning_content:
+        result["codex_reasoning"] = response.reasoning_content
+    return result
 
 
-def _web_search_blocks_from_raw(raw: dict | None) -> list[dict[str, Any]]:
-    events = raw.get("events") if isinstance(raw, dict) else None
-    if not isinstance(events, list):
+def _raw_response_events(raw: dict | None) -> list[dict[str, Any]]:
+    if raw is None:
         return []
-    blocks: list[dict[str, Any]] = []
-    for event in events:
-        if not isinstance(event, dict) or event.get("type") != "web_search_call":
-            continue
-        tool_id = str(event.get("id") or f"srvtoolu_{len(blocks) // 2}")
-        input_obj = event.get("input") if isinstance(event.get("input"), dict) else {"query": ""}
-        result_content = event.get("content") if isinstance(event.get("content"), list) else []
-        blocks.append({"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": input_obj})
-        blocks.append({"type": "web_search_tool_result", "tool_use_id": tool_id, "content": result_content})
-    return blocks
+    if not isinstance(raw, dict):
+        raise ChatGPTOAuthProtocolError("provider raw response must be an object")
+    events = raw.get("events")
+    if not isinstance(events, list):
+        raise ChatGPTOAuthProtocolError("provider raw response requires an events array")
+    validated: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ChatGPTOAuthProtocolError(f"provider raw event {index} must be an object")
+        if not isinstance(event.get("type"), str) or not event["type"]:
+            raise ChatGPTOAuthProtocolError(f"provider raw event {index} requires a non-empty string type")
+        validated.append(event)
+    return validated
 
 
-def _merge_server_tool_usage(
+def _reject_unrepresentable_response_events(raw: dict | None) -> None:
+    if any(event.get("type") == "web_search_call" for event in _raw_response_events(raw)):
+        raise ChatGPTOAuthProtocolError(
+            "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
+        )
+
+
+def _anthropic_usage_from_internal(usage: Usage) -> dict[str, Any]:
+    return {
+        "cache_creation": None,
+        "cache_creation_input_tokens": usage.cache_write_tokens,
+        "cache_read_input_tokens": usage.cached_tokens,
+        "inference_geo": None,
+        "input_tokens": usage.prompt_tokens,
+        "iterations": None,
+        "output_tokens": usage.completion_tokens,
+        "server_tool_use": None,
+        "service_tier": None,
+        "speed": None,
+    }
+
+
+def _merge_usage_extensions(
     usage: dict[str, Any],
     raw: dict | None,
-    web_search_requests: int,
 ) -> dict[str, Any]:
-    events = raw.get("events") if isinstance(raw, dict) else None
-    if isinstance(events, list):
-        for event in events:
-            if not isinstance(event, dict) or event.get("type") != "finish":
+    for event in _raw_response_events(raw):
+        if event.get("type") != "finish":
+            continue
+        raw_usage = event.get("usage")
+        if raw_usage is None:
+            continue
+        if not isinstance(raw_usage, dict):
+            raise ChatGPTOAuthProtocolError("provider finish event usage must be an object")
+        for key, required_fields in (
+            ("cache_creation", {"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"}),
+            ("server_tool_use", {"web_search_requests", "web_fetch_requests"}),
+        ):
+            value = raw_usage.get(key)
+            if value is None:
                 continue
-            raw_usage = event.get("usage")
-            if isinstance(raw_usage, dict) and "server_tool_use" in raw_usage:
-                usage["server_tool_use"] = raw_usage["server_tool_use"]
-                return usage
-    if web_search_requests > 0 and "server_tool_use" not in usage:
-        usage["server_tool_use"] = {"web_search_requests": web_search_requests}
+            if not isinstance(value, dict):
+                raise ChatGPTOAuthProtocolError(f"provider usage {key} must be an object or null")
+            _validate_usage_counter_object(value, key, required_fields)
+            usage[key] = value
+        service_tier = raw_usage.get("service_tier")
+        if service_tier is not None:
+            if service_tier not in {"standard", "priority", "batch"}:
+                raise ChatGPTOAuthProtocolError(
+                    "provider usage service_tier must be standard, priority, batch, or null"
+                )
+            usage["service_tier"] = service_tier
+        return usage
     return usage
 
 
-def _map_stop_reason(finish_reason: str, has_tool_calls: bool) -> str:
-    if has_tool_calls:
+def _map_stop_reason(finish_reason: str | None, has_tool_calls: bool) -> str:
+    if finish_reason not in {None, "stop", "tool_calls"}:
+        raise ChatGPTOAuthProtocolError(f"unsupported provider finish_reason {finish_reason!r}")
+    if finish_reason is None:
+        raise ChatGPTOAuthProtocolError("provider response requires a non-null finish_reason")
+    if finish_reason == "tool_calls":
+        if not has_tool_calls:
+            raise ChatGPTOAuthProtocolError("provider finish_reason tool_calls requires at least one tool call")
         return "tool_use"
-    mapping = {
-        "stop": "end_turn",
-        "length": "max_tokens",
-        "max_tokens": "max_tokens",
-        "tool_calls": "tool_use",
-        "tool_use": "tool_use",
-        "stop_sequence": "stop_sequence",
-        "pause_turn": "pause_turn",
-        "refusal": "refusal",
-    }
-    return mapping.get(finish_reason, "end_turn")
+    if has_tool_calls:
+        raise ChatGPTOAuthProtocolError("provider finish_reason stop conflicts with emitted tool calls")
+    return "end_turn"
 
 
 # ---------------------------------------------------------------------------
@@ -647,11 +792,11 @@ def anthropic_stream_adapter(
     request_id: str,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
-    yield _message_start_sse(model, request_id, {"input_tokens": 0, "output_tokens": 0})
+    yield _message_start_sse(model, request_id)
     yield from _render_anthropic_stream_events(event_stream)
 
 
-def _message_start_sse(model: str, request_id: str, usage: dict[str, Any]) -> str:
+def _message_start_sse(model: str, request_id: str) -> str:
     return _sse(
         "message_start",
         {
@@ -661,96 +806,160 @@ def _message_start_sse(model: str, request_id: str, usage: dict[str, Any]) -> st
                 "type": "message",
                 "role": "assistant",
                 "model": model,
+                "container": None,
                 "content": [],
+                "context_management": None,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": usage,
             },
         },
     )
 
 
-def _num(value: Any) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+def _usage_int(value: Any, field: str, *, required: bool = False) -> int | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        requirement = "a non-negative integer"
+        raise ChatGPTOAuthProtocolError(f"provider usage {field} must be {requirement}")
+    return value
 
 
 def _anthropic_usage_from_provider(usage: Any) -> dict[str, Any]:
     if not isinstance(usage, dict):
-        return {"input_tokens": 0, "output_tokens": 0}
-    token_details = usage.get("input_tokens_details", usage.get("prompt_tokens_details"))
-    cache_read = _num(usage.get("cache_read_input_tokens", usage.get("cached_input_tokens")))
-    cache_write = _num(
-        usage.get(
+        raise ChatGPTOAuthProtocolError("provider finish usage must be an object")
+    unsupported_aliases = sorted(
+        set(usage)
+        & {
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
             "cache_creation_input_tokens",
-            usage.get("cache_write_tokens", usage.get("cache_write_input_tokens")),
-        )
+        }
     )
-    if cache_read == 0 and isinstance(token_details, dict):
-        cache_read = _num(token_details.get("cached_tokens"))
-    if cache_write == 0 and isinstance(token_details, dict):
-        cache_write = _num(token_details.get("cache_write_tokens"))
+    if unsupported_aliases:
+        raise ChatGPTOAuthProtocolError(
+            "provider finish usage contains unsupported public aliases: " + ", ".join(unsupported_aliases)
+        )
+    token_details = usage.get("input_tokens_details")
+    if token_details is not None and not isinstance(token_details, dict):
+        raise ChatGPTOAuthProtocolError("provider usage input token details must be an object or null")
+    cache_read: int | None = None
+    cache_write: int | None = None
+    if isinstance(token_details, dict):
+        has_detail_cache_write = "cache_write_tokens" in token_details
+        detail_cache_read = _usage_int(
+            token_details.get("cached_tokens"),
+            "cached_tokens",
+            required=True,
+        )
+        detail_cache_write = _usage_int(
+            token_details.get("cache_write_tokens"),
+            "cache_write_tokens",
+            required=has_detail_cache_write,
+        )
+        cache_read = detail_cache_read
+        if has_detail_cache_write:
+            cache_write = detail_cache_write
+    input_tokens = _usage_int(
+        usage.get("input_tokens"),
+        "input_tokens",
+        required=True,
+    )
+    output_tokens = _usage_int(
+        usage.get("output_tokens"),
+        "output_tokens",
+        required=True,
+    )
+    total_tokens = _usage_int(
+        usage.get("total_tokens"),
+        "total_tokens",
+        required=True,
+    )
+    if input_tokens is None or output_tokens is None or total_tokens is None:
+        raise ChatGPTOAuthProtocolError("provider usage must include input_tokens, output_tokens, and total_tokens")
+    if total_tokens != input_tokens + output_tokens:
+        raise ChatGPTOAuthProtocolError("provider usage total_tokens must equal input_tokens plus output_tokens")
+    server_tool_use = usage.get("server_tool_use")
+    if server_tool_use is not None:
+        if not isinstance(server_tool_use, dict):
+            raise ChatGPTOAuthProtocolError("provider usage server_tool_use must be an object or null")
+        _validate_usage_counter_object(
+            server_tool_use,
+            "server_tool_use",
+            {"web_search_requests", "web_fetch_requests"},
+        )
+    cache_creation = usage.get("cache_creation")
+    if cache_creation is not None:
+        if not isinstance(cache_creation, dict):
+            raise ChatGPTOAuthProtocolError("provider usage cache_creation must be an object or null")
+        _validate_usage_counter_object(
+            cache_creation,
+            "cache_creation",
+            {"ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"},
+        )
+    service_tier = usage.get("service_tier")
+    if service_tier is not None and (
+        not isinstance(service_tier, str) or service_tier not in {"standard", "priority", "batch"}
+    ):
+        raise ChatGPTOAuthProtocolError(
+            "provider usage service_tier must be standard, priority, batch, or null"
+        )
     out: dict[str, Any] = {
-        "input_tokens": _num(usage.get("input_tokens", usage.get("prompt_tokens"))),
-        "output_tokens": _num(usage.get("output_tokens", usage.get("completion_tokens"))),
         "cache_creation_input_tokens": cache_write,
         "cache_read_input_tokens": cache_read,
+        "input_tokens": input_tokens,
+        "iterations": None,
+        "output_tokens": output_tokens,
+        "server_tool_use": server_tool_use,
     }
-    for key in ("cache_creation", "server_tool_use", "service_tier"):
-        if key in usage:
-            out[key] = usage[key]
     return out
+
+
+def _validate_usage_counter_object(
+    value: dict[str, Any],
+    field: str,
+    required_fields: set[str],
+) -> None:
+    unknown = sorted(set(value) - required_fields)
+    if unknown:
+        raise ChatGPTOAuthProtocolError(f"provider usage {field} contains unsupported fields: " + ", ".join(unknown))
+    missing = sorted(required_fields - set(value))
+    if missing:
+        raise ChatGPTOAuthProtocolError(f"provider usage {field} is missing required fields: " + ", ".join(missing))
+    for name, counter in value.items():
+        if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+            raise ChatGPTOAuthProtocolError(f"provider usage {field}.{name} must be a non-negative integer")
 
 
 def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterator[str]:
     block_index = 0
-    current_block: str | None = None  # "thinking", "text", "tool_use"
-    has_any_content = False
-    web_search_requests = 0
+    current_block: str | None = None
+    has_tool_calls = False
 
     for event in events:
+        if not isinstance(event, dict):
+            raise ChatGPTOAuthProtocolError("provider stream event must be an object")
         typ = event.get("type")
 
         if typ in ("reasoning_delta", "reasoning_raw_delta"):
-            has_any_content = True
-            text = str(event.get("text", ""))
-            if current_block != "thinking":
-                if current_block is not None:
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
-                    block_index += 1
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-                    },
-                )
-                current_block = "thinking"
+            text = event.get("text")
+            if not isinstance(text, str):
+                raise ChatGPTOAuthProtocolError(f"provider {typ} event requires string text")
             yield _sse(
-                "content_block_delta",
+                "codex_reasoning_delta",
                 {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "thinking_delta", "thinking": text},
+                    "type": "codex_reasoning_delta",
+                    "delta": text,
                 },
             )
 
         elif typ == "content":
-            has_any_content = True
-            text = str(event.get("text", ""))
-            if current_block == "thinking":
-                # Close thinking block, emit signature
-                yield _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                    },
-                )
-                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
-                block_index += 1
-                current_block = None
+            text = event.get("text")
+            if not isinstance(text, str):
+                raise ChatGPTOAuthProtocolError("provider content event requires string text")
             if current_block != "text":
                 if current_block is not None:
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
@@ -760,7 +969,7 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
                     {
                         "type": "content_block_start",
                         "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
+                        "content_block": {"type": "text", "text": "", "citations": None},
                     },
                 )
                 current_block = "text"
@@ -774,28 +983,30 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             )
 
         elif typ == "tool_call":
-            has_any_content = True
+            has_tool_calls = True
             if current_block is not None:
-                if current_block == "thinking":
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                        },
-                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 block_index += 1
-            tool_id = str(event.get("id", ""))
-            tool_name = str(event.get("name", ""))
-            tool_args = event.get("arguments") or {}
+            tool_id = event.get("id")
+            tool_name = event.get("name")
+            tool_args = event.get("arguments")
+            if not isinstance(tool_id, str):
+                raise ChatGPTOAuthProtocolError("provider tool_call event requires a string id")
+            if not isinstance(tool_name, str):
+                raise ChatGPTOAuthProtocolError("provider tool_call event requires a string name")
+            _parse_anthropic_tool_arguments(tool_args)
             yield _sse(
                 "content_block_start",
                 {
                     "type": "content_block_start",
                     "index": block_index,
-                    "content_block": {"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}},
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "input": {},
+                        "caller": {"type": "direct"},
+                    },
                 },
             )
             yield _sse(
@@ -803,7 +1014,7 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
                 {
                     "type": "content_block_delta",
                     "index": block_index,
-                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_args, ensure_ascii=False)},
+                    "delta": {"type": "input_json_delta", "partial_json": tool_args},
                 },
             )
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
@@ -811,103 +1022,38 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             current_block = None
 
         elif typ == "web_search_call":
-            has_any_content = True
-            web_search_requests += 1
-            if current_block is not None:
-                if current_block == "thinking":
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                        },
-                    )
-                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
-                block_index += 1
-            tool_id = str(event.get("id") or "")
-            tool_input = event.get("input") if isinstance(event.get("input"), dict) else {"query": ""}
-            result_content = event.get("content") if isinstance(event.get("content"), list) else []
-            yield _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {"type": "server_tool_use", "id": tool_id, "name": "web_search", "input": {}},
-                },
+            raise ChatGPTOAuthProtocolError(
+                "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
             )
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)},
-                },
-            )
-            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
-            block_index += 1
-            yield _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "web_search_tool_result",
-                        "tool_use_id": tool_id,
-                        "content": result_content,
-                    },
-                },
-            )
-            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
-            block_index += 1
-            current_block = None
+
+        elif typ == "reasoning_section_break":
+            continue
 
         elif typ == "finish":
             if current_block is not None:
-                if current_block == "thinking":
-                    yield _sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "signature_delta", "signature": "sig-placeholder"},
-                        },
-                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 current_block = None
 
-            if not has_any_content:
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            finish_reason = event.get("finish_reason")
+            if finish_reason is not None and (not isinstance(finish_reason, str) or not finish_reason):
+                raise ChatGPTOAuthProtocolError("provider finish event finish_reason must be non-empty or null")
+            stop_reason = _map_stop_reason(finish_reason, has_tool_calls)
+            usage = _anthropic_usage_from_provider(event.get("usage"))
 
-            finish_reason = str(event.get("finish_reason") or "stop")
-            stop_reason = _map_stop_reason(finish_reason, False)
-
-            yield _sse(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": _usage_with_synthesized_web_search(
-                        _anthropic_usage_from_provider(event.get("usage")),
-                        web_search_requests,
-                    ),
-                },
-            )
+            message_delta: dict[str, Any] = {
+                "type": "message_delta",
+                "context_management": None,
+                "delta": {"container": None, "stop_reason": stop_reason, "stop_sequence": None},
+                "usage": usage,
+            }
+            yield _sse("message_delta", message_delta)
             yield _sse("message_stop", {"type": "message_stop"})
+            return
 
+        else:
+            raise ChatGPTOAuthProtocolError(f"unsupported normalized response event type {typ!r}")
 
-def _usage_with_synthesized_web_search(usage: dict[str, Any], web_search_requests: int) -> dict[str, Any]:
-    if web_search_requests > 0 and "server_tool_use" not in usage:
-        usage["server_tool_use"] = {"web_search_requests": web_search_requests}
-    return usage
+    raise ChatGPTOAuthProtocolError("provider stream ended without a finish event")
 
 
 def _sse(event_type: str, data: dict[str, Any]) -> str:

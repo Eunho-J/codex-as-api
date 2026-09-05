@@ -18,6 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/check_package_versions.py --tag "$GITHUB_REF_NAME"
+      - run: python scripts/check_no_static_model_catalog.py config src ts/src rust/src
 
   python:
     name: Test and package Python
@@ -26,18 +27,47 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.11"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install build -e ".[server,dev]"
+      - run: python -m pip install build==1.5.0 -e ".[dev]"
       - run: python -m pytest
-      - run: python -m mypy src
+      - run: python -m mypy src scripts/check_registry_release.py
       - run: python -m ruff check .
       - run: python -m build --outdir dist
+      - name: Verify base wheel installs a runnable server
+        run: |
+          python -m venv /tmp/codex-as-api-wheel
+          /tmp/codex-as-api-wheel/bin/python -m pip install --disable-pip-version-check dist/*.whl
+          /tmp/codex-as-api-wheel/bin/python -c "from codex_as_api.server import app; assert app is not None"
+          test -x /tmp/codex-as-api-wheel/bin/codex-as-api
+          set +e
+          CODEX_AS_API_PORT=0 /tmp/codex-as-api-wheel/bin/codex-as-api
+          smoke_status=$?
+          set -e
+          test "$smoke_status" -eq 1
+      - name: Inspect Python release artifacts
+        run: |
+          python scripts/check_no_static_model_catalog.py dist/*.whl dist/*.tar.gz
+          python scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --python-dist dist/*.whl dist/*.tar.gz
+      - name: Run release validators from the source distribution
+        run: |
+          extract_dir="$(mktemp -d)"
+          python -m tarfile -e dist/codex_as_api-*.tar.gz "$extract_dir"
+          python -m pytest -q \
+            "$extract_dir"/codex_as_api-*/tests/test_no_static_model_catalog.py \
+            "$extract_dir"/codex_as_api-*/tests/test_package_versions.py \
+            "$extract_dir"/codex_as_api-*/tests/test_registry_release.py \
+            "$extract_dir"/codex_as_api-*/tests/test_release_artifacts.py \
+            "$extract_dir"/codex_as_api-*/tests/test_rust_third_party_notices.py
       - uses: actions/upload-artifact@v4
         with:
           name: python-dist
-          path: dist/*
+          path: |
+            dist/codex_as_api-*.whl
+            dist/codex_as_api-*.tar.gz
           if-no-files-found: error
 
   typescript:
@@ -50,17 +80,57 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.14.0"
           cache: npm
           cache-dependency-path: ts/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install --global npm@11.19.1
       - run: npm ci
       - run: npm test
+      - run: npm run typecheck
       - run: npm run build
-      - run: npm pack
+      - name: Pack npmjs and GitHub Packages artifacts
+        run: |
+          mkdir -p ../dist/npm ../dist/github
+          npm pack --ignore-scripts --pack-destination ../dist/npm
+          npm pkg set name="@eunho-j/codex-as-api"
+          npm pack --ignore-scripts --pack-destination ../dist/github
+          python ../scripts/check_no_static_model_catalog.py ../dist/npm/*.tgz ../dist/github/*.tgz
+          python ../scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --npm-tarball ../dist/npm/codex-as-api-*.tgz \
+            --github-npm-tarball ../dist/github/eunho-j-codex-as-api-*.tgz
+      - name: Install and smoke-test the exact npm archives
+        run: |
+          unscoped_dir="$(mktemp -d)"
+          scoped_dir="$(mktemp -d)"
+          npm install --ignore-scripts --prefix "$unscoped_dir" ../dist/npm/codex-as-api-*.tgz
+          npm install --ignore-scripts --prefix "$scoped_dir" ../dist/github/eunho-j-codex-as-api-*.tgz
+          pushd "$unscoped_dir"
+          node --input-type=module -e "await import('codex-as-api')"
+          popd
+          pushd "$scoped_dir"
+          node --input-type=module -e "await import('@eunho-j/codex-as-api')"
+          popd
+          set +e
+          CODEX_AS_API_PORT=0 "$unscoped_dir/node_modules/.bin/codex-as-api"
+          unscoped_status=$?
+          CODEX_AS_API_PORT=0 "$scoped_dir/node_modules/.bin/codex-as-api"
+          scoped_status=$?
+          set -e
+          test "$unscoped_status" -eq 1
+          test "$scoped_status" -eq 1
       - uses: actions/upload-artifact@v4
         with:
           name: npm-tarball
-          path: ts/*.tgz
+          path: dist/npm/codex-as-api-*.tgz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: github-packages-tarball
+          path: dist/github/eunho-j-codex-as-api-*.tgz
           if-no-files-found: error
 
   rust:
@@ -87,22 +157,50 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable Rust with required components
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - run: rustup default stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned Rust with required components
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - run: rustup default 1.96.0
       - name: Check Rust formatting and linting
         if: matrix.checks
         run: |
           cargo fmt --check
-          cargo clippy --locked --all-targets
+          cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test Rust
         if: matrix.checks
-        run: cargo test --locked
+        run: cargo test --locked --all-targets --all-features
+      - name: Verify locked Rust dependency notices
+        if: matrix.checks
+        run: python ../scripts/generate_rust_third_party_notices.py --check
+      - name: Verify atomic auth replacement on Windows
+        if: matrix.platform == 'windows'
+        run: cargo test --locked auth::tests
       - run: cargo build --locked --release
+      - name: Package and inspect the Rust release archive
+        shell: bash
+        run: |
+          set +e
+          CODEX_AS_API_PORT=0 "target/release/${{ matrix.binary }}"
+          smoke_status=$?
+          set -e
+          test "$smoke_status" -eq 2
+          python ../scripts/package_rust_release.py \
+            --binary "target/release/${{ matrix.binary }}" \
+            --platform "${{ matrix.platform }}" \
+            --version "${GITHUB_REF_NAME#v}" \
+            --output-dir ../dist/rust
+          python ../scripts/check_no_static_model_catalog.py \
+            "../dist/rust/codex-as-api-${GITHUB_REF_NAME#v}-${{ matrix.platform }}.zip"
+          python ../scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --rust-archive "${{ matrix.platform }}" \
+              "../dist/rust/codex-as-api-${GITHUB_REF_NAME#v}-${{ matrix.platform }}.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: rust-${{ matrix.platform }}-binary
-          path: rust/target/release/${{ matrix.binary }}
+          name: rust-${{ matrix.platform }}-archive
+          path: dist/rust/codex-as-api-*-${{ matrix.platform }}.zip
           if-no-files-found: error
 
   publish-pypi:
@@ -113,84 +211,212 @@ jobs:
       name: pypi
       url: https://pypi.org/p/codex-as-api
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           name: python-dist
-          path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          path: dist/python
+      - name: Verify downloaded Python artifacts
+        run: |
+          python scripts/check_no_static_model_catalog.py dist/python/*.whl dist/python/*.tar.gz
+          python scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --python-dist dist/python/*.whl dist/python/*.tar.gz
+      - name: Check whether exact Python artifacts are already on PyPI
+        id: pypi_state
+        run: |
+          python scripts/check_registry_release.py pypi \
+            --package codex-as-api \
+            --version "${GITHUB_REF_NAME#v}" \
+            --artifact dist/python/*.whl dist/python/*.tar.gz
+      - name: Publish Python artifacts
+        if: steps.pypi_state.outputs.published != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: dist/python
 
   publish-npm:
     name: Publish npm package
-    needs: [versions, python, typescript, rust]
+    needs: publish-pypi
     runs-on: ubuntu-latest
     environment:
       name: npm
       url: https://www.npmjs.com/package/codex-as-api
     permissions:
+      contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           name: npm-tarball
-          path: dist
+          path: dist/npmjs
       - uses: actions/setup-node@v4
         with:
           node-version: "22.14.0"
           registry-url: https://registry.npmjs.org
-      - run: npm install --global npm@^11.15
-      - run: npm publish --access public ./dist/*.tgz
+      - run: npm install --global npm@11.19.1
+      - name: Verify downloaded npmjs artifact
+        run: |
+          python scripts/check_no_static_model_catalog.py dist/npmjs/codex-as-api-*.tgz
+          python scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --npm-tarball dist/npmjs/codex-as-api-*.tgz
+      - name: Check whether the exact npmjs artifact is already published
+        id: npmjs_state
+        run: |
+          python scripts/check_registry_release.py npm \
+            --registry https://registry.npmjs.org \
+            --package codex-as-api \
+            --version "${GITHUB_REF_NAME#v}" \
+            --artifact dist/npmjs/codex-as-api-*.tgz
+      - name: Publish npmjs artifact
+        if: steps.npmjs_state.outputs.published != 'true'
+        run: npm publish --access public ./dist/npmjs/codex-as-api-*.tgz
 
   publish-github-packages:
     name: Publish scoped npm package to GitHub Packages
-    needs: [versions, python, typescript, rust]
+    needs: publish-npm
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    defaults:
-      run:
-        working-directory: ts
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: github-packages-tarball
+          path: dist/github
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.14.0"
           registry-url: https://npm.pkg.github.com
           scope: "@eunho-j"
-          cache: npm
-          cache-dependency-path: ts/package-lock.json
-      - run: npm ci
-      - run: npm run build
-      - run: npm pkg set name="@eunho-j/codex-as-api"
-      - run: npm publish --registry=https://npm.pkg.github.com
+      - run: npm install --global npm@11.19.1
+      - name: Verify downloaded GitHub Packages artifact
+        run: |
+          python scripts/check_no_static_model_catalog.py dist/github/eunho-j-codex-as-api-*.tgz
+          python scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --github-npm-tarball dist/github/eunho-j-codex-as-api-*.tgz
+      - name: Check whether the exact GitHub Packages artifact is already published
+        id: github_packages_state
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/check_registry_release.py npm \
+            --registry https://npm.pkg.github.com \
+            --package @eunho-j/codex-as-api \
+            --version "${GITHUB_REF_NAME#v}" \
+            --artifact dist/github/eunho-j-codex-as-api-*.tgz \
+            --token-env NODE_AUTH_TOKEN \
+            --packument
+      - name: Publish GitHub Packages artifact
+        if: steps.github_packages_state.outputs.published != 'true'
+        run: npm publish --registry=https://npm.pkg.github.com ./dist/github/eunho-j-codex-as-api-*.tgz
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
 
   github-release:
     name: Create GitHub Release
-    needs: [publish-pypi, publish-npm, publish-github-packages]
+    needs: publish-github-packages
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
-      - name: Create release with all package artifacts
+      - name: Verify downloaded package artifacts
+        run: |
+          python scripts/check_no_static_model_catalog.py \
+            release-artifacts/python-dist/*.whl \
+            release-artifacts/python-dist/*.tar.gz \
+            release-artifacts/npm-tarball/codex-as-api-*.tgz \
+            release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz \
+            release-artifacts/rust-linux-archive/*.zip \
+            release-artifacts/rust-macos-archive/*.zip \
+            release-artifacts/rust-windows-archive/*.zip
+          python scripts/check_release_artifacts.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --python-dist \
+              release-artifacts/python-dist/*.whl \
+              release-artifacts/python-dist/*.tar.gz \
+            --npm-tarball release-artifacts/npm-tarball/codex-as-api-*.tgz \
+            --github-npm-tarball release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz \
+            --rust-archive linux release-artifacts/rust-linux-archive/*.zip \
+            --rust-archive macos release-artifacts/rust-macos-archive/*.zip \
+            --rust-archive windows release-artifacts/rust-windows-archive/*.zip
+      - name: Prepare release assets
+        run: |
+          mkdir release-assets
+          cp release-artifacts/python-dist/codex_as_api-*.whl release-assets/
+          cp release-artifacts/python-dist/codex_as_api-*.tar.gz release-assets/
+          cp release-artifacts/npm-tarball/codex-as-api-*.tgz release-assets/
+          cp release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz release-assets/
+          cp release-artifacts/rust-linux-archive/*.zip release-assets/
+          cp release-artifacts/rust-macos-archive/*.zip release-assets/
+          cp release-artifacts/rust-windows-archive/*.zip release-assets/
+          test "$(find release-assets -type f | wc -l)" -eq 7
+      - name: Check whether the GitHub Release already exists
+        id: github_release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/check_registry_release.py github-release \
+            --repository "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME"
+      - name: Create GitHub Release metadata
+        if: steps.github_release_state.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+      - name: Align existing GitHub Release title
+        if: steps.github_release_state.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --draft=false --prerelease=false
+      - name: Remove release assets outside the exact local set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/check_registry_release.py github-release-assets \
+            --repository "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --mode prune \
+            --asset release-assets/*
+      - name: Upload the exact release asset set
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mkdir release-assets
-          cp release-artifacts/python-dist/* release-assets/
-          cp release-artifacts/npm-tarball/* release-assets/
-          cp release-artifacts/rust-linux-binary/codex-as-api release-assets/codex-as-api-linux
-          cp release-artifacts/rust-macos-binary/codex-as-api release-assets/codex-as-api-macos
-          cp release-artifacts/rust-windows-binary/codex-as-api.exe release-assets/codex-as-api-windows.exe
           mapfile -d '' files < <(find release-assets -type f -print0)
-          test "${#files[@]}" -gt 0
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "${files[@]}"
+          test "${#files[@]}" -eq 7
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+      - name: Verify remote release asset names and SHA-256 digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/check_registry_release.py github-release-assets \
+            --repository "${{ github.repository }}" \
+            --tag "$GITHUB_REF_NAME" \
+            --mode verify \
+            --asset release-assets/*

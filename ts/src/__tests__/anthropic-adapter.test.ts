@@ -6,6 +6,10 @@ import {
   anthropicStreamAdapter,
   formatAnthropicError,
 } from "../anthropic-adapter.js";
+import {
+  ChatGPTOAuthInvalidRequestError,
+  ChatGPTOAuthProtocolError,
+} from "../auth.js";
 import { MessageRole } from "../messages.js";
 import type { AssistantResponse, ToolCall, Usage } from "../messages.js";
 
@@ -22,11 +26,23 @@ function makeResponse(overrides: Partial<AssistantResponse> = {}): AssistantResp
 }
 
 function makeUsage(overrides: Partial<Usage> = {}): Usage {
+  const promptTokens = overrides.prompt_tokens ?? 0;
+  const completionTokens = overrides.completion_tokens ?? 0;
   return {
-    prompt_tokens: 0,
-    completion_tokens: 0,
-    total_tokens: 0,
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: overrides.total_tokens ?? promptTokens + completionTokens,
     cached_tokens: 0,
+    ...overrides,
+  };
+}
+
+function makeStreamUsage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    input_tokens_details: { cached_tokens: 0 },
     ...overrides,
   };
 }
@@ -128,6 +144,40 @@ describe("anthropicRequestToInternal", () => {
     assert.ok(messages.every((m) => m.role === MessageRole.TOOL));
   });
 
+  it("requires tool_result tool_use_id to be a string", () => {
+    for (const block of [
+      { type: "tool_result", content: "result" },
+      { type: "tool_result", tool_use_id: null, content: "result" },
+      { type: "tool_result", tool_use_id: 1, content: "result" },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: [block] }],
+      }), /string tool_use_id/);
+    }
+  });
+
+  it("maps omitted tool_result content to empty and rejects explicit null typed fields", () => {
+    const { messages } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call-empty" }],
+      }],
+    });
+    assert.equal(messages[0].content, "");
+
+    for (const block of [
+      { type: "tool_result", tool_use_id: "call-null", content: null },
+      { type: "tool_result", tool_use_id: "call-null", content: "ok", is_error: null },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: [block] }],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
+  });
+
   it("maps direct and tool-result URL images and preserves tool errors", () => {
     const { messages } = anthropicRequestToInternal({
       model: "test",
@@ -165,7 +215,6 @@ describe("anthropicRequestToInternal", () => {
         role: MessageRole.TOOL,
         content: "[tool_error]\ntool failed",
         tool_call_id: "call-image",
-        name: "call-image",
       },
       {
         role: MessageRole.USER,
@@ -181,6 +230,8 @@ describe("anthropicRequestToInternal", () => {
       { type: "image", source: null },
       { type: "image", source: { type: "file", file_id: "file-1" } },
       { type: "image", source: { type: "base64", media_type: 42, data: "AAAA" } },
+      { type: "image", source: { type: "base64", media_type: "image/svg+xml", data: "PHN2Zz4=" } },
+      { type: "image", source: { type: "base64", media_type: "text/plain", data: "dGV4dA==" } },
       { type: "image", source: { type: "base64", media_type: "image/png", data: "" } },
       { type: "image", source: { type: "base64", media_type: "image/png" } },
       { type: "image", source: { type: "url", url: "" } },
@@ -215,7 +266,7 @@ describe("anthropicRequestToInternal", () => {
           }],
         }],
       }),
-      /Anthropic base64 image source requires a string media_type/,
+      ChatGPTOAuthInvalidRequestError,
     );
   });
 
@@ -235,18 +286,48 @@ describe("anthropicRequestToInternal", () => {
         role: "assistant",
         content: [
           { type: "text", text: "Let me check." },
-          { type: "tool_use", id: "tc-1", name: "get_weather", input: { city: "Seoul" } },
+          {
+            type: "tool_use",
+            id: "tc-1",
+            name: "get_weather",
+            input: { city: "Seoul" },
+            caller: { type: "direct" },
+          },
         ],
       }],
     });
     assert.equal(messages[0].content, "Let me check.");
     assert.equal(messages[0].tool_calls?.length, 1);
     assert.equal(messages[0].tool_calls?.[0].name, "get_weather");
-    assert.deepEqual(messages[0].tool_calls?.[0].arguments, { city: "Seoul" });
+    assert.equal(messages[0].tool_calls?.[0].arguments, '{"city":"Seoul"}');
   });
 
-  it("assistant thinking block", () => {
-    const { messages } = anthropicRequestToInternal({
+  it("rejects non-direct or malformed tool_use caller history", () => {
+    for (const caller of [
+      null,
+      "direct",
+      {},
+      { type: "code_execution_20260120", tool_id: "srv_1" },
+      { type: "direct", extra: true },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "tc-1",
+            name: "get_weather",
+            input: { city: "Seoul" },
+            caller,
+          }],
+        }],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
+  });
+
+  it("rejects assistant thinking history that cannot be represented", () => {
+    assert.throws(() => anthropicRequestToInternal({
       model: "test",
       messages: [{
         role: "assistant",
@@ -255,13 +336,11 @@ describe("anthropicRequestToInternal", () => {
           { type: "text", text: "The answer is 42." },
         ],
       }],
-    });
-    assert.equal(messages[0].reasoning_content, "Let me think...");
-    assert.equal(messages[0].content, "The answer is 42.");
+    }), ChatGPTOAuthInvalidRequestError);
   });
 
-  it("preserves assistant server web-search history as context text", () => {
-    const { messages } = anthropicRequestToInternal({
+  it("rejects assistant server web-search history that cannot be represented", () => {
+    assert.throws(() => anthropicRequestToInternal({
       model: "test",
       messages: [{
         role: "assistant",
@@ -275,14 +354,11 @@ describe("anthropicRequestToInternal", () => {
           { type: "text", text: "Summary" },
         ],
       }],
-    });
-    assert.match(messages[0].content, /server_tool_use: web_search/);
-    assert.match(messages[0].content, /https:\/\/example.com/);
-    assert.match(messages[0].content, /Summary/);
+    }), ChatGPTOAuthInvalidRequestError);
   });
 
-  it("preserves non-text tool_result blocks as text context", () => {
-    const { messages } = anthropicRequestToInternal({
+  it("rejects non-text tool_result blocks that cannot be represented", () => {
+    assert.throws(() => anthropicRequestToInternal({
       model: "test",
       messages: [{
         role: "user",
@@ -295,10 +371,7 @@ describe("anthropicRequestToInternal", () => {
           ],
         }],
       }],
-    });
-    assert.equal(messages[0].role, MessageRole.TOOL);
-    assert.match(messages[0].content, /Docs/);
-    assert.match(messages[0].content, /document body/);
+    }), ChatGPTOAuthInvalidRequestError);
   });
 
   it("tools conversion", () => {
@@ -342,48 +415,112 @@ describe("anthropicRequestToInternal", () => {
         output_schema: { type: "object" },
       }],
     }));
+
+    assert.throws(() => anthropicRequestToInternal({
+      ...base,
+      tools: [{
+        name: "lookup",
+        input_schema: { type: "object" },
+        allowed_callers: null,
+      }],
+    }));
   });
 
-  it("rejects enabled beta tool semantics and accepts explicit no-ops", () => {
+  it("forwards function strict and rejects unsupported enabled beta semantics", () => {
     const base = {
       model: "test",
       messages: [] as Record<string, unknown>[],
     };
-    for (const field of ["strict", "defer_loading", "eager_input_streaming"] as const) {
-      assert.throws(() => anthropicRequestToInternal({
-        ...base,
-        tools: [{
-          name: "lookup",
-          input_schema: { type: "object" },
-          [field]: true,
-        }],
-      }));
+    for (const field of ["defer_loading", "eager_input_streaming"] as const) {
+      for (const value of [false, true]) {
+        assert.throws(() => anthropicRequestToInternal({
+          ...base,
+          tools: [{
+            name: "lookup",
+            input_schema: { type: "object" },
+            [field]: value,
+          }],
+        }));
+      }
     }
 
     const { tools } = anthropicRequestToInternal({
       ...base,
       tools: [{
         name: "lookup",
+        description: "",
         input_schema: { type: "object" },
-        strict: false,
-        defer_loading: null,
-        eager_input_streaming: false,
+        strict: true,
+        eager_input_streaming: null,
       }],
     });
     assert.deepEqual(tools, [{
       name: "lookup",
       description: "",
       parameters: { type: "object" },
+      strict: true,
     }]);
+
+    assert.throws(() => anthropicRequestToInternal({
+      ...base,
+      tools: [{ name: "lookup", input_schema: {}, strict: "true" }],
+    }), ChatGPTOAuthInvalidRequestError);
+    for (const invalidTool of [
+      { name: "lookup", input_schema: {}, strict: null },
+      { name: "lookup", input_schema: {}, defer_loading: null },
+      { name: "lookup", input_schema: {}, allowed_callers: null },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        ...base,
+        tools: [invalidTool],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
+  });
+
+  it("accepts omitted, custom, and null custom tool discriminators", () => {
+    for (const tool of [
+      { name: "lookup", input_schema: {} },
+      { type: "custom", name: "lookup", input_schema: {} },
+      { type: null, name: "lookup", input_schema: {} },
+    ]) {
+      const { tools } = anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [tool],
+      });
+      assert.equal(tools?.[0].name, "lookup");
+    }
+    for (const type of ["future", 1, false, {}]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type, name: "lookup", input_schema: {} }],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
   });
 
   it("tool_choice auto", () => {
-    const { toolChoice } = anthropicRequestToInternal({
+    const { toolChoice, parallelToolCalls } = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
       toolChoice: { type: "auto" },
     });
     assert.equal(toolChoice, "auto");
+    assert.equal(parallelToolCalls, undefined);
+  });
+
+  it("maps disable_parallel_tool_use to the provider parallel flag", () => {
+    for (const [disableParallel, expected] of [[true, false], [false, true]] as const) {
+      const { parallelToolCalls } = anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        toolChoice: {
+          type: "auto",
+          disable_parallel_tool_use: disableParallel,
+        },
+      });
+      assert.equal(parallelToolCalls, expected);
+    }
   });
 
   it("tool_choice any", () => {
@@ -404,56 +541,43 @@ describe("anthropicRequestToInternal", () => {
     assert.deepEqual(toolChoice, { type: "function", name: "get_weather" });
   });
 
-  it("converts Anthropic web_search server tool", () => {
-    const { tools } = anthropicRequestToInternal({
-      model: "test",
-      messages: [{ role: "user", content: "hi" }],
-      tools: [{
+  it("rejects Anthropic hosted web_search tools", () => {
+    for (const tool of [
+      { type: "web_search", name: "web_search" },
+      { type: "web_search_20250305", name: "web_search", blocked_domains: ["example.com"] },
+      {
         type: "web_search_20260209",
         name: "web_search",
         allowed_domains: ["example.com"],
         max_uses: 8,
+        strict: false,
         user_location: { type: "approximate", country: "US" },
-      }],
-    });
-    assert.ok(tools);
-    assert.equal(tools[0].name, "web_search");
-    assert.equal(tools[0].parameters.__codex_as_api_tool_type, "web_search");
-    const openaiTool = tools[0].parameters.openai_tool as Record<string, unknown>;
-    assert.equal(openaiTool.type, "web_search");
-    assert.equal(openaiTool.external_web_access, true);
-    assert.deepEqual(openaiTool.filters, { allowed_domains: ["example.com"] });
-    assert.deepEqual(openaiTool.user_location, { type: "approximate", country: "US" });
+      },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [tool],
+      }), /cannot be represented losslessly/);
+    }
   });
 
-  it("converts unsuffixed Anthropic web_search server tool", () => {
-    const { tools } = anthropicRequestToInternal({
-      model: "test",
-      messages: [{ role: "user", content: "hi" }],
-      tools: [{ type: "web_search", name: "web_search" }],
-    });
-    assert.equal(tools?.[0].parameters.__codex_as_api_tool_type, "web_search");
+  it("rejects unknown Anthropic web_search tool versions", () => {
+    for (const type of ["web_search_20240101", "web_search_future"]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type, name: "web_search" }],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
   });
 
-  it("rejects unsupported Anthropic web_search blocked_domains", () => {
+  it("rejects web_search tool_choice", () => {
     assert.throws(() => anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
-      tools: [{
-        type: "web_search_20250305",
-        name: "web_search",
-        blocked_domains: ["example.com"],
-      }],
-    }), /blocked_domains/);
-  });
-
-  it("converts web_search tool_choice to hosted tool choice", () => {
-    const { toolChoice } = anthropicRequestToInternal({
-      model: "test",
-      messages: [{ role: "user", content: "hi" }],
       toolChoice: { type: "tool", name: "web_search" },
-    });
-    assert.deepEqual(toolChoice, { type: "web_search" });
+    }), /cannot be represented losslessly/);
   });
 
   it("tool_choice none", () => {
@@ -463,6 +587,11 @@ describe("anthropicRequestToInternal", () => {
       toolChoice: { type: "none" },
     });
     assert.equal(toolChoice, "none");
+    assert.throws(() => anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      toolChoice: { type: "none", disable_parallel_tool_use: false },
+    }), ChatGPTOAuthInvalidRequestError);
   });
 
   it("thinking enabled", () => {
@@ -472,13 +601,20 @@ describe("anthropicRequestToInternal", () => {
       thinking: { type: "enabled", budget_tokens: 4096 },
     });
     assert.equal(reasoningEffort, "high");
+    const withDisplay = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      maxTokens: 4096,
+      thinking: { type: "enabled", budget_tokens: 1024, display: "omitted" },
+    });
+    assert.equal(withDisplay.reasoningEffort, "high");
   });
 
   it("thinking adaptive", () => {
     const { reasoningEffort } = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
-      thinking: { type: "adaptive" },
+      thinking: { type: "adaptive", display: "omitted" },
     });
     assert.equal(reasoningEffort, "medium");
   });
@@ -497,10 +633,41 @@ describe("anthropicRequestToInternal", () => {
       const { reasoningEffort } = anthropicRequestToInternal({
         model: "test",
         messages: [{ role: "user", content: "hi" }],
-        thinking: { type: thinkingType, display: "omitted" },
+        thinking: thinkingType === "enabled"
+          ? { type: thinkingType, budget_tokens: 4096 }
+          : { type: thinkingType },
         outputConfig: { effort: "max" },
       });
       assert.equal(reasoningEffort, "max");
+    }
+  });
+
+  it("rejects malformed thinking controls instead of repairing them", () => {
+    for (const thinking of [
+      { type: "enabled" },
+      { type: "enabled", budget_tokens: 0 },
+      { type: "enabled", budget_tokens: 1023 },
+      { type: "enabled", budget_tokens: 1024, display: "summarized" },
+      { type: "adaptive", budget_tokens: 4096 },
+      { type: "adaptive", display: "visible" },
+      { type: "disabled", budget_tokens: 4096 },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        thinking,
+      }), ChatGPTOAuthInvalidRequestError);
+    }
+  });
+
+  it("requires enabled thinking budget below max_tokens", () => {
+    for (const budgetTokens of [2048, 4096]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{ role: "user", content: "hi" }],
+        maxTokens: 2048,
+        thinking: { type: "enabled", budget_tokens: budgetTokens },
+      }), ChatGPTOAuthInvalidRequestError);
     }
   });
 
@@ -588,7 +755,42 @@ describe("anthropicRequestToInternal", () => {
         outputFormat: {
           type: "json_schema",
           schema: { type: "object" },
+          name: "my schema!",
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          name: "schéma",
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          name: "x".repeat(65),
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
           description: 42,
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          description: null,
+        },
+      },
+      {
+        outputFormat: {
+          type: "json_schema",
+          schema: { type: "object" },
+          name: null,
         },
       },
       {
@@ -601,7 +803,7 @@ describe("anthropicRequestToInternal", () => {
       {
         outputFormat: { type: "json_object" },
         outputConfig: {
-          format: { type: "json_schema", schema: { type: "object" } },
+          format: { type: "json_schema", name: "nested", schema: { type: "object" } },
         },
       },
     ];
@@ -620,7 +822,7 @@ describe("anthropicRequestToInternal", () => {
       messages: [{ role: "user", content: "hi" }],
       outputFormat: {
         type: "json_schema",
-        name: "my schema!",
+        name: "my_schema",
         description: "Answer envelope",
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
         strict: false,
@@ -629,11 +831,41 @@ describe("anthropicRequestToInternal", () => {
     assert.deepEqual(text, {
       format: {
         type: "json_schema",
-        name: "my_schema_",
+        name: "my_schema",
         description: "Answer envelope",
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
         strict: false,
       },
+    });
+  });
+
+  it("uses the pinned Codex schema name when Anthropic omits name", () => {
+    const { text } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      outputFormat: { type: "json_schema", schema: { type: "object" } },
+    });
+    assert.deepEqual(text, {
+      format: {
+        type: "json_schema",
+        name: "codex_output_schema",
+        schema: { type: "object" },
+      },
+    });
+  });
+
+  it("omits nullable json_schema strict", () => {
+    const { text } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      outputFormat: {
+        type: "json_schema",
+        schema: { type: "object" },
+        strict: null,
+      },
+    });
+    assert.deepEqual(text, {
+      format: { type: "json_schema", name: "codex_output_schema", schema: { type: "object" } },
     });
   });
 
@@ -664,6 +896,48 @@ describe("anthropicRequestToInternal", () => {
     assert.equal(messages[0].role, MessageRole.TOOL);
     assert.equal(messages[0].content, "result line 1result line 2");
   });
+
+  it("rejects nested fields and duplicate identities that would otherwise be dropped", () => {
+    const invalidRequests = [
+      { messages: [{ role: "user", content: "hi", name: "ignored" }] },
+      { messages: [{ role: "user", content: [{ type: "text", text: "hi", future: true }] }] },
+      {
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "url", url: "https://example.com/a.png", future: true },
+          }],
+        }],
+      },
+      {
+        messages: [{
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "call-1", name: "lookup", input: {} },
+            { type: "tool_use", id: "call-1", name: "lookup", input: {} },
+          ],
+        }],
+      },
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          { name: "lookup", input_schema: {} },
+          { name: "lookup", input_schema: {} },
+        ],
+      },
+      {
+        messages: [{ role: "user", content: "hi" }],
+        toolChoice: { type: "auto", disable_parallel_tool_use: null },
+      },
+    ];
+    for (const request of invalidRequests) {
+      assert.throws(
+        () => anthropicRequestToInternal({ model: "test", ...request }),
+        ChatGPTOAuthInvalidRequestError,
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -686,16 +960,80 @@ describe("internalResponseToAnthropic", () => {
     assert.equal(content.length, 1);
     assert.equal(content[0].type, "text");
     assert.equal(content[0].text, "Hello!");
+    assert.equal(content[0].citations, null);
+    assert.equal(result.container, null);
+    assert.equal(result.context_management, null);
     const usage = result.usage as Record<string, unknown>;
-    assert.equal(usage.input_tokens, 10);
-    assert.equal(usage.output_tokens, 5);
+    assert.deepEqual(usage, {
+      cache_creation: null,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: 0,
+      inference_geo: null,
+      input_tokens: 10,
+      iterations: null,
+      output_tokens: 5,
+      server_tool_use: null,
+      service_tier: null,
+      speed: null,
+    });
+  });
+
+  it("rejects a response without authoritative usage", () => {
+    assert.throws(() => internalResponseToAnthropic(
+      makeResponse({ content: "Hello", usage: null }),
+      "test-model",
+      "msg_no_usage",
+    ), /authoritative usage/);
+  });
+
+  it("rejects a null upstream finish reason", () => {
+    assert.throws(() => internalResponseToAnthropic(
+      makeResponse({ content: "pending", finish_reason: null, usage: makeUsage() }),
+      "test-model",
+      "msg_pending",
+    ), /non-null finish_reason/);
+  });
+
+  it("does not synthesize usage from raw event extensions", () => {
+    assert.throws(() => internalResponseToAnthropic(
+      makeResponse({
+        content: "Hello",
+        usage: null,
+        raw: {
+          events: [{
+            type: "finish",
+            usage: { server_tool_use: { web_search_requests: 1, web_fetch_requests: 0 } },
+          }],
+        },
+      }),
+      "test-model",
+      "msg_no_usage",
+    ), /authoritative usage/);
+  });
+
+  it("rejects malformed present raw events instead of treating them as absent", () => {
+    for (const raw of [
+      {},
+      { events: null },
+      { events: [null] },
+      { events: [{ type: "finish", usage: "unknown" }] },
+    ]) {
+      assert.throws(
+        () => internalResponseToAnthropic(
+          makeResponse({ content: "Hello", usage: makeUsage(), raw }),
+          "test-model",
+          "msg_bad_raw",
+        ),
+        ChatGPTOAuthProtocolError,
+      );
+    }
   });
 
   it("tool_use response", () => {
-    const tc: ToolCall = { id: "tc-1", name: "get_weather", arguments: { city: "Seoul" } };
+    const tc: ToolCall = { id: "tc-1", name: "get_weather", arguments: '{"city":"Seoul"}' };
     const resp = makeResponse({
       tool_calls: [tc],
-      finish_reason: "stop",
+      finish_reason: "tool_calls",
       usage: makeUsage({ prompt_tokens: 20, completion_tokens: 10 }),
     });
     const result = internalResponseToAnthropic(resp, "test-model", "msg_123");
@@ -704,6 +1042,37 @@ describe("internalResponseToAnthropic", () => {
     assert.equal(content.length, 1);
     assert.equal(content[0].type, "tool_use");
     assert.equal(content[0].name, "get_weather");
+    assert.deepEqual(content[0].caller, { type: "direct" });
+
+    const replayed = anthropicRequestToInternal({
+      model: "test-model",
+      messages: [{ role: "assistant", content }],
+    });
+    assert.deepEqual(replayed.messages[0].tool_calls, resp.tool_calls);
+  });
+
+  it("round-trips an empty tool_use id through the following tool_result", () => {
+    const tc: ToolCall = { id: "", name: "lookup", arguments: "{}" };
+    const resp = makeResponse({
+      tool_calls: [tc],
+      finish_reason: "tool_calls",
+      usage: makeUsage({ prompt_tokens: 1, completion_tokens: 1 }),
+    });
+    const result = internalResponseToAnthropic(resp, "test-model", "msg_empty_call");
+    const content = result.content as Record<string, unknown>[];
+
+    const replayed = anthropicRequestToInternal({
+      model: "test-model",
+      messages: [
+        { role: "assistant", content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "", content: "done" }] },
+      ],
+    });
+
+    assert.deepEqual(replayed.messages[0].tool_calls, [tc]);
+    assert.equal(replayed.messages[1].role, MessageRole.TOOL);
+    assert.equal(replayed.messages[1].tool_call_id, "");
+    assert.equal(replayed.messages[1].content, "done");
   });
 
   it("reasoning response", () => {
@@ -715,19 +1084,30 @@ describe("internalResponseToAnthropic", () => {
     });
     const result = internalResponseToAnthropic(resp, "test-model", "msg_123");
     const content = result.content as Record<string, unknown>[];
-    assert.equal(content.length, 2);
-    assert.equal(content[0].type, "thinking");
-    assert.equal(content[0].thinking, "Let me think about this...");
-    assert.equal(content[1].type, "text");
-  });
-
-  it("empty response", () => {
-    const resp = makeResponse({ content: "", finish_reason: "stop" });
-    const result = internalResponseToAnthropic(resp, "test-model", "msg_123");
-    const content = result.content as Record<string, unknown>[];
     assert.equal(content.length, 1);
     assert.equal(content[0].type, "text");
-    assert.equal(content[0].text, "");
+    assert.equal(content[0].text, "42");
+    assert.equal(result.codex_reasoning, "Let me think about this...");
+    assert.equal(Object.hasOwn(content[0], "thinking"), false);
+    assert.equal(Object.hasOwn(content[0], "signature"), false);
+  });
+
+  it("represents an empty response with an empty content array", () => {
+    const resp = makeResponse({
+      content: "",
+      finish_reason: "stop",
+      usage: makeUsage(),
+    });
+    const result = internalResponseToAnthropic(resp, "test-model", "msg_123");
+    assert.deepEqual(result.content, []);
+    assert.equal(result.stop_reason, "end_turn");
+    const replayed = anthropicRequestToInternal({
+      model: "test-model",
+      messages: [{ role: "assistant", content: result.content }],
+    });
+    assert.equal(replayed.messages.length, 1);
+    assert.equal(replayed.messages[0].role, MessageRole.ASSISTANT);
+    assert.equal(replayed.messages[0].content, "");
   });
 
   it("cached tokens in usage", () => {
@@ -747,9 +1127,24 @@ describe("internalResponseToAnthropic", () => {
     assert.equal(usage.cache_creation_input_tokens, 25);
   });
 
-  it("adds web_search server tool blocks before text", () => {
+  it("uses null cache counters when internal usage omits them", () => {
+    const result = internalResponseToAnthropic(makeResponse({
+      content: "hi",
+      usage: {
+        prompt_tokens: 2,
+        completion_tokens: 1,
+        total_tokens: 3,
+      },
+    }), "m", "msg_1");
+    const usage = result.usage as Record<string, unknown>;
+    assert.equal(usage.cache_read_input_tokens, null);
+    assert.equal(usage.cache_creation_input_tokens, null);
+  });
+
+  it("rejects web_search provider output", () => {
     const resp = makeResponse({
       content: "Final answer",
+      usage: makeUsage(),
       raw: {
         events: [{
           type: "web_search_call",
@@ -759,17 +1154,33 @@ describe("internalResponseToAnthropic", () => {
         }],
       },
     });
-    const result = internalResponseToAnthropic(resp, "m", "msg_1");
-    const content = result.content as Record<string, unknown>[];
-    assert.deepEqual(content.map((c) => c.type), ["server_tool_use", "web_search_tool_result", "text"]);
-    assert.equal(content[0].name, "web_search");
-    assert.equal(content[1].tool_use_id, "srvtoolu_ws1");
-    assert.deepEqual((content[1].content as unknown[])[0], {
-      type: "web_search_result",
-      url: "https://example.com",
-      title: "Example",
-    });
-    assert.deepEqual((result.usage as Record<string, unknown>).server_tool_use, { web_search_requests: 1 });
+    assert.throws(
+      () => internalResponseToAnthropic(resp, "m", "msg_1"),
+      /cannot be represented losslessly/,
+    );
+  });
+
+  it("rejects malformed actual non-stream server tool usage", () => {
+    for (const serverToolUse of [
+      { web_search_requests: "one" },
+      { web_search_requests: 1, web_fetch_requests: 0, future_counter: 1 },
+      { web_search_requests: 1 },
+    ]) {
+      const resp = makeResponse({
+        content: "Final answer",
+        usage: makeUsage(),
+        raw: {
+          events: [{
+            type: "finish",
+            usage: { server_tool_use: serverToolUse },
+          }],
+        },
+      });
+      assert.throws(
+        () => internalResponseToAnthropic(resp, "m", "msg_1"),
+        ChatGPTOAuthProtocolError,
+      );
+    }
   });
 });
 
@@ -782,7 +1193,7 @@ describe("anthropicStreamAdapter", () => {
     const events = [
       { type: "content", text: "Hello" },
       { type: "content", text: " world" },
-      { type: "finish", finish_reason: "stop", usage: { output_tokens: 5 } },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage({ output_tokens: 5, total_tokens: 5 }) },
     ];
     const result = await collectStreamEvents(events);
     const types = result.map((e) => e.type);
@@ -806,25 +1217,46 @@ describe("anthropicStreamAdapter", () => {
     const events = [
       { type: "reasoning_delta", text: "thinking..." },
       { type: "content", text: "result" },
-      { type: "finish", finish_reason: "stop" },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
-    assert.equal(blockStarts.length, 2);
-    assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "thinking");
-    assert.equal((blockStarts[1].content_block as Record<string, unknown>).type, "text");
+    assert.equal(blockStarts.length, 1);
+    assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "text");
+    const reasoningEvents = result.filter((e) => e.type === "codex_reasoning_delta");
+    assert.deepEqual(reasoningEvents, [{ type: "codex_reasoning_delta", delta: "thinking..." }]);
+    assert.equal(result.some((event) => event.type === "signature_delta"), false);
+  });
+
+  it("represents a reasoning-only stream without content blocks", async () => {
+    const events = [
+      { type: "reasoning_delta", text: "thinking..." },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+    ];
+    const result = await collectStreamEvents(events);
+
+    assert.equal(result.some((event) => event.type === "content_block_start"), false);
+    assert.deepEqual(
+      result.filter((event) => event.type === "codex_reasoning_delta"),
+      [{ type: "codex_reasoning_delta", delta: "thinking..." }],
+    );
+    assert.equal(result.at(-1)?.type, "message_stop");
   });
 
   it("tool call stream", async () => {
     const events = [
-      { type: "tool_call", id: "tc-1", name: "get_weather", arguments: { city: "Seoul" } },
-      { type: "finish", finish_reason: "tool_calls" },
+      { type: "tool_call", id: "tc-1", name: "get_weather", arguments: '{"city":"Seoul"}' },
+      { type: "finish", finish_reason: "tool_calls", usage: makeStreamUsage() },
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
     assert.equal(blockStarts.length, 1);
     assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "tool_use");
     assert.equal((blockStarts[0].content_block as Record<string, unknown>).name, "get_weather");
+    assert.deepEqual(
+      (blockStarts[0].content_block as Record<string, unknown>).caller,
+      { type: "direct" },
+    );
 
     const jsonDeltas = result.filter(
       (e) => e.type === "content_block_delta" &&
@@ -845,8 +1277,8 @@ describe("anthropicStreamAdapter", () => {
   it("text then tool call", async () => {
     const events = [
       { type: "content", text: "Let me check." },
-      { type: "tool_call", id: "tc-1", name: "search", arguments: { q: "test" } },
-      { type: "finish", finish_reason: "stop" },
+      { type: "tool_call", id: "tc-1", name: "search", arguments: '{"q":"test"}' },
+      { type: "finish", finish_reason: "tool_calls", usage: makeStreamUsage() },
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
@@ -855,23 +1287,99 @@ describe("anthropicStreamAdapter", () => {
     assert.equal((blockStarts[1].content_block as Record<string, unknown>).type, "tool_use");
   });
 
-  it("empty stream", async () => {
-    const events = [{ type: "finish", finish_reason: "stop" }];
-    const result = await collectStreamEvents(events);
-    const blockStarts = result.filter((e) => e.type === "content_block_start");
-    assert.equal(blockStarts.length, 1);
-    assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "text");
+  it("represents a finish-only empty stream without content blocks", async () => {
+    const result = await collectStreamEvents([
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+    ]);
+
+    assert.equal(result.some((event) => event.type === "content_block_start"), false);
+    assert.deepEqual(
+      result.map((event) => event.type),
+      ["message_start", "message_delta", "message_stop"],
+    );
+  });
+
+  it("preserves empty content and reasoning deltas", async () => {
+    const result = await collectStreamEvents([
+      { type: "reasoning_delta", text: "" },
+      { type: "content", text: "" },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+    ]);
+    const reasoning = result.find((event) => event.type === "codex_reasoning_delta")!;
+    assert.equal(reasoning.delta, "");
+    const textDelta = result.find((event) => event.type === "content_block_delta")!;
+    assert.deepEqual(textDelta.delta, { type: "text_delta", text: "" });
+  });
+
+  it("rejects legacy provider finish reasons without reflecting them", async () => {
+    const legacyReason = "legacy-secret-reason";
+    await assert.rejects(
+      () => collectStreamEvents([
+        { type: "finish", finish_reason: legacyReason, usage: makeStreamUsage() },
+      ]),
+      (error: unknown) => error instanceof ChatGPTOAuthProtocolError
+        && !error.message.includes(legacyReason),
+    );
+    assert.throws(
+      () => internalResponseToAnthropic(
+        makeResponse({ finish_reason: legacyReason as never }),
+        "test-model",
+        "msg_legacy",
+      ),
+      (error: unknown) => error instanceof ChatGPTOAuthProtocolError
+        && !error.message.includes(legacyReason),
+    );
+  });
+
+  it("rejects unsupported provider events instead of silently dropping them", async () => {
+    const credentialSentinel = "access_token=NORMALIZED_PROVIDER_SECRET";
+    for (const events of [
+      [{ type: credentialSentinel, value: true }],
+      [{
+        type: "finish",
+        finish_reason: "stop",
+        usage: {
+          ...makeStreamUsage(),
+          cache_creation: { [credentialSentinel]: 1 },
+        },
+      }],
+    ]) {
+      await assert.rejects(
+        () => collectStreamEvents(events),
+        (error) => error instanceof ChatGPTOAuthProtocolError
+          && !error.message.includes(credentialSentinel),
+      );
+    }
   });
 
   it("message_delta stop reason", async () => {
     const events = [
       { type: "content", text: "hi" },
-      { type: "finish", finish_reason: "stop", usage: { output_tokens: 3 } },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage({ output_tokens: 3, total_tokens: 3 }) },
     ];
     const result = await collectStreamEvents(events);
     const msgDelta = result.find((e) => e.type === "message_delta")!;
-    assert.equal((msgDelta.delta as Record<string, unknown>).stop_reason, "end_turn");
-    assert.equal((msgDelta.usage as Record<string, unknown>).output_tokens, 3);
+    assert.deepEqual(msgDelta.delta, {
+      container: null,
+      stop_reason: "end_turn",
+      stop_sequence: null,
+    });
+    assert.deepEqual(msgDelta.usage, {
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: 0,
+      input_tokens: 0,
+      iterations: null,
+      output_tokens: 3,
+      server_tool_use: null,
+    });
+    assert.equal(msgDelta.context_management, null);
+  });
+
+  it("rejects a null stream finish reason", async () => {
+    await assert.rejects(() => collectStreamEvents([
+      { type: "content", text: "pending" },
+      { type: "finish", finish_reason: null, usage: makeStreamUsage() },
+    ]), /non-null finish_reason/);
   });
 
   it("routes real cumulative usage into message_delta", async () => {
@@ -883,36 +1391,90 @@ describe("anthropicStreamAdapter", () => {
         usage: {
           input_tokens: 123,
           output_tokens: 7,
-          cache_creation_input_tokens: 11,
-          cache_read_input_tokens: 13,
+          total_tokens: 130,
+          input_tokens_details: {
+            cached_tokens: 13,
+            cache_write_tokens: 11,
+          },
           cache_creation: { ephemeral_5m_input_tokens: 11, ephemeral_1h_input_tokens: 0 },
-          server_tool_use: { web_search_requests: 2 },
+          server_tool_use: { web_search_requests: 2, web_fetch_requests: 1 },
         },
       },
     ];
     const result = await collectStreamEvents(events);
     const msgStart = result.find((e) => e.type === "message_start")!;
-    assert.deepEqual((msgStart.message as Record<string, unknown>).usage, {
-      input_tokens: 0,
-      output_tokens: 0,
-    });
+    assert.equal(
+      Object.hasOwn(msgStart.message as Record<string, unknown>, "usage"),
+      false,
+    );
+    assert.equal((msgStart.message as Record<string, unknown>).container, null);
+    assert.equal((msgStart.message as Record<string, unknown>).context_management, null);
 
     const msgDelta = result.find((e) => e.type === "message_delta")!;
     assert.deepEqual(msgDelta.usage, {
-      input_tokens: 123,
-      output_tokens: 7,
       cache_creation_input_tokens: 11,
       cache_read_input_tokens: 13,
-      cache_creation: { ephemeral_5m_input_tokens: 11, ephemeral_1h_input_tokens: 0 },
-      server_tool_use: { web_search_requests: 2 },
+      input_tokens: 123,
+      iterations: null,
+      output_tokens: 7,
+      server_tool_use: { web_search_requests: 2, web_fetch_requests: 1 },
     });
+  });
+
+  it("rejects absent stream usage and uses null unknown cache counters", async () => {
+    await assert.rejects(() => collectStreamEvents([
+      { type: "content", text: "hi" },
+      { type: "finish", finish_reason: "stop" },
+    ]), /authoritative usage/);
+
+    const withoutDetails = await collectStreamEvents([
+      { type: "content", text: "hi" },
+      {
+        type: "finish",
+        finish_reason: "stop",
+        usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+      },
+    ]);
+    const usage = withoutDetails.find((event) => event.type === "message_delta")!
+      .usage as Record<string, unknown>;
+    assert.deepEqual(usage, {
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+      input_tokens: 2,
+      iterations: null,
+      output_tokens: 1,
+      server_tool_use: null,
+    });
+  });
+
+  it("rejects malformed actual usage instead of copying it into Anthropic events", async () => {
+    for (const usage of [
+      makeStreamUsage({ total_tokens: 99 }),
+      { ...makeStreamUsage(), prompt_tokens: 0 },
+      { ...makeStreamUsage(), completion_tokens: 0 },
+      { ...makeStreamUsage(), prompt_tokens_details: { cached_tokens: 0 } },
+      { ...makeStreamUsage(), server_tool_use: { web_search_requests: "one", web_fetch_requests: 0 } },
+      { ...makeStreamUsage(), server_tool_use: { web_search_requests: 1, web_fetch_requests: 0, future_counter: 1 } },
+      { ...makeStreamUsage(), server_tool_use: { web_search_requests: 1 } },
+      { ...makeStreamUsage(), cache_creation: "invalid" },
+      { ...makeStreamUsage(), cache_creation: { future_counter: 1 } },
+      { ...makeStreamUsage(), service_tier: 1 },
+    ]) {
+      await assert.rejects(
+        () => collectStreamEvents([
+          { type: "content", text: "hi" },
+          { type: "finish", finish_reason: "stop", usage },
+        ]),
+        ChatGPTOAuthProtocolError,
+      );
+    }
   });
 
   it("multiple tool calls", async () => {
     const events = [
-      { type: "tool_call", id: "tc-1", name: "tool_a", arguments: { a: 1 } },
-      { type: "tool_call", id: "tc-2", name: "tool_b", arguments: { b: 2 } },
-      { type: "finish", finish_reason: "stop" },
+      { type: "tool_call", id: "tc-1", name: "tool_a", arguments: '{"a":1}' },
+      { type: "tool_call", id: "tc-2", name: "tool_b", arguments: '{"b":2}' },
+      { type: "finish", finish_reason: "tool_calls", usage: makeStreamUsage() },
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
@@ -923,7 +1485,7 @@ describe("anthropicStreamAdapter", () => {
     assert.equal(blockStarts[1].index, 1);
   });
 
-  it("web_search_call stream emits server tool result before text", async () => {
+  it("rejects web_search_call stream output", async () => {
     const events = [
       {
         type: "web_search_call",
@@ -932,19 +1494,12 @@ describe("anthropicStreamAdapter", () => {
         content: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
       },
       { type: "content", text: "It is noon." },
-      { type: "finish", finish_reason: "stop" },
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
     ];
-    const result = await collectStreamEvents(events);
-    const blockStarts = result.filter((e) => e.type === "content_block_start");
-    assert.deepEqual(blockStarts.map((e) => (e.content_block as Record<string, unknown>).type), [
-      "server_tool_use",
-      "web_search_tool_result",
-      "text",
-    ]);
-    const msgDelta = result.find((e) => e.type === "message_delta")!;
-    assert.deepEqual((msgDelta.usage as Record<string, unknown>).server_tool_use, {
-      web_search_requests: 1,
-    });
+    await assert.rejects(
+      () => collectStreamEvents(events),
+      /cannot be represented losslessly/,
+    );
   });
 });
 

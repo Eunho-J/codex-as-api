@@ -1,5 +1,6 @@
 export enum MessageRole {
   SYSTEM = "system",
+  DEVELOPER = "developer",
   USER = "user",
   ASSISTANT = "assistant",
   TOOL = "tool",
@@ -8,7 +9,7 @@ export enum MessageRole {
 export interface ToolCall {
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: string;
 }
 
 export interface PromptCacheBreakpoint {
@@ -25,6 +26,11 @@ export type MessageContentPart =
       type: "image_url";
       image_url: string;
       detail?: "auto" | "low" | "high" | "original";
+      prompt_cache_breakpoint?: PromptCacheBreakpoint;
+    }
+  | {
+      type: "input_audio";
+      audio_url: string;
       prompt_cache_breakpoint?: PromptCacheBreakpoint;
     };
 
@@ -43,14 +49,16 @@ export interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  cached_tokens: number;
+  cached_tokens?: number;
   cache_write_tokens?: number;
 }
+
+export type FinishReason = "stop" | "tool_calls" | null;
 
 export interface AssistantResponse {
   content: string;
   tool_calls: ToolCall[];
-  finish_reason: string;
+  finish_reason: FinishReason;
   usage: Usage | null;
   reasoning_content: string | null;
   raw: Record<string, unknown> | null;
@@ -59,8 +67,9 @@ export interface AssistantResponse {
 
 export interface ToolSchema {
   name: string;
-  description: string;
+  description?: string;
   parameters: Record<string, unknown>;
+  strict?: boolean;
   allowed_callers?: unknown;
   output_schema?: unknown;
 }

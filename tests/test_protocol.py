@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from codex_as_api.auth import ChatGPTOAuthProtocolError
 from codex_as_api.protocol import (
     get_value,
     normalize_openai_chat_completion_chunk,
@@ -53,13 +56,19 @@ def test_normalize_stream_content_list_of_dicts():
     assert normalize_stream_content(items) == "foobar"
 
 
-def test_normalize_stream_content_list_skips_non_text():
-    items = [{"other": "x"}, {"text": "ok"}]
-    assert normalize_stream_content(items) == "ok"
+def test_normalize_stream_content_rejects_missing_text():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="requires text"):
+        normalize_stream_content([{"other": "x"}, {"text": "ok"}])
 
 
-def test_normalize_stream_content_other_type():
-    assert normalize_stream_content(42) == "42"
+def test_normalize_stream_content_rejects_other_type():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="must be a string"):
+        normalize_stream_content(42)
+
+
+def test_normalize_stream_content_rejects_non_string_item_text():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="text must be a string"):
+        normalize_stream_content([{"text": 42}])
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +78,12 @@ def test_normalize_stream_content_other_type():
 
 def _make_chunk(delta: dict, finish_reason: str | None = None) -> dict:
     return {
-        "choices": [{
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }]
+        "choices": [
+            {
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ]
     }
 
 
@@ -85,6 +96,33 @@ def test_normalize_chunk_content_delta():
 def test_normalize_chunk_no_choices_empty():
     events = normalize_openai_chat_completion_chunk({"choices": []})
     assert events == []
+
+
+def test_normalize_chunk_rejects_missing_choices():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="requires choices"):
+        normalize_openai_chat_completion_chunk({})
+
+
+def test_normalize_chunk_rejects_malformed_choice():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="choice must be an object"):
+        normalize_openai_chat_completion_chunk({"choices": [42]})
+
+
+def test_normalize_chunk_rejects_malformed_delta():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="delta must be an object"):
+        normalize_openai_chat_completion_chunk({"choices": [{"delta": 42}]})
+
+
+def test_normalize_chunk_rejects_non_array_tool_calls():
+    chunk = _make_chunk({"tool_calls": {"id": "tc1"}})
+    with pytest.raises(ChatGPTOAuthProtocolError, match="tool_calls must be an array"):
+        normalize_openai_chat_completion_chunk(chunk)
+
+
+def test_normalize_chunk_rejects_non_string_finish_reason():
+    chunk = _make_chunk({}, finish_reason=42)  # type: ignore[arg-type]
+    with pytest.raises(ChatGPTOAuthProtocolError, match="finish_reason must be a string"):
+        normalize_openai_chat_completion_chunk(chunk)
 
 
 def test_normalize_chunk_reasoning_content():
@@ -166,30 +204,51 @@ def test_response_failure_fallback_json_dump():
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_from_items_summary_string():
-    items = [{"type": "reasoning", "summary": "I thought about it"}]
-    assert reasoning_from_response_items(items) == "I thought about it"
-
-
-def test_reasoning_from_items_content_string():
-    items = [{"type": "reasoning", "content": "direct content"}]
-    assert reasoning_from_response_items(items) == "direct content"
-
-
-def test_reasoning_from_items_summary_list_of_strings():
-    items = [{"type": "reasoning", "summary": ["part one", "part two"]}]
-    assert reasoning_from_response_items(items) == "part onepart two"
-
-
-def test_reasoning_from_items_summary_list_of_dicts():
-    items = [{"type": "reasoning", "summary": [{"text": "dict text"}]}]
+def test_reasoning_from_items_reads_official_summary_shape():
+    items = [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "dict text"}],
+        }
+    ]
     assert reasoning_from_response_items(items) == "dict text"
+
+
+@pytest.mark.parametrize("part_type", ["reasoning_text", "text"])
+def test_reasoning_from_items_reads_official_content_shape(part_type):
+    items = [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": part_type, "text": "detail"}],
+        }
+    ]
+    assert reasoning_from_response_items(items) == "detail"
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        {"summary": "direct"},
+        {"summary": ["bare"]},
+        {"summary": [{"text": "untyped"}]},
+        {"summary": [], "content": "direct"},
+        {"summary": [], "content": ["bare"]},
+        {"summary": [], "content": [{"text": "untyped"}]},
+    ],
+)
+def test_reasoning_from_items_rejects_stale_wire_fallbacks(reasoning):
+    with pytest.raises(ChatGPTOAuthProtocolError):
+        reasoning_from_response_items([{"type": "reasoning", **reasoning}])
 
 
 def test_reasoning_from_items_skips_non_reasoning():
     items = [
         {"type": "message", "content": "ignored"},
-        {"type": "reasoning", "summary": "kept"},
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "kept"}],
+        },
     ]
     assert reasoning_from_response_items(items) == "kept"
 
@@ -200,7 +259,12 @@ def test_reasoning_from_items_empty_list():
 
 def test_reasoning_from_items_multiple_reasoning_items():
     items = [
-        {"type": "reasoning", "summary": "A"},
-        {"type": "reasoning", "summary": "B"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "A"}]},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "B"}]},
     ]
     assert reasoning_from_response_items(items) == "AB"
+
+
+def test_reasoning_from_items_rejects_non_object_item():
+    with pytest.raises(ChatGPTOAuthProtocolError, match="response item 0"):
+        reasoning_from_response_items([42])  # type: ignore[list-item]

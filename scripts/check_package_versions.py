@@ -17,6 +17,9 @@ except ModuleNotFoundError:  # pragma: no cover - supports local Python 3.10 run
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_PYTHON_PACKAGE_NAME = "codex-as-api"
+EXPECTED_TYPESCRIPT_PACKAGE_NAME = "codex-as-api"
+EXPECTED_RUST_PACKAGE_NAME = "codex-as-api"
 
 
 class VersionCheckError(ValueError):
@@ -41,6 +44,14 @@ def read_toml_version(path: Path, section: str) -> str:
     if not isinstance(section_data, Mapping):
         raise VersionCheckError(f"{path}: missing [{section}] table")
     return require_string(section_data.get("version"), f"{path}: [{section}].version")
+
+
+def read_toml_name(path: Path, section: str) -> str:
+    document = read_toml(path)
+    section_data = document.get(section)
+    if not isinstance(section_data, Mapping):
+        raise VersionCheckError(f"{path}: missing [{section}] table")
+    return require_string(section_data.get("name"), f"{path}: [{section}].name")
 
 
 def read_json(path: Path) -> Mapping[str, object]:
@@ -114,11 +125,60 @@ def read_cargo_lock_version(path: Path) -> str:
     matching_packages = [
         package
         for package in packages
-        if isinstance(package, Mapping) and package.get("name") == "codex-as-api"
+        if isinstance(package, Mapping) and package.get("name") == EXPECTED_RUST_PACKAGE_NAME
     ]
     if len(matching_packages) != 1:
         raise VersionCheckError(f"{path}: expected exactly one codex-as-api package entry")
     return require_string(matching_packages[0].get("version"), f"{path}: codex-as-api package version")
+
+
+def read_json_object(path: Path, *keys: str) -> Mapping[str, object]:
+    value: object = read_json(path)
+    location = str(path)
+    for key in keys:
+        if not isinstance(value, Mapping):
+            raise VersionCheckError(f"{location}: {key} is not an object")
+        value = value.get(key)
+        location = f"{location}.{key}"
+    if not isinstance(value, Mapping):
+        raise VersionCheckError(f"{location} is not an object")
+    return value
+
+
+def collect_package_names(root: Path) -> dict[str, str]:
+    package_json = root / "ts" / "package.json"
+    package_lock = root / "ts" / "package-lock.json"
+    return {
+        "Python package (pyproject.toml)": read_toml_name(root / "pyproject.toml", "project"),
+        "TypeScript package (ts/package.json)": require_string(
+            read_json(package_json).get("name"), f"{package_json}.name"
+        ),
+        "TypeScript lockfile (ts/package-lock.json)": require_string(
+            read_json(package_lock).get("name"), f"{package_lock}.name"
+        ),
+        "TypeScript lockfile root package": require_string(
+            read_json_object(package_lock, "packages", "").get("name"),
+            f"{package_lock}.packages..name",
+        ),
+        "Rust package (rust/Cargo.toml)": read_toml_name(root / "rust" / "Cargo.toml", "package"),
+    }
+
+
+def validate_package_names(names: Mapping[str, str]) -> None:
+    expected = {
+        "Python package (pyproject.toml)": EXPECTED_PYTHON_PACKAGE_NAME,
+        "TypeScript package (ts/package.json)": EXPECTED_TYPESCRIPT_PACKAGE_NAME,
+        "TypeScript lockfile (ts/package-lock.json)": EXPECTED_TYPESCRIPT_PACKAGE_NAME,
+        "TypeScript lockfile root package": EXPECTED_TYPESCRIPT_PACKAGE_NAME,
+        "Rust package (rust/Cargo.toml)": EXPECTED_RUST_PACKAGE_NAME,
+    }
+    mismatches = [
+        f"  {surface}: expected {expected[surface]!r}, got {actual!r}"
+        for surface, actual in names.items()
+        if actual != expected[surface]
+    ]
+    if mismatches:
+        raise VersionCheckError("package names are inconsistent:\n" + "\n".join(mismatches))
 
 
 def collect_versions(root: Path) -> dict[str, str]:
@@ -161,6 +221,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        validate_package_names(collect_package_names(ROOT))
         version = validate_versions(collect_versions(ROOT), args.tag)
     except VersionCheckError as error:
         print(error, file=sys.stderr)

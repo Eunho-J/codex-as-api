@@ -1,7 +1,10 @@
 [package]
 name = "codex-as-api"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2021"
+description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
+license = "Apache-2.0"
+repository = "https://github.com/Eunho-J/codex-as-api"
 
 [[bin]]
 name = "codex-as-api"
@@ -22,3 +25,6 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "v5"] }
 futures = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

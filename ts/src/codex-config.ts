@@ -20,7 +20,16 @@ function expandHome(p: string): string {
 }
 
 export function resolveCodexHome(raw?: string | null): string {
-  return expandHome(raw || process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  if (raw != null) {
+    if (raw.trim().length === 0) throw new Error("Codex home path must not be blank");
+    return expandHome(raw);
+  }
+  const envHome = process.env.CODEX_HOME;
+  if (envHome !== undefined) {
+    if (envHome.trim().length === 0) throw new Error("CODEX_HOME must not be blank");
+    return expandHome(envHome);
+  }
+  return path.join(os.homedir(), ".codex");
 }
 
 export function loadCodexConfig(rawCodexHome?: string | null): CodexConfig {
@@ -39,12 +48,23 @@ export function loadCodexConfig(rawCodexHome?: string | null): CodexConfig {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   const document = parse(text, { integersAsBigInt: true });
   const model = optionalRootString(document, "model");
-  if (model) config.model = model;
+  if (model !== undefined) {
+    if (model.trim().length === 0) {
+      throw new Error("model must be a non-empty TOML string");
+    }
+    if (model !== model.trim()) {
+      throw new Error("model must not contain surrounding whitespace");
+    }
+    config.model = model;
+  }
 
   const modelReasoningEffort = optionalRootString(document, "model_reasoning_effort");
   if (modelReasoningEffort !== undefined) {
-    if (modelReasoningEffort.length === 0) {
+    if (modelReasoningEffort.trim().length === 0) {
       throw new Error("model_reasoning_effort must be a non-empty TOML string");
+    }
+    if (modelReasoningEffort !== modelReasoningEffort.trim()) {
+      throw new Error("model_reasoning_effort must not contain surrounding whitespace");
     }
     config.modelReasoningEffort = modelReasoningEffort;
   }
@@ -52,7 +72,7 @@ export function loadCodexConfig(rawCodexHome?: string | null): CodexConfig {
   const modelContextWindow = optionalPositiveRootInteger(document, "model_context_window");
   if (modelContextWindow != null) config.modelContextWindow = modelContextWindow;
 
-  const modelAutoCompactTokenLimit = optionalPositiveRootInteger(
+  const modelAutoCompactTokenLimit = optionalSignedRootInteger(
     document,
     "model_auto_compact_token_limit",
   );
@@ -77,6 +97,19 @@ function optionalPositiveRootInteger(document: TomlTable, key: string): number |
   const value = document[key];
   if (typeof value !== "bigint" || value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error(`${key} must be a positive TOML integer`);
+  }
+  return Number(value);
+}
+
+function optionalSignedRootInteger(document: TomlTable, key: string): number | undefined {
+  if (!Object.hasOwn(document, key)) return undefined;
+  const value = document[key];
+  if (
+    typeof value !== "bigint"
+    || value < -BigInt(Number.MAX_SAFE_INTEGER)
+    || value > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new Error(`${key} must be a JavaScript-safe TOML integer`);
   }
   return Number(value);
 }

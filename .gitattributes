@@ -1,0 +1,5 @@
+LICENSE text eol=lf
+THIRD_PARTY_NOTICES.md text eol=lf
+ts/LICENSE text eol=lf
+ts/THIRD_PARTY_NOTICES.md text eol=lf
+rust/THIRD_PARTY_NOTICES.md text eol=lf -whitespace

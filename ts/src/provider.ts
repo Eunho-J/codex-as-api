@@ -1,11 +1,16 @@
-import * as crypto from "node:crypto";
 import * as os from "node:os";
 import packageMetadata from "../package.json";
 import upstreamContract from "../../config/codex-upstream-contract.json";
 import {
   ChatGPTOAuthError,
+  ChatGPTOAuthCatalogUnavailableError,
   ChatGPTOAuthInvalidRequestError,
+  ChatGPTOAuthModelNotFoundError,
+  ChatGPTOAuthProtocolError,
+  ChatGPTOAuthRefreshError,
+  ChatGPTOAuthUnavailableError,
   ChatGPTOAuthUpstreamError,
+  type ChatGPTTokenData,
   loadTokenData,
   redactText,
   refreshAfterUnauthorized,
@@ -13,6 +18,7 @@ import {
 } from "./auth.js";
 import type {
   AssistantResponse,
+  FinishReason,
   Message,
   MessageContentPart,
   ToolCall,
@@ -21,27 +27,36 @@ import type {
 } from "./messages.js";
 import { MessageRole } from "./messages.js";
 import {
+  normalizeFinishReason,
   reasoningFromResponseItems,
+  reasoningPartsFromResponseItems,
   responseFailureMessage,
 } from "./protocol.js";
 import {
   LITE_HEADER_NAME,
   LITE_HEADER_VALUE,
+  accountIdFromModelCatalogCacheKey,
   applyModelCapabilityFields,
   buildCodexClientMetadata,
-  capabilityForModel,
+  ModelCatalogCache,
+  modelCatalogCacheKey,
+  modelFromSnapshot,
   resolveCodexMetadataEnabled,
   shouldEnableParallelToolCalls,
-  stripImageDetailFields,
   useResponsesLite,
 } from "./model-capabilities.js";
+import type {
+  ModelCapability,
+  ModelCatalogSnapshot,
+} from "./model-capabilities.js";
+import { parseJsonResponseStrict, parseJsonStrict } from "./utf8-json.js";
 
 export const CHATGPT_OAUTH_DEFAULT_BASE_URL =
   "https://chatgpt.com/backend-api/codex";
-export const CHATGPT_OAUTH_DEFAULT_MODEL = "gpt-5.5";
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
+export const MODEL_CATALOG_TIMEOUT_MS = 5_000;
 const REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR = "codex_cli_rs";
-const CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION";
 const CODEX_COMPATIBILITY_VERSION = requireCodexCliVersion(
   upstreamContract.upstream.version,
   "bundled Codex upstream contract version",
@@ -50,57 +65,174 @@ const CODEX_AS_API_VERSION = requireCodexCliVersion(
   packageMetadata.version,
   "codex-as-api package version",
 );
-const KNOWN_REASONING_EFFORT_VALUES = new Set([
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "ultra",
-]);
 const RESPONSES_LITE_PAYLOAD = Symbol("responses-lite-payload");
 const REASONING_MODES = new Set(["standard", "pro"]);
 const REASONING_CONTEXTS = new Set(["auto", "current_turn", "all_turns"]);
 const IMAGE_DETAILS = new Set(["auto", "low", "high", "original"]);
+const RESPONSE_EVENT_TYPES = new Set([
+  "error",
+  "codex.response.metadata",
+  "response.created",
+  "response.in_progress",
+  "response.metadata",
+  "response.queued",
+  "response.output_item.added",
+  "response.output_item.done",
+  "response.content_part.added",
+  "response.content_part.done",
+  "response.output_text.delta",
+  "response.output_text.done",
+  "response.function_call_arguments.delta",
+  "response.function_call_arguments.done",
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_part.done",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_summary_text.done",
+  "response.reasoning_text.delta",
+  "response.reasoning_text.done",
+  "response.web_search_call.in_progress",
+  "response.web_search_call.searching",
+  "response.web_search_call.completed",
+  "response.image_generation_call.in_progress",
+  "response.image_generation_call.generating",
+  "response.image_generation_call.partial_image",
+  "response.image_generation_call.completed",
+  "response.failed",
+  "response.incomplete",
+  "response.completed",
+  "responsesapi.websocket_timing",
+]);
+const UNSUPPORTED_RESPONSE_EVENT_TYPES = new Set([
+  "response.file_search_call.in_progress",
+  "response.file_search_call.searching",
+  "response.file_search_call.completed",
+  "response.code_interpreter_call.in_progress",
+  "response.code_interpreter_call.interpreting",
+  "response.code_interpreter_call_code.delta",
+  "response.code_interpreter_call_code.done",
+  "response.code_interpreter_call.completed",
+  "response.mcp_call.in_progress",
+  "response.mcp_call_arguments.delta",
+  "response.mcp_call_arguments.done",
+  "response.mcp_call.completed",
+  "response.mcp_call.failed",
+  "response.mcp_list_tools.in_progress",
+  "response.mcp_list_tools.completed",
+  "response.mcp_list_tools.failed",
+  "response.shell_call_command.added",
+  "response.shell_call_command.delta",
+  "response.shell_call_command.done",
+  "response.shell_call_output_content.delta",
+  "response.shell_call_output_content.done",
+  "response.audio.delta",
+  "response.audio.done",
+  "response.audio.transcript.delta",
+  "response.audio.transcript.done",
+  "response.refusal.delta",
+  "response.refusal.done",
+  "response.output_text.annotation.added",
+  "response.custom_tool_call_input.delta",
+  "response.custom_tool_call_input.done",
+]);
 const RESPONSE_CHAIN_CAPACITY = 256;
+
+function callerAbortController(callerSignal?: AbortSignal): {
+  controller: AbortController;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const abort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal?.aborted) {
+    abort();
+  } else {
+    callerSignal?.addEventListener("abort", abort, { once: true });
+  }
+  return {
+    controller,
+    dispose: () => callerSignal?.removeEventListener("abort", abort),
+  };
+}
+
+async function readWithIdleTimeout<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  controller: AbortController,
+  timeoutMs: number,
+): Promise<ReadableStreamReadResult<T>> {
+  const timeout = setTimeout(() => {
+    controller.abort(new Error("ChatGPT OAuth SSE stream exceeded its idle timeout"));
+  }, timeoutMs);
+  timeout.unref?.();
+  try {
+    return await reader.read();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function abortAfter(
+  controller: AbortController,
+  timeoutMs: number,
+  message: string,
+): () => void {
+  const timeout = setTimeout(() => controller.abort(new Error(message)), timeoutMs);
+  timeout.unref?.();
+  return () => clearTimeout(timeout);
+}
 
 interface ResponseChain {
   input: Record<string, unknown>[];
   output: Record<string, unknown>[];
+  compHash?: string;
 }
 
 class ResponseChainStore {
   private readonly chains = new Map<string, ResponseChain>();
 
-  resolve(responseId: string): Record<string, unknown>[] {
-    const chain = this.chains.get(responseId);
+  resolve(
+    accountId: string,
+    responseId: string,
+    currentCompHash?: string,
+  ): Record<string, unknown>[] {
+    const key = JSON.stringify([accountId, responseId]);
+    const chain = this.chains.get(key);
     if (chain == null) {
       throw new ChatGPTOAuthInvalidRequestError(
-        `previous_response_id ${JSON.stringify(responseId)} is unknown or has been evicted from the local response history`,
+        "previous_response_id is unknown or has been evicted from the local response history",
       );
     }
 
     // Map operations are synchronous, so concurrent requests cannot observe a
     // partially updated LRU entry. Returning a clone also lets multiple
     // branches reuse the same completed response without sharing mutations.
-    this.chains.delete(responseId);
-    this.chains.set(responseId, chain);
+    if (
+      chain.compHash !== undefined
+      && currentCompHash !== undefined
+      && chain.compHash !== currentCompHash
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "previous_response_id requires compaction because the model compatibility hash changed",
+      );
+    }
+    this.chains.delete(key);
+    this.chains.set(key, chain);
     return cloneResponseItems([...chain.input, ...chain.output]);
   }
 
   commit(
+    accountId: string,
     responseId: string,
     input: Record<string, unknown>[],
     output: Record<string, unknown>[],
+    compHash?: string,
   ): void {
+    const key = JSON.stringify([accountId, responseId]);
     const chain = {
       input: cloneResponseItems(input),
       output: cloneResponseItems(output),
+      ...(compHash === undefined ? {} : { compHash }),
     };
-    this.chains.delete(responseId);
-    this.chains.set(responseId, chain);
+    this.chains.delete(key);
+    this.chains.set(key, chain);
     while (this.chains.size > RESPONSE_CHAIN_CAPACITY) {
       const oldest = this.chains.keys().next().value as string | undefined;
       if (oldest == null) break;
@@ -116,16 +248,12 @@ function cloneResponseItems(
 }
 
 export function resolveCodexCliVersion(): string {
-  const raw = process.env[CODEX_CLI_VERSION_ENV];
-  if (raw == null || raw.trim().length === 0) {
-    return CODEX_COMPATIBILITY_VERSION;
-  }
-  return requireCodexCliVersion(raw, CODEX_CLI_VERSION_ENV);
+  return CODEX_COMPATIBILITY_VERSION;
 }
 
 function normalizeCodexCliVersion(value: string | undefined): string | undefined {
-  const version = value?.trim();
-  if (!version) return undefined;
+  if (value == null || value.length === 0 || value !== value.trim()) return undefined;
+  const version = value;
   return /^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
     ? version
     : undefined;
@@ -140,14 +268,17 @@ function requireCodexCliVersion(value: string | undefined, source: string): stri
 }
 
 export function codexCliHeadersForVersion(
-  version: string | undefined,
+  version: string | undefined = CODEX_COMPATIBILITY_VERSION,
 ): Record<string, string> {
   const normalized = requireCodexCliVersion(
-    version == null || version.trim().length === 0
-      ? CODEX_COMPATIBILITY_VERSION
-      : version,
+    version,
     "Codex compatibility version",
   );
+  if (normalized !== CODEX_COMPATIBILITY_VERSION) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `Codex compatibility version is pinned to ${CODEX_COMPATIBILITY_VERSION}`,
+    );
+  }
   return {
     originator: CODEX_CLI_ORIGINATOR,
     "User-Agent": sanitizeHeaderValue(
@@ -157,15 +288,16 @@ export function codexCliHeadersForVersion(
 }
 
 function codexCliHeaders(): Record<string, string> {
-  return codexCliHeadersForVersion(resolveCodexCliVersion());
+  return codexCliHeadersForVersion();
 }
 
 function codexOsInfo(): string {
-  return `${codexOsName()} ${os.release() || "unknown"}; ${os.arch() || "unknown"}`;
+  return `${codexOsName()} ${os.release()}; ${os.arch()}`;
 }
 
 function codexOsName(): string {
-  switch (os.platform()) {
+  const platform = os.platform();
+  switch (platform) {
     case "darwin":
       return "Mac OS";
     case "win32":
@@ -173,7 +305,7 @@ function codexOsName(): string {
     case "linux":
       return "Linux";
     default:
-      return os.platform() || "unknown";
+      return platform;
   }
 }
 
@@ -202,6 +334,16 @@ export interface ChatOptions {
   codexMetadata?: boolean;
   responsesLite?: boolean | string;
   parallelToolCalls?: boolean;
+  ignoreMaxTokens?: boolean;
+  preparedModel?: PreparedModel;
+  signal?: AbortSignal;
+}
+
+export interface PreparedModel {
+  readonly slug: string;
+  readonly accountId: string;
+  readonly capability: ModelCapability;
+  readonly snapshot: ModelCatalogSnapshot;
 }
 
 export interface ReasoningOptions {
@@ -230,10 +372,11 @@ export class ChatGPTOAuthProvider {
   readonly name = "chatgpt_oauth";
   readonly supportsPromptCacheKey = true;
 
-  private model: string;
+  private model: string | undefined;
   private baseUrl: string;
   private authJsonPath: string | undefined;
-  private timeout: number | undefined;
+  private timeout: number;
+  private readonly modelCatalog: ModelCatalogCache;
   private readonly responseChains = new ResponseChainStore();
   private readonly semanticInputs = new WeakMap<
     Record<string, unknown>,
@@ -246,14 +389,129 @@ export class ChatGPTOAuthProvider {
       baseUrl?: string;
       authJsonPath?: string;
       timeout?: number;
+      modelCatalogTtlMs?: number;
+      now?: () => number;
+      monotonicNow?: () => number;
     } = {},
   ) {
-    this.model = opts.model || CHATGPT_OAUTH_DEFAULT_MODEL;
-    this.baseUrl = (
-      opts.baseUrl || CHATGPT_OAUTH_DEFAULT_BASE_URL
-    ).replace(/\/+$/, "");
+    if (
+      opts.model != null
+      && (typeof opts.model !== "string" || opts.model.trim().length === 0)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError("model must be a non-empty string when provided");
+    }
+    if (opts.model != null && opts.model !== opts.model.trim()) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "model must not contain surrounding whitespace",
+      );
+    }
+    if (opts.authJsonPath != null && opts.authJsonPath.trim().length === 0) {
+      throw new ChatGPTOAuthInvalidRequestError("authJsonPath must not be blank");
+    }
+    this.model = opts.model;
+    this.baseUrl = normalizeBaseUrl(
+      opts.baseUrl ?? CHATGPT_OAUTH_DEFAULT_BASE_URL,
+    );
     this.authJsonPath = opts.authJsonPath;
-    this.timeout = opts.timeout;
+    this.timeout = opts.timeout ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(this.timeout) || this.timeout <= 0) {
+      throw new ChatGPTOAuthInvalidRequestError("timeout must be a positive finite number");
+    }
+    this.modelCatalog = new ModelCatalogCache(
+      opts.modelCatalogTtlMs,
+      opts.now,
+      opts.monotonicNow,
+    );
+  }
+
+  async catalogSnapshot(): Promise<ModelCatalogSnapshot> {
+    const token = await tokenForRequest(this.authJsonPath);
+    const clientVersion = resolveCodexCliVersion();
+    const key = modelCatalogCacheKey(token.account_id, this.baseUrl, clientVersion);
+    try {
+      return await this.modelCatalog.get(key, () => this.fetchModelCatalog(token, clientVersion));
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthProtocolError) {
+        throw new ChatGPTOAuthCatalogUnavailableError(err.message);
+      }
+      throw err;
+    }
+  }
+
+  async prepareModel(
+    requestedModel?: string,
+    snapshot?: ModelCatalogSnapshot,
+  ): Promise<PreparedModel> {
+    if (
+      requestedModel != null
+      && (typeof requestedModel !== "string" || requestedModel.trim().length === 0)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError("model must be a non-empty string when provided");
+    }
+    if (requestedModel != null && requestedModel !== requestedModel.trim()) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "model must not contain surrounding whitespace",
+      );
+    }
+    const catalog = snapshot ?? await this.catalogSnapshot();
+    const accountId = accountIdFromModelCatalogCacheKey(catalog.key);
+    const selected = requestedModel ?? this.model ?? catalog.defaultModel?.slug;
+    if (selected == null) {
+      throw new ChatGPTOAuthCatalogUnavailableError(
+        "upstream model catalog has no model with list visibility for default selection",
+      );
+    }
+    if (
+      requestedModel == null
+      && (selected.trim().length === 0 || selected !== selected.trim())
+    ) {
+      throw new ChatGPTOAuthCatalogUnavailableError(
+        this.model == null
+          ? "default model publishes an unusable slug"
+          : "configured model is unusable",
+      );
+    }
+    const slug = selected;
+    const capability = modelFromSnapshot(catalog, slug);
+    if (capability == null) {
+      if (requestedModel == null && this.model != null) {
+        throw new ChatGPTOAuthCatalogUnavailableError(
+          "configured model is unavailable in the authenticated catalog",
+        );
+      }
+      throw new ChatGPTOAuthModelNotFoundError(selected);
+    }
+    return Object.freeze({ slug, accountId, capability, snapshot: catalog });
+  }
+
+  async prepareAnthropicModel(
+    clientModel?: string,
+    snapshot?: ModelCatalogSnapshot,
+  ): Promise<PreparedModel> {
+    if (typeof clientModel !== "string" || clientModel.trim().length === 0) {
+      throw new ChatGPTOAuthInvalidRequestError("Anthropic requests require an explicit claude-* model facade");
+    }
+    if (clientModel !== clientModel.trim()) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "Anthropic model must not contain surrounding whitespace",
+      );
+    }
+    if (!clientModel.startsWith("claude-")) {
+      throw new ChatGPTOAuthInvalidRequestError("Anthropic model must use an explicit claude-* facade");
+    }
+    if (this.model == null) {
+      throw new ChatGPTOAuthInvalidRequestError("Claude facade backend model is not configured");
+    }
+    try {
+      return await this.prepareModel(this.model, snapshot);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthModelNotFoundError) {
+        throw new ChatGPTOAuthCatalogUnavailableError(
+          "configured model is unavailable in the authenticated catalog",
+        );
+      }
+      throw err;
+    }
   }
 
   async chat(
@@ -263,36 +521,88 @@ export class ChatGPTOAuthProvider {
     const contentParts: string[] = [];
     let reasoningParts: string[] = [];
     const toolCalls: ToolCall[] = [];
-    let finishReason = "stop";
+    let finishReason: FinishReason = null;
+    let sawFinish = false;
     const rawEvents: Record<string, unknown>[] = [];
     let usage: Usage | null = null;
     let responseId: string | null = null;
+    const toolCallIds = new Set<string>();
 
     for await (const event of this.chatStream(messages, opts)) {
       rawEvents.push({ ...event });
       if (event.type === "content") {
-        contentParts.push(String(event.text ?? ""));
+        if (typeof event.text !== "string") {
+          throw new ChatGPTOAuthProtocolError("content event text must be a string");
+        }
+        contentParts.push(event.text);
       } else if (
         event.type === "reasoning_delta" ||
         event.type === "reasoning_raw_delta"
       ) {
-        reasoningParts.push(String(event.text ?? ""));
+        if (typeof event.text !== "string") {
+          throw new ChatGPTOAuthProtocolError("reasoning event text must be a string");
+        }
+        reasoningParts.push(event.text);
       } else if (event.type === "tool_call") {
+        if (typeof event.id !== "string") {
+          throw new ChatGPTOAuthProtocolError("tool_call event requires a string id");
+        }
+        if (typeof event.name !== "string") {
+          throw new ChatGPTOAuthProtocolError("tool_call event requires a string name");
+        }
+        if (typeof event.arguments !== "string") {
+          throw new ChatGPTOAuthProtocolError("tool_call event arguments must be a string");
+        }
+        if (toolCallIds.has(event.id)) {
+          throw new ChatGPTOAuthProtocolError(
+            `provider response contains duplicate call_id ${JSON.stringify(event.id)}`,
+          );
+        }
+        toolCallIds.add(event.id);
         toolCalls.push({
-          id: String(event.id),
-          name: String(event.name),
-          arguments: (event.arguments as Record<string, unknown>) || {},
+          id: event.id,
+          name: event.name,
+          arguments: event.arguments,
         });
       } else if (event.type === "finish") {
-        finishReason = String(event.finish_reason ?? finishReason);
+        finishReason = normalizeFinishReason(event.finish_reason);
+        sawFinish = true;
         if (typeof event.reasoning_content === "string") {
           reasoningParts = [event.reasoning_content];
         }
-        usage = usageFromResponse(event.usage) ?? usage;
-        if (typeof event.response_id === "string") {
-          responseId = event.response_id;
+        if (event.usage == null) {
+          usage = null;
+        } else {
+          usage = usageFromResponse(event.usage);
+          if (usage == null) {
+            throw new ChatGPTOAuthProtocolError("finish event usage is malformed");
+          }
         }
+        if (typeof event.response_id !== "string" || event.response_id.length === 0) {
+          throw new ChatGPTOAuthProtocolError("finish event requires response_id");
+        }
+        responseId = event.response_id;
+      } else if (event.type === "reasoning_section_break") {
+        continue;
+      } else if (event.type === "web_search_call") {
+        if (typeof event.id !== "string") {
+          throw new ChatGPTOAuthProtocolError("web_search_call event requires a string id");
+        }
+        if (typeof event.input !== "object" || event.input === null || Array.isArray(event.input)) {
+          throw new ChatGPTOAuthProtocolError("web_search_call event input must be an object");
+        }
+        if (!Array.isArray(event.content)) {
+          throw new ChatGPTOAuthProtocolError("web_search_call event content must be an array");
+        }
+      } else {
+        throw new ChatGPTOAuthProtocolError(
+          "provider emitted an unsupported event type",
+        );
       }
+    }
+
+    if (responseId == null || !sawFinish) {
+      throw new ChatGPTOAuthProtocolError("provider stream ended before a valid finish event");
     }
 
     return {
@@ -306,14 +616,26 @@ export class ChatGPTOAuthProvider {
     };
   }
 
-  chatStream(
+  async *chatStream(
     messages: Message[],
     opts: ChatOptions = {},
   ): AsyncGenerator<StreamEvent> {
-    const payload = this.responsesPayload(messages, opts);
+    const stream = await this.createChatStream(messages, opts);
+    yield* stream;
+  }
+
+  async createChatStream(
+    messages: Message[],
+    opts: ChatOptions = {},
+  ): Promise<AsyncGenerator<StreamEvent>> {
+    const subagent = opts.subagent == null
+      ? undefined
+      : requireSubagentHeaderValue(opts.subagent);
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const payload = this.responsesPayload(messages, opts, prepared);
     const extraHeaders: Record<string, string> = {};
-    if (opts.subagent != null) {
-      extraHeaders["x-openai-subagent"] = opts.subagent;
+    if (subagent != null) {
+      extraHeaders["x-openai-subagent"] = subagent;
     }
     if (opts.memgenRequest != null) {
       extraHeaders["x-openai-memgen-request"] = opts.memgenRequest
@@ -321,51 +643,74 @@ export class ChatGPTOAuthProvider {
         : "false";
     }
 
-    return this.streamChatPayload(payload, extraHeaders);
+    return this.streamChatPayload(payload, extraHeaders, prepared, opts.signal);
   }
 
   private async *streamChatPayload(
     payload: Record<string, unknown>,
     extraHeaders: Record<string, string>,
+    prepared: PreparedModel,
+    signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
     const semanticInput = this.semanticInputs.get(payload);
     if (semanticInput == null) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthProtocolError(
         "internal error: missing semantic input for response history",
       );
     }
     const finalOutput: Record<string, unknown>[] = [];
-    const reasoningParts: string[] = [];
+    const reasoningSummaryParts: string[] = [];
+    const reasoningRawParts: string[] = [];
+    const streamedTextParts: string[] = [];
     const yieldedWebSearchIds = new Set<string>();
+    const yieldedToolCallIds = new Set<string>();
     let sawTextDelta = false;
-    let sawReasoningDelta = false;
+    let sawReasoningSummaryDelta = false;
+    let sawReasoningRawDelta = false;
     let sawToolCall = false;
 
     for await (const event of this.postSSE(
       "/responses",
       payload,
       extraHeaders,
+      prepared.accountId,
+      prepared.snapshot.key,
+      signal,
     )) {
+      if (!validateResponseEvent(event)) {
+        continue;
+      }
       const typ = event.type;
 
       if (typ === "response.output_text.delta") {
         const delta = event.delta;
-        if (typeof delta === "string" && delta) {
+        if (typeof delta !== "string") {
+          throw new ChatGPTOAuthProtocolError("response.output_text.delta delta must be a string");
+        }
+        if (delta) {
           sawTextDelta = true;
+          streamedTextParts.push(delta);
           yield { type: "content", text: delta };
         }
       } else if (typ === "response.output_item.done") {
         const item = event.item;
         if (typeof item !== "object" || item === null || Array.isArray(item)) {
-          throw new ChatGPTOAuthError(
+          throw new ChatGPTOAuthProtocolError(
             "response.output_item.done must contain an object item",
           );
         }
         const itemDict = item as Record<string, unknown>;
+        validateChatResponseItem(itemDict);
         finalOutput.push(itemDict);
         const tool = toolCallFromResponseItem(itemDict);
         if (tool) {
+          if (yieldedToolCallIds.has(tool.id)) {
+            throw new ChatGPTOAuthProtocolError(
+              `provider response contains duplicate call_id ${JSON.stringify(tool.id)}`,
+            );
+          }
           sawToolCall = true;
+          yieldedToolCallIds.add(tool.id);
           yield {
             type: "tool_call",
             id: tool.id,
@@ -382,13 +727,15 @@ export class ChatGPTOAuthProvider {
         yield {
           type: "reasoning_section_break",
           summary_index: event.summary_index,
-          part_index: event.part_index,
         };
       } else if (typ === "response.reasoning_summary_text.delta") {
         const delta = event.delta;
-        if (typeof delta === "string" && delta) {
-          sawReasoningDelta = true;
-          reasoningParts.push(delta);
+        if (typeof delta !== "string") {
+          throw new ChatGPTOAuthProtocolError("response.reasoning_summary_text.delta delta must be a string");
+        }
+        sawReasoningSummaryDelta = true;
+        reasoningSummaryParts.push(delta);
+        if (delta) {
           yield {
             type: "reasoning_delta",
             text: delta,
@@ -397,63 +744,114 @@ export class ChatGPTOAuthProvider {
         }
       } else if (typ === "response.reasoning_text.delta") {
         const delta = event.delta;
-        if (typeof delta === "string" && delta) {
-          sawReasoningDelta = true;
-          reasoningParts.push(delta);
+        if (typeof delta !== "string") {
+          throw new ChatGPTOAuthProtocolError("response.reasoning_text.delta delta must be a string");
+        }
+        sawReasoningRawDelta = true;
+        reasoningRawParts.push(delta);
+        if (delta) {
           yield {
             type: "reasoning_raw_delta",
             text: delta,
-            summary_index: event.summary_index,
+            content_index: event.content_index,
           };
         }
+      } else if (typ === "error") {
+        throw new ChatGPTOAuthUpstreamError(502, responseFailureMessage(event, "error"));
       } else if (typ === "response.failed") {
-        throw new ChatGPTOAuthError(responseFailureMessage(event, "failed"));
+        throw new ChatGPTOAuthUpstreamError(502, responseFailureMessage(event, "failed"));
       } else if (typ === "response.incomplete") {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUpstreamError(
+          502,
           responseFailureMessage(event, "incomplete"),
         );
       } else if (typ === "response.completed") {
         const response = completedResponseFromEvent(event);
-        this.responseChains.commit(
-          String(response.id),
-          semanticInput,
-          finalOutput,
-        );
         const usageData = response.usage;
-        for (const item of finalOutput) {
-          const webSearch = webSearchEventFromResponseItem(item, finalOutput);
+        if (usageData != null && usageFromResponse(usageData) == null) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed response.usage is malformed",
+          );
+        }
+        const completedOutput = finalOutput;
+        const completedText = textFromResponseItems(completedOutput);
+        if (sawTextDelta && streamedTextParts.join("") !== completedText) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed output text does not match streamed output text",
+          );
+        }
+        const completedReasoning = reasoningPartsFromResponseItems(completedOutput);
+        if (
+          sawReasoningSummaryDelta
+          && reasoningSummaryParts.join("") !== completedReasoning.summary
+        ) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed reasoning summary does not match streamed reasoning summary",
+          );
+        }
+        if (
+          sawReasoningRawDelta
+          && reasoningRawParts.join("") !== completedReasoning.content
+        ) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed reasoning content does not match streamed reasoning content",
+          );
+        }
+        this.responseChains.commit(
+          prepared.accountId,
+          response.id as string,
+          semanticInput,
+          completedOutput,
+          prepared.capability.compHash,
+        );
+        for (const item of completedOutput) {
+          const tool = toolCallFromResponseItem(item);
+          if (tool && !yieldedToolCallIds.has(tool.id)) {
+            sawToolCall = true;
+            yieldedToolCallIds.add(tool.id);
+            yield {
+              type: "tool_call",
+              id: tool.id,
+              name: tool.name,
+              arguments: tool.arguments,
+            };
+          }
+          const webSearch = webSearchEventFromResponseItem(item);
           if (webSearch && !yieldedWebSearchIds.has(String(webSearch.id))) {
             yieldedWebSearchIds.add(String(webSearch.id));
             yield webSearch;
           }
         }
         if (!sawTextDelta) {
-          const finalText = textFromResponseItems(finalOutput);
-          if (finalText) {
+          if (completedText) {
             sawTextDelta = true;
-            yield { type: "content", text: finalText };
+            yield { type: "content", text: completedText };
           }
         }
-        if (!sawReasoningDelta) {
-          const completedReasoning =
-            reasoningFromResponseItems(finalOutput);
-          if (completedReasoning) {
-            sawReasoningDelta = true;
-            reasoningParts.push(completedReasoning);
-            yield { type: "reasoning_delta", text: completedReasoning };
-          }
+        if (!sawReasoningSummaryDelta && completedReasoning.summary) {
+          reasoningSummaryParts.push(completedReasoning.summary);
+          yield { type: "reasoning_delta", text: completedReasoning.summary };
+        }
+        if (!sawReasoningRawDelta && completedReasoning.content) {
+          reasoningRawParts.push(completedReasoning.content);
+          yield { type: "reasoning_raw_delta", text: completedReasoning.content };
         }
         yield {
           type: "finish",
-          finish_reason: sawToolCall ? "tool_calls" : "stop",
-          usage: usageData,
-          reasoning_content: reasoningParts.join("") || null,
+          finish_reason: sawToolCall
+            ? "tool_calls"
+            : response.end_turn === false
+              ? null
+              : "stop",
+          ...(usageData == null ? {} : { usage: usageData }),
+          reasoning_content:
+            (reasoningSummaryParts.join("") + reasoningRawParts.join("")) || null,
           response_id: response.id,
         };
         return;
       }
     }
-    throw new ChatGPTOAuthError(
+    throw new ChatGPTOAuthProtocolError(
       "ChatGPT OAuth response stream ended before response.completed",
     );
   }
@@ -470,21 +868,30 @@ export class ChatGPTOAuthProvider {
       promptCacheOptions?: PromptCacheOptions;
       text?: Record<string, unknown>;
       responsesLite?: boolean | string;
+      preparedModel?: PreparedModel;
     } = {},
   ): Promise<Record<string, unknown>[]> {
     if (!prompt || prompt.trim() === "") {
-      throw new ChatGPTOAuthError("image generation prompt is required");
+      throw new ChatGPTOAuthInvalidRequestError("image generation prompt is required");
     }
     const content: Record<string, unknown>[] = [
       { type: "input_text", text: prompt },
     ];
     content.push(
-      ...validateImageContentItems(opts.referenceImages || []),
+      ...validateImageContentItems(opts.referenceImages ?? []),
     );
-    if (opts.size && opts.size !== "auto") {
-      content[0].text = `${prompt}\n\nRequested output size/aspect: ${opts.size}`;
+    if (opts.size != null && opts.size !== "auto") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "image size is not supported by the private Codex OAuth transport",
+      );
     }
-    const requestModel = opts.model || this.model;
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    if (!prepared.capability.inputModalities.includes("image")) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "image generation is not supported by the selected model",
+      );
+    }
+    const requestModel = prepared.slug;
     const payload: Record<string, unknown> = {
       model: wireModel(requestModel),
       instructions:
@@ -497,13 +904,12 @@ export class ChatGPTOAuthProvider {
       stream: true,
       store: false,
       include: [],
-      prompt_cache_key: crypto.randomUUID(),
     };
     setReasoningPayload(
       payload,
-      effectiveReasoningEffort(requestModel, opts.reasoningEffort, opts.reasoning),
+      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
       opts.reasoning,
-      requestModel,
+      prepared.capability,
     );
     rejectUnsupportedPrivateRequestFields(
       payload,
@@ -513,19 +919,28 @@ export class ChatGPTOAuthProvider {
     validatePromptCacheBreakpoints(payload);
     finalizeResponsesPayload(payload, {
       endpoint: "responses",
-      model: requestModel,
+      capability: prepared.capability,
       responsesLite: opts.responsesLite,
       text: opts.text,
       tools: payload.tools as Record<string, unknown>[],
     });
-    const outputItems = await this.collectResponseOutputItems(payload);
-    const generated = outputItems
-      .map(imageGenerationFromItem)
-      .filter(
-        (img): img is Record<string, unknown> => img !== null,
-      );
+    const outputItems = await this.collectResponseOutputItems(payload, prepared);
+    const generated: Record<string, unknown>[] = [];
+    for (const item of outputItems) {
+      if (item.type === "reasoning") {
+        reasoningFromResponseItems([item]);
+        continue;
+      }
+      const image = imageGenerationFromItem(item);
+      if (image == null) {
+        throw new ChatGPTOAuthProtocolError(
+          "image generation response contains an unsupported output item",
+        );
+      }
+      generated.push(image);
+    }
     if (!generated.length) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthProtocolError(
         "image generation response returned no image_generation_call",
       );
     }
@@ -543,16 +958,18 @@ export class ChatGPTOAuthProvider {
       promptCacheOptions?: PromptCacheOptions;
       text?: Record<string, unknown>;
       responsesLite?: boolean | string;
+      preparedModel?: PreparedModel;
     },
   ): Promise<string> {
     if (!prompt || prompt.trim() === "") {
-      throw new ChatGPTOAuthError("image inspection prompt is required");
+      throw new ChatGPTOAuthInvalidRequestError("image inspection prompt is required");
     }
     const content: Record<string, unknown>[] = [
       { type: "input_text", text: prompt },
     ];
     content.push(...validateImageContentItems(opts.images));
-    const requestModel = opts.model || this.model;
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const requestModel = prepared.slug;
     const payload: Record<string, unknown> = {
       model: wireModel(requestModel),
       instructions:
@@ -564,13 +981,12 @@ export class ChatGPTOAuthProvider {
       stream: true,
       store: false,
       include: [],
-      prompt_cache_key: crypto.randomUUID(),
     };
     setReasoningPayload(
       payload,
-      effectiveReasoningEffort(requestModel, opts.reasoningEffort, opts.reasoning),
+      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
       opts.reasoning,
-      requestModel,
+      prepared.capability,
     );
     rejectUnsupportedPrivateRequestFields(
       payload,
@@ -580,15 +996,22 @@ export class ChatGPTOAuthProvider {
     validatePromptCacheBreakpoints(payload);
     finalizeResponsesPayload(payload, {
       endpoint: "responses",
-      model: requestModel,
+      capability: prepared.capability,
       responsesLite: opts.responsesLite,
       text: opts.text,
       tools: payload.tools as Record<string, unknown>[],
     });
-    const outputItems = await this.collectResponseOutputItems(payload);
+    const outputItems = await this.collectResponseOutputItems(payload, prepared);
+    for (const item of outputItems) {
+      if (item.type === "reasoning") {
+        reasoningFromResponseItems([item]);
+      } else {
+        validateAssistantMessageOutputItem(item);
+      }
+    }
     const text = textFromResponseItems(outputItems).trim();
     if (!text) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthProtocolError(
         "image inspection response returned empty content",
       );
     }
@@ -608,13 +1031,17 @@ export class ChatGPTOAuthProvider {
       previousResponseId?: string;
       serviceTier?: string;
       text?: Record<string, unknown>;
+      preparedModel?: PreparedModel;
     } = {},
   ): Promise<string> {
-    const requestModel = opts.model || this.model;
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const requestModel = prepared.slug;
     const [baseInstructions, compactInput] = splitInstructionsAndInput(messages);
     const semanticInput = this.resolveSemanticInput(
       compactInput,
       opts.previousResponseId,
+      prepared.accountId,
+      prepared.capability.compHash,
     );
     const toolsPayload = opts.tools?.map(toolSchemaToResponseDict) ?? [];
     const payload: Record<string, unknown> = {
@@ -637,7 +1064,9 @@ export class ChatGPTOAuthProvider {
     }
     setReasoningPayload(
       payload,
-      opts.reasoningEffort ?? capabilityForModel(requestModel).defaultReasoningEffort,
+      opts.reasoningEffort ?? prepared.capability.defaultReasoningEffort,
+      undefined,
+      prepared.capability,
     );
     rejectUnsupportedPrivateRequestFields(
       payload,
@@ -647,89 +1076,116 @@ export class ChatGPTOAuthProvider {
     validatePromptCacheBreakpoints(payload);
     finalizeResponsesPayload(payload, {
       endpoint: "compact",
-      model: requestModel,
+      capability: prepared.capability,
       responsesLite: opts.responsesLite,
       serviceTier: opts.serviceTier,
       text: opts.text,
       tools: toolsPayload,
     });
-    const data = await this.postJSON("/responses/compact", payload);
+    const data = await this.postJSON(
+      "/responses/compact",
+      payload,
+      prepared.accountId,
+      prepared.snapshot.key,
+    );
     const output = data.output;
     if (!Array.isArray(output)) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthProtocolError(
         "remote compact response missing output array",
       );
     }
-    return REMOTE_COMPACTION_MARKER + "\n" + JSON.stringify(filterCompactedHistoryItems(output));
+    let compacted: Record<string, unknown>[];
+    try {
+      compacted = filterCompactedHistoryItems(output);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthInvalidRequestError) {
+        throw new ChatGPTOAuthProtocolError(err.message);
+      }
+      throw err;
+    }
+    return REMOTE_COMPACTION_MARKER + "\n" + JSON.stringify(compacted);
   }
 
   private async collectResponseOutputItems(
     payload: Record<string, unknown>,
+    prepared: PreparedModel,
   ): Promise<Record<string, unknown>[]> {
     const outputItems: Record<string, unknown>[] = [];
-    let sawCompleted = false;
 
-    for await (const event of this.postSSE("/responses", payload)) {
+    for await (const event of this.postSSE(
+      "/responses",
+      payload,
+      {},
+      prepared.accountId,
+      prepared.snapshot.key,
+    )) {
+      if (!validateResponseEvent(event)) {
+        continue;
+      }
       const typ = event.type;
       if (typ === "response.output_item.done") {
         const item = event.item;
         if (typeof item !== "object" || item === null || Array.isArray(item)) {
-          throw new ChatGPTOAuthError(
+          throw new ChatGPTOAuthProtocolError(
             "response.output_item.done must contain an object item",
           );
         }
         outputItems.push(item as Record<string, unknown>);
+      } else if (typ === "error") {
+        throw new ChatGPTOAuthUpstreamError(
+          502,
+          responseFailureMessage(event, "error"),
+        );
       } else if (typ === "response.failed") {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUpstreamError(
+          502,
           responseFailureMessage(event, "failed"),
         );
       } else if (typ === "response.incomplete") {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUpstreamError(
+          502,
           responseFailureMessage(event, "incomplete"),
         );
       } else if (typ === "response.completed") {
-        completedResponseFromEvent(event);
-        sawCompleted = true;
-        break;
+        const response = completedResponseFromEvent(event);
+        if (response.usage != null && usageFromResponse(response.usage) == null) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed response.usage is malformed",
+          );
+        }
+        return outputItems;
       }
     }
-    if (!sawCompleted) {
-      throw new ChatGPTOAuthError(
-        "ChatGPT OAuth response stream ended before response.completed",
-      );
-    }
-    return outputItems;
+    throw new ChatGPTOAuthProtocolError(
+      "ChatGPT OAuth response stream ended before response.completed",
+    );
   }
 
   private responsesPayload(
     messages: Message[],
     opts: ChatOptions,
+    prepared: PreparedModel,
   ): Record<string, unknown> {
     rejectUnsupportedStop(opts.stop);
     const [instructions, inputItems] =
       splitInstructionsAndInput(messages);
-    if (!instructions) {
-      throw new ChatGPTOAuthError(
-        "ChatGPT OAuth Responses request requires system instructions",
-      );
-    }
-    const requestModel = opts.model || this.model;
+    const requestModel = prepared.slug;
     const semanticInput = this.resolveSemanticInput(
       inputItems,
       opts.previousResponseId,
+      prepared.accountId,
+      prepared.capability.compHash,
     );
     const toolsPayload = opts.tools
       ? opts.tools.map(toolSchemaToResponseDict)
       : [];
-    const lite = useResponsesLite(requestModel, opts.responsesLite);
+    const lite = useResponsesLite(prepared.capability, opts.responsesLite);
     const payload: Record<string, unknown> = {
       model: wireModel(requestModel),
-      instructions,
       input: semanticInput,
       tools: toolsPayload,
       tool_choice: opts.toolChoice ?? "auto",
       parallel_tool_calls: shouldEnableParallelToolCalls({
-        model: requestModel,
         requested: opts.parallelToolCalls,
         responsesLite: lite,
       }),
@@ -737,10 +1193,20 @@ export class ChatGPTOAuthProvider {
       store: false,
       include: [],
     };
+    if (instructions.length > 0) payload.instructions = instructions;
     if ((payload.tools as Record<string, unknown>[]).some((tool) => tool.type === "web_search")) {
       payload.include = ["web_search_call.action.sources"];
     }
-    void opts.maxTokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
+    if (opts.maxTokens != null && opts.ignoreMaxTokens !== true) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "max_tokens and max_completion_tokens are not supported by the private Codex OAuth HTTP transport",
+      );
+    }
+    if (opts.temperature != null) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "temperature is not supported by the private Codex OAuth HTTP transport",
+      );
+    }
     let clientMetadata = normalizeClientMetadata(opts.clientMetadata);
     if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
       clientMetadata = buildCodexClientMetadata({
@@ -769,9 +1235,9 @@ export class ChatGPTOAuthProvider {
     }
     setReasoningPayload(
       payload,
-      effectiveReasoningEffort(requestModel, opts.reasoningEffort, opts.reasoning),
+      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
       opts.reasoning,
-      requestModel,
+      prepared.capability,
     );
     rejectUnsupportedPrivateRequestFields(
       payload,
@@ -781,7 +1247,7 @@ export class ChatGPTOAuthProvider {
     validatePromptCacheBreakpoints(payload);
     finalizeResponsesPayload(payload, {
       endpoint: "responses",
-      model: requestModel,
+      capability: prepared.capability,
       responsesLite: lite,
       serviceTier: opts.serviceTier,
       text: opts.text,
@@ -793,7 +1259,9 @@ export class ChatGPTOAuthProvider {
 
   private resolveSemanticInput(
     input: Record<string, unknown>[],
-    previousResponseId?: string,
+    previousResponseId: string | undefined,
+    accountId: string,
+    currentCompHash?: string,
   ): Record<string, unknown>[] {
     if (previousResponseId == null) return cloneResponseItems(input);
     if (
@@ -805,9 +1273,80 @@ export class ChatGPTOAuthProvider {
       );
     }
     return [
-      ...this.responseChains.resolve(previousResponseId),
+      ...this.responseChains.resolve(accountId, previousResponseId, currentCompHash),
       ...cloneResponseItems(input),
     ];
+  }
+
+  private async fetchModelCatalog(
+    initialToken: ChatGPTTokenData,
+    clientVersion: string,
+  ): Promise<{ value: unknown; etag: string | null }> {
+    let token = initialToken;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const url = new URL(`${this.baseUrl}/models`);
+      url.searchParams.set("client_version", clientVersion);
+      let response: globalThis.Response;
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          redirect: "manual",
+          headers: this.getHeaders(token),
+          signal: AbortSignal.timeout(MODEL_CATALOG_TIMEOUT_MS),
+        });
+      } catch (err) {
+        throw new ChatGPTOAuthCatalogUnavailableError(
+          `upstream model catalog request failed: ${redactText(
+            String(err),
+            token.access_token,
+            token.refresh_token,
+            token.id_token,
+            token.account_id,
+          )}`,
+        );
+      }
+      if (response.status === 401 && attempt === 0) {
+        await cancelResponseBody(response, [
+          token.access_token,
+          token.refresh_token,
+          token.id_token,
+          token.account_id,
+        ], "catalog");
+        const refreshed = await refreshAfterUnauthorized(token);
+        if (refreshed.account_id !== initialToken.account_id) {
+          throw new ChatGPTOAuthRefreshError(
+            "ChatGPT OAuth account changed while refreshing the model catalog",
+          );
+        }
+        token = refreshed;
+        continue;
+      }
+      if (!response.ok) {
+        const body = await readRedactedResponseBody(response, [
+          token.access_token,
+          token.refresh_token,
+          token.id_token,
+          token.account_id,
+        ]);
+        if (response.status === 401) {
+          throw new ChatGPTOAuthUpstreamError(401, `upstream model catalog authentication failed: ${body}`);
+        }
+        throw new ChatGPTOAuthUpstreamError(
+          response.status,
+          `upstream model catalog request failed: HTTP ${response.status}: ${body}`,
+        );
+      }
+      let value: unknown;
+      try {
+        value = await parseJsonResponseStrict(response);
+      } catch {
+        throw new ChatGPTOAuthCatalogUnavailableError(
+          "upstream model catalog is not valid JSON",
+        );
+      }
+      return { value, etag: response.headers.get("etag") };
+    }
+    throw new ChatGPTOAuthUpstreamError(401, "upstream model catalog authentication failed");
   }
 
   private getHeaders(token = loadTokenData(this.authJsonPath)): Record<string, string> {
@@ -826,10 +1365,13 @@ export class ChatGPTOAuthProvider {
   private async postJSON(
     path: string,
     payload: Record<string, unknown>,
+    expectedAccountId: string,
+    catalogKey: string,
   ): Promise<Record<string, unknown>> {
     let tokenValues: (string | null)[] = [null];
     for (let attempt = 0; attempt < 2; attempt++) {
       const token = await tokenForRequest(this.authJsonPath);
+      requireExpectedAccount(token, expectedAccountId);
       const headers = this.getHeaders(token);
       if (isResponsesLitePayload(payload)) {
         headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
@@ -846,38 +1388,47 @@ export class ChatGPTOAuthProvider {
       try {
         response = await fetch(url, {
           method: "POST",
+          redirect: "manual",
           headers,
           body: JSON.stringify(payload),
-          signal: this.timeout
-            ? AbortSignal.timeout(this.timeout)
-            : undefined,
+          signal: AbortSignal.timeout(this.timeout),
         });
       } catch (err) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUnavailableError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
       }
 
       if (!response.ok) {
-        const body = await response.text();
-        const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
+          await cancelResponseBody(response, tokenValues, "request");
           await refreshAfterUnauthorized(token);
           continue;
         }
+        const redacted = await readRedactedResponseBody(response, tokenValues);
         throw new ChatGPTOAuthUpstreamError(
           response.status,
           `ChatGPT OAuth request failed: HTTP ${response.status}: ${redacted}`,
         );
       }
 
-      const data = await response.json();
+      this.modelCatalog.invalidateOnEtagMismatch(
+        catalogKey,
+        response.headers.get("x-models-etag"),
+      );
+
+      let data: unknown;
+      try {
+        data = await parseJsonResponseStrict(response);
+      } catch {
+        throw new ChatGPTOAuthProtocolError("ChatGPT OAuth response is not valid JSON");
+      }
       if (
         typeof data !== "object" ||
         data === null ||
         Array.isArray(data)
       ) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthProtocolError(
           "ChatGPT OAuth response must be a JSON object",
         );
       }
@@ -889,11 +1440,15 @@ export class ChatGPTOAuthProvider {
   private async *postSSE(
     path: string,
     payload: Record<string, unknown>,
-    extraHeaders: Record<string, string> = {},
+    extraHeaders: Record<string, string>,
+    expectedAccountId: string,
+    catalogKey: string,
+    callerSignal?: AbortSignal,
   ): AsyncGenerator<Record<string, unknown>> {
     let tokenValues: (string | null)[] = [null];
     for (let attempt = 0; attempt < 2; attempt++) {
       const token = await tokenForRequest(this.authJsonPath);
+      requireExpectedAccount(token, expectedAccountId);
       const headers = this.getHeaders(token);
       headers.Accept = "text/event-stream";
       Object.assign(headers, extraHeaders);
@@ -908,51 +1463,111 @@ export class ChatGPTOAuthProvider {
       ];
 
       const url = this.baseUrl + path;
+      const requestAbort = callerAbortController(callerSignal);
+      const clearHeaderTimeout = abortAfter(
+        requestAbort.controller,
+        this.timeout,
+        "ChatGPT OAuth request exceeded its response header idle timeout",
+      );
       let response: globalThis.Response;
       try {
         response = await fetch(url, {
           method: "POST",
+          redirect: "manual",
           headers,
           body: JSON.stringify(payload),
-          signal: this.timeout
-            ? AbortSignal.timeout(this.timeout)
-            : undefined,
+          signal: requestAbort.controller.signal,
         });
       } catch (err) {
-        throw new ChatGPTOAuthError(
+        clearHeaderTimeout();
+        requestAbort.dispose();
+        throw new ChatGPTOAuthUnavailableError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
       }
+      clearHeaderTimeout();
 
       if (!response.ok) {
-        const body = await response.text();
-        const redacted = redactText(body, ...tokenValues);
         if (response.status === 401 && attempt === 0) {
+          try {
+            await cancelResponseBody(response, tokenValues, "request");
+          } finally {
+            requestAbort.dispose();
+          }
           await refreshAfterUnauthorized(token);
           continue;
         }
+        const clearErrorBodyTimeout = abortAfter(
+          requestAbort.controller,
+          this.timeout,
+          "ChatGPT OAuth error response body exceeded its idle timeout",
+        );
+        const redacted = await readRedactedResponseBody(response, tokenValues);
+        clearErrorBodyTimeout();
+        requestAbort.dispose();
         throw new ChatGPTOAuthUpstreamError(
           response.status,
           `ChatGPT OAuth request failed: HTTP ${response.status}: ${redacted}`,
         );
       }
 
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
+      this.modelCatalog.invalidateOnEtagMismatch(
+        catalogKey,
+        response.headers.get("x-models-etag"),
+      );
+
+      if (response.body == null) {
+        requestAbort.dispose();
+        throw new ChatGPTOAuthProtocolError("ChatGPT OAuth streaming response has no body");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let buffer = "";
       const block: string[] = [];
+      let reachedEof = false;
+      let streamFailure: unknown;
 
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithIdleTimeout(
+            reader,
+            requestAbort.controller,
+            this.timeout,
+          );
           if (done) {
+            reachedEof = true;
+            try {
+              buffer += decoder.decode();
+            } catch (err) {
+              throw new ChatGPTOAuthProtocolError(
+                `ChatGPT OAuth SSE stream is not valid UTF-8: ${String(err)}`,
+              );
+            }
+            if (buffer.length > 0) {
+              for (const rawLine of buffer.split("\n")) {
+                const line = rawLine.replace(/\r$/, "");
+                if (line === "") {
+                  const event = decodeSSEBlock(block);
+                  block.length = 0;
+                  if (event) yield redactSSEEvent(event, tokenValues);
+                } else {
+                  block.push(line);
+                }
+              }
+            }
             if (block.length) {
               const event = decodeSSEBlock(block);
-              if (event) yield event;
+              if (event) yield redactSSEEvent(event, tokenValues);
             }
             return;
           }
-          buffer += decoder.decode(value, { stream: true });
+          try {
+            buffer += decoder.decode(value, { stream: true });
+          } catch (err) {
+            throw new ChatGPTOAuthProtocolError(
+              `ChatGPT OAuth SSE stream is not valid UTF-8: ${String(err)}`,
+            );
+          }
           const lines = buffer.split("\n");
           buffer = lines.pop()!;
           for (const rawLine of lines) {
@@ -960,33 +1575,195 @@ export class ChatGPTOAuthProvider {
             if (line === "") {
               const event = decodeSSEBlock(block);
               block.length = 0;
-              if (event) yield event;
+              if (event) yield redactSSEEvent(event, tokenValues);
               continue;
             }
             block.push(line);
           }
         }
       } catch (err) {
+        streamFailure = err;
+        if (err instanceof ChatGPTOAuthProtocolError) {
+          throw new ChatGPTOAuthProtocolError(
+            redactText(err.message, ...tokenValues),
+          );
+        }
         if (err instanceof ChatGPTOAuthError) throw err;
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthUnavailableError(
           `ChatGPT OAuth request failed: ${redactText(String(err), ...tokenValues)}`,
         );
+      } finally {
+        if (!reachedEof) {
+          try {
+            await reader.cancel();
+          } catch (err) {
+            if (streamFailure === undefined) {
+              throw new ChatGPTOAuthUnavailableError(
+                `ChatGPT OAuth stream cancellation failed: ${redactText(String(err), ...tokenValues)}`,
+              );
+            }
+          }
+        }
+        try {
+          reader.releaseLock();
+        } catch (err) {
+          if (streamFailure === undefined) {
+            throw new ChatGPTOAuthUnavailableError(
+              `ChatGPT OAuth stream reader release failed: ${redactText(String(err), ...tokenValues)}`,
+            );
+          }
+        }
+        requestAbort.dispose();
       }
       return;
     }
   }
 }
 
+function redactSSEEvent(
+  event: Record<string, unknown>,
+  tokenValues: (string | null | undefined)[],
+): Record<string, unknown> {
+  if (!["error", "response.failed", "response.incomplete"].includes(String(event.type))) {
+    return event;
+  }
+  return redactStructuredStrings(event, tokenValues) as Record<string, unknown>;
+}
+
+function redactStructuredStrings(
+  value: unknown,
+  tokenValues: (string | null | undefined)[],
+): unknown {
+  if (typeof value === "string") return redactText(value, ...tokenValues);
+  if (Array.isArray(value)) {
+    return value.map((item) => redactStructuredStrings(item, tokenValues));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactStructuredStrings(item, tokenValues),
+      ]),
+    );
+  }
+  return value;
+}
+
+async function readRedactedResponseBody(
+  response: globalThis.Response,
+  tokenValues: (string | null | undefined)[],
+): Promise<string> {
+  try {
+    return redactText(await response.text(), ...tokenValues);
+  } catch (err) {
+    return `unable to read upstream error body: ${redactText(String(err), ...tokenValues)}`;
+  }
+}
+
+async function cancelResponseBody(
+  response: globalThis.Response,
+  tokenValues: (string | null | undefined)[],
+  context: "catalog" | "request",
+): Promise<void> {
+  if (response.body == null) return;
+  try {
+    await response.body.cancel();
+  } catch (err) {
+    const detail = redactText(String(err), ...tokenValues);
+    if (context === "catalog") {
+      throw new ChatGPTOAuthCatalogUnavailableError(
+        `upstream model catalog response cancellation failed: ${detail}`,
+      );
+    }
+    throw new ChatGPTOAuthUnavailableError(
+      `ChatGPT OAuth response cancellation failed: ${detail}`,
+    );
+  }
+}
+
+function normalizeBaseUrl(value: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError("baseUrl must not be blank");
+  }
+  if (value.trim() !== value) {
+    throw new ChatGPTOAuthInvalidRequestError("baseUrl must not contain surrounding whitespace");
+  }
+  if (/[\p{White_Space}\p{Cc}]/u.test(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "baseUrl must not contain raw whitespace or control characters",
+    );
+  }
+  if (/%(?![0-9A-Fa-f]{2})/.test(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "baseUrl must not contain malformed percent encoding",
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ChatGPTOAuthInvalidRequestError("baseUrl must be a valid HTTP(S) URL");
+  }
+  const hasExplicitAuthority = value
+    .split("://", 2)[1]
+    ?.split(/[/?#]/, 1)[0]
+    .length;
+  if (
+    (url.protocol !== "https:" && url.protocol !== "http:")
+    || url.hostname.length === 0
+    || !hasExplicitAuthority
+    || url.username.length > 0
+    || url.password.length > 0
+    || url.search.length > 0
+    || url.hash.length > 0
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "baseUrl must be an HTTP(S) URL without credentials, query, or fragment",
+    );
+  }
+  return value.replace(/\/+$/, "");
+}
+
 function normalizeClientMetadata(
   value: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
+): Record<string, string> | undefined {
   if (value == null) return undefined;
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new ChatGPTOAuthInvalidRequestError(
       "client_metadata must be an object when provided",
     );
   }
-  return { ...value };
+  for (const [field, fieldValue] of Object.entries(value)) {
+    if (typeof fieldValue !== "string") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `client_metadata.${field} must be a string`,
+      );
+    }
+  }
+  for (const field of ["session_id", "thread_id"] as const) {
+    const fieldValue = value[field];
+    if (
+      Object.hasOwn(value, field)
+      && typeof fieldValue === "string"
+      && fieldValue.trim().length === 0
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `client_metadata.${field} must be a non-empty string when provided`,
+      );
+    }
+  }
+  return { ...value } as Record<string, string>;
+}
+
+function requireExpectedAccount(
+  token: ChatGPTTokenData,
+  expectedAccountId: string,
+): void {
+  if (token.account_id !== expectedAccountId) {
+    throw new ChatGPTOAuthRefreshError(
+      "ChatGPT OAuth account changed after the model catalog snapshot was prepared",
+    );
+  }
 }
 
 function sessionIdFromClientMetadata(
@@ -996,14 +1773,11 @@ function sessionIdFromClientMetadata(
     return undefined;
   }
   const sessionId = metadata.session_id;
-  return typeof sessionId === "string" && sessionId.trim().length > 0
-    ? sessionId
-    : undefined;
+  return sessionId as string;
 }
 
 function rejectUnsupportedStop(stop: string | string[] | undefined): void {
-  const values = stop == null ? [] : Array.isArray(stop) ? stop : [stop];
-  if (!values.some((value) => value.length > 0)) return;
+  if (stop == null) return;
   throw new ChatGPTOAuthInvalidRequestError(
     "stop is not supported by the private Codex OAuth HTTP transport",
   );
@@ -1014,14 +1788,23 @@ function rejectUnsupportedStop(stop: string | string[] | undefined): void {
 function completedResponseFromEvent(event: Record<string, unknown>): Record<string, unknown> {
   const response = event.response;
   if (typeof response !== "object" || response === null || Array.isArray(response)) {
-    throw new ChatGPTOAuthError(
+    throw new ChatGPTOAuthProtocolError(
       "response.completed must contain an object response",
     );
   }
   const responseRecord = response as Record<string, unknown>;
   if (typeof responseRecord.id !== "string" || responseRecord.id.length === 0) {
-    throw new ChatGPTOAuthError(
+    throw new ChatGPTOAuthProtocolError(
       "response.completed response.id must be a non-empty string",
+    );
+  }
+  if (
+    responseRecord.end_turn !== undefined
+    && responseRecord.end_turn !== null
+    && typeof responseRecord.end_turn !== "boolean"
+  ) {
+    throw new ChatGPTOAuthProtocolError(
+      "response.completed response.end_turn must be a boolean when provided",
     );
   }
   return responseRecord;
@@ -1036,11 +1819,271 @@ export function decodeSSEBlock(
   if (!dataLines.length) return null;
   const joined = dataLines.join("\n");
   if (joined === "[DONE]") return null;
-  const event = JSON.parse(joined);
-  if (typeof event !== "object" || event === null || Array.isArray(event)) {
-    throw new ChatGPTOAuthError("ChatGPT OAuth SSE event must be a JSON object");
+  let event: unknown;
+  try {
+    event = parseJsonStrict(joined);
+  } catch {
+    throw new ChatGPTOAuthProtocolError("ChatGPT OAuth SSE event is not valid JSON");
   }
-  return event;
+  if (typeof event !== "object" || event === null || Array.isArray(event)) {
+    throw new ChatGPTOAuthProtocolError("ChatGPT OAuth SSE event must be a JSON object");
+  }
+  if (typeof (event as Record<string, unknown>).type !== "string") {
+    throw new ChatGPTOAuthProtocolError("ChatGPT OAuth SSE event type must be a string");
+  }
+  return event as Record<string, unknown>;
+}
+
+function validateResponseEvent(event: Record<string, unknown>): boolean {
+  const eventType = event.type;
+  if (typeof eventType !== "string") {
+    throw new ChatGPTOAuthProtocolError(
+      "ChatGPT OAuth SSE event requires a string type",
+    );
+  }
+  if (eventType === "error") {
+    return true;
+  }
+  if (UNSUPPORTED_RESPONSE_EVENT_TYPES.has(eventType)) {
+    throw new ChatGPTOAuthProtocolError(
+      "ChatGPT OAuth SSE event has an unsupported semantic type",
+    );
+  }
+  if (!RESPONSE_EVENT_TYPES.has(eventType)) {
+    return false;
+  }
+  if (eventType === "response.created") {
+    if (!isRecordValue(event.response)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.created must contain an object response",
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.output_item.added") {
+    if (!isRecordValue(event.item)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.added must contain an object item",
+      );
+    }
+    validateAddedResponseItem(event.item);
+    return true;
+  }
+  if (eventType === "response.output_item.done") {
+    if (!isRecordValue(event.item)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.done must contain an object item",
+      );
+    }
+    validateResponseOutputItem(event.item);
+    return true;
+  }
+  if (
+    eventType === "response.content_part.added"
+    || eventType === "response.content_part.done"
+  ) {
+    if (!isRecordValue(event.part)) {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} must contain an object part`,
+      );
+    }
+    if (event.part.type !== "output_text") {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} has an unsupported semantic part type`,
+      );
+    }
+    if (typeof event.part.text !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} output_text part requires a text string`,
+      );
+    }
+    if (Object.hasOwn(event.part, "annotations") && !Array.isArray(event.part.annotations)) {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} output_text annotations must be an array`,
+      );
+    }
+    if (Object.hasOwn(event.part, "logprobs") && !Array.isArray(event.part.logprobs)) {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} output_text logprobs must be an array`,
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.output_text.delta") {
+    if (typeof event.delta !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `${eventType} requires a string delta`,
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.reasoning_summary_text.delta") {
+    if (
+      typeof event.delta !== "string"
+      || !Number.isSafeInteger(event.summary_index)
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.reasoning_summary_text.delta requires string delta and integer summary_index",
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.reasoning_summary_text.done") {
+    if (
+      typeof event.item_id !== "string"
+      || typeof event.text !== "string"
+      || !Number.isSafeInteger(event.summary_index)
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.reasoning_summary_text.done requires string item_id/text and integer summary_index",
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.reasoning_text.delta") {
+    if (
+      typeof event.delta !== "string"
+      || !Number.isSafeInteger(event.content_index)
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.reasoning_text.delta requires string delta and integer content_index",
+      );
+    }
+    return true;
+  }
+  if (eventType === "response.reasoning_summary_part.added") {
+    if (!Number.isSafeInteger(event.summary_index)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.reasoning_summary_part.added requires integer summary_index",
+      );
+    }
+  }
+  return true;
+}
+
+function validateAddedResponseItem(item: Record<string, unknown>): void {
+  const itemType = item.type;
+  if (typeof itemType !== "string" || itemType.length === 0) {
+    throw new ChatGPTOAuthProtocolError(
+      "response.output_item.added item requires a non-empty string type",
+    );
+  }
+  if (itemType === "custom_tool_call") {
+    throw new ChatGPTOAuthProtocolError(
+      "custom_tool_call is not supported by the public tool contract",
+    );
+  }
+  validateResponseItemOptionalFields(item, itemType);
+  if (itemType === "function_call") {
+    requireAddedItemStrings(item, itemType, ["name", "arguments", "call_id"]);
+    return;
+  }
+  if (itemType === "web_search_call") {
+    if (item.status != null && typeof item.status !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.added web_search_call status must be a string when provided",
+      );
+    }
+    if (item.action != null && !isRecordValue(item.action)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.added web_search_call action must be an object when provided",
+      );
+    }
+    return;
+  }
+  if (itemType === "message") {
+    if (typeof item.role !== "string" || !Array.isArray(item.content)) {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.added message requires string role and content array",
+      );
+    }
+    for (const [index, rawPart] of item.content.entries()) {
+      if (!isRecordValue(rawPart) || typeof rawPart.type !== "string") {
+        throw new ChatGPTOAuthProtocolError(
+          `response.output_item.added message content ${index} must be a typed object`,
+        );
+      }
+      const valueField = rawPart.type === "input_image"
+        ? "image_url"
+        : rawPart.type === "input_audio"
+          ? "audio_url"
+          : "text";
+      if (
+        !["input_text", "input_image", "input_audio", "output_text"].includes(rawPart.type)
+        || typeof rawPart[valueField] !== "string"
+      ) {
+        throw new ChatGPTOAuthProtocolError(
+          `response.output_item.added message content ${index} is not a valid ResponseItem content part`,
+        );
+      }
+    }
+    return;
+  }
+  if (itemType === "reasoning") {
+    validateAddedReasoningParts(item.summary, "summary", new Set(["summary_text"]));
+    if (item.content != null) {
+      validateAddedReasoningParts(
+        item.content,
+        "content",
+        new Set(["reasoning_text", "text"]),
+      );
+    }
+    if (item.encrypted_content != null && typeof item.encrypted_content !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        "response.output_item.added reasoning encrypted_content must be a string when provided",
+      );
+    }
+    return;
+  }
+  if (itemType === "image_generation_call") {
+    imageGenerationFromItem(item);
+    return;
+  }
+  throw new ChatGPTOAuthProtocolError(
+    "response.output_item.added item has an unsupported type",
+  );
+}
+
+function requireAddedItemStrings(
+  item: Record<string, unknown>,
+  itemType: string,
+  fields: string[],
+): void {
+  for (const field of fields) {
+    if (typeof item[field] !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `response.output_item.added ${itemType} requires string ${field}`,
+      );
+    }
+  }
+}
+
+function validateAddedReasoningParts(
+  value: unknown,
+  field: string,
+  allowedTypes: ReadonlySet<string>,
+): void {
+  if (!Array.isArray(value)) {
+    throw new ChatGPTOAuthProtocolError(
+      `response.output_item.added reasoning requires ${field} array`,
+    );
+  }
+  for (const [index, rawPart] of value.entries()) {
+    if (
+      !isRecordValue(rawPart)
+      || typeof rawPart.type !== "string"
+      || !allowedTypes.has(rawPart.type)
+      || typeof rawPart.text !== "string"
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        `response.output_item.added reasoning ${field} ${index} is not a valid ResponseItem part`,
+      );
+    }
+  }
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function splitInstructionsAndInput(
@@ -1088,9 +2131,16 @@ export function messagesToResponseItems(
       const raw = message.content
         .slice(REMOTE_COMPACTION_MARKER.length)
         .trim();
-      const parsed = JSON.parse(raw);
+      let parsed: unknown;
+      try {
+        parsed = parseJsonStrict(raw);
+      } catch (err) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `remote compaction marker must contain valid JSON: ${String(err)}`,
+        );
+      }
       if (!Array.isArray(parsed)) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           "remote compaction marker must contain a response item array",
         );
       }
@@ -1099,10 +2149,12 @@ export function messagesToResponseItems(
     }
 
     if (message.role === MessageRole.TOOL) {
+      if (typeof message.tool_call_id !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError("tool message requires a string tool_call_id");
+      }
       items.push({
         type: "function_call_output",
-        call_id:
-          message.tool_call_id || message.name || "tool-call",
+        call_id: message.tool_call_id,
         output: message.content,
       });
       continue;
@@ -1112,7 +2164,7 @@ export function messagesToResponseItems(
       message.role === MessageRole.ASSISTANT &&
       message.tool_calls?.length
     ) {
-      if (message.content || message.structured_content?.length) {
+      if (message.content || message.structured_content != null) {
         items.push(messageItem(
           "assistant",
           message.content,
@@ -1121,18 +2173,35 @@ export function messagesToResponseItems(
         ));
       }
       for (const tc of message.tool_calls) {
+        if (typeof tc.id !== "string") {
+          throw new ChatGPTOAuthInvalidRequestError("assistant tool call requires a string id");
+        }
+        if (typeof tc.name !== "string") {
+          throw new ChatGPTOAuthInvalidRequestError("assistant tool call requires a string name");
+        }
+        if (typeof tc.arguments !== "string") {
+          throw new ChatGPTOAuthInvalidRequestError("assistant tool call arguments must be a string");
+        }
         items.push({
           type: "function_call",
           call_id: tc.id,
           name: tc.name,
-          arguments: JSON.stringify(tc.arguments),
+          arguments: tc.arguments,
         });
       }
       continue;
     }
 
-    const role =
-      message.role === MessageRole.ASSISTANT ? "assistant" : "user";
+    if (
+      message.role !== MessageRole.USER
+      && message.role !== MessageRole.DEVELOPER
+      && message.role !== MessageRole.ASSISTANT
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `unsupported internal message role ${JSON.stringify(message.role)}`,
+      );
+    }
+    const role = message.role;
     items.push(messageItem(
       role,
       message.content,
@@ -1149,6 +2218,9 @@ export function messageItem(
   images?: string[],
   structuredContent?: MessageContentPart[],
 ): Record<string, unknown> {
+  if (role !== "user" && role !== "developer" && role !== "assistant") {
+    throw new ChatGPTOAuthInvalidRequestError("message role must be user, developer, or assistant");
+  }
   const typ = role === "assistant" ? "output_text" : "input_text";
   const contentItems: Record<string, unknown>[] = [];
   if (structuredContent != null) {
@@ -1165,17 +2237,19 @@ export function messageItem(
       if (part.type === "text") {
         const item: Record<string, unknown> = { type: typ, text: part.text };
         contentItems.push(item);
-      } else {
+      } else if (part.type === "image_url") {
         const item: Record<string, unknown> = {
           type: "input_image",
           image_url: part.image_url,
         };
         if (part.detail != null) item.detail = part.detail;
         contentItems.push(item);
+      } else {
+        contentItems.push({ type: "input_audio", audio_url: part.audio_url });
       }
     }
   } else {
-    contentItems.push({ type: typ, text: content || "" });
+    contentItems.push({ type: typ, text: content });
   }
   if (images && structuredContent == null) {
     for (const imageUrl of images) {
@@ -1192,13 +2266,13 @@ export function messageItem(
 export function toolSchemaToResponseDict(
   tool: ToolSchema,
 ): Record<string, unknown> {
-  if (tool.allowed_callers != null) {
-    throw new ChatGPTOAuthError(
+  if (Object.hasOwn(tool, "allowed_callers")) {
+    throw new ChatGPTOAuthInvalidRequestError(
       "programmatic tool allowed_callers is not supported",
     );
   }
-  if (tool.output_schema != null) {
-    throw new ChatGPTOAuthError(
+  if (Object.hasOwn(tool, "output_schema")) {
+    throw new ChatGPTOAuthInvalidRequestError(
       "programmatic tool output_schema is not supported",
     );
   }
@@ -1211,41 +2285,80 @@ export function toolSchemaToResponseDict(
     ) {
       return { ...(openaiTool as Record<string, unknown>) };
     }
-    return { type: "web_search", external_web_access: true };
+    throw new ChatGPTOAuthInvalidRequestError(
+      "web_search tool metadata must contain an OpenAI tool object",
+    );
   }
-  return {
+  const result: Record<string, unknown> = {
     type: "function",
     name: tool.name,
-    description: tool.description,
     parameters: tool.parameters,
-    strict: false,
+    strict: tool.strict ?? false,
   };
+  if (tool.description !== undefined) result.description = tool.description;
+  return result;
 }
 
 function finalizeResponsesPayload(
   payload: Record<string, unknown>,
   opts: {
     endpoint: "responses" | "compact";
-    model: string;
+    capability: ModelCapability;
     responsesLite?: boolean | string;
     serviceTier?: string;
     text?: Record<string, unknown>;
     tools: Record<string, unknown>[];
   },
 ): void {
+  for (const modality of requiredInputModalities(payload)) {
+    if (!opts.capability.inputModalities.includes(modality)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${modality} input is not supported by the selected model`,
+      );
+    }
+  }
   if (
-    !capabilityForModel(opts.model).supportsImageDetailOriginal
+    !opts.capability.supportsImageDetailOriginal
     && hasOriginalImageDetail(payload)
   ) {
     throw new ChatGPTOAuthInvalidRequestError(
-      `image detail "original" is not supported by model ${JSON.stringify(opts.model)}`,
+      "image detail original is not supported by the selected model",
     );
   }
-  applyModelCapabilityFields(payload, opts.model, opts.text, opts.serviceTier);
+  applyModelCapabilityFields(payload, opts.capability, opts.text, opts.serviceTier);
+  const configuredSummary = opts.capability.supportsReasoningSummaryParameter
+    && opts.capability.defaultReasoningSummary !== "none"
+    ? opts.capability.defaultReasoningSummary
+    : undefined;
+  if (configuredSummary != null) {
+    if (payload.reasoning == null) payload.reasoning = {};
+    if (!isRecordValue(payload.reasoning)) {
+      throw new ChatGPTOAuthProtocolError("internal Responses reasoning must be an object");
+    }
+    payload.reasoning.summary = configuredSummary;
+  } else if (isRecordValue(payload.reasoning)) {
+    delete payload.reasoning.summary;
+  }
+  if (opts.endpoint === "responses") {
+    if (Object.hasOwn(payload, "include") && !Array.isArray(payload.include)) {
+      throw new ChatGPTOAuthInvalidRequestError("include must be an array");
+    }
+    const include = Array.isArray(payload.include) ? payload.include : [];
+    if (!include.includes("reasoning.encrypted_content")) {
+      include.push("reasoning.encrypted_content");
+    }
+    payload.include = include;
+  }
   if (opts.endpoint === "compact") {
     delete payload.include;
   }
-  if (!useResponsesLite(opts.model, opts.responsesLite)) return;
+  if (!useResponsesLite(opts.capability, opts.responsesLite)) return;
+
+  if (hasAnyImageDetail(payload)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "explicit image detail cannot be represented by Responses Lite",
+    );
+  }
 
   const unsupportedTool = opts.tools.find(
     (tool) => tool.type === "web_search"
@@ -1253,24 +2366,30 @@ function finalizeResponsesPayload(
       || tool.type === "programmatic_tool_calling",
   );
   if (unsupportedTool) {
-    throw new ChatGPTOAuthError(
+    throw new ChatGPTOAuthInvalidRequestError(
       `Responses Lite cannot use hosted ${String(unsupportedTool.type)} without a standalone executor`,
     );
   }
 
-  const instructions = String(payload.instructions ?? "");
+  if (payload.instructions != null && typeof payload.instructions !== "string") {
+    throw new ChatGPTOAuthProtocolError("internal Responses instructions must be a string");
+  }
+  const instructions = payload.instructions ?? "";
   delete payload.instructions;
   delete payload.tools;
   if (opts.endpoint === "responses") {
     if (payload.tool_choice !== "auto") {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         "Responses Lite requires tool_choice to be the exact string auto",
       );
     }
     payload.tool_choice = "auto";
   }
   payload.parallel_tool_calls = false;
-  const input = Array.isArray(payload.input) ? payload.input : [];
+  if (!Array.isArray(payload.input)) {
+    throw new ChatGPTOAuthProtocolError("internal Responses input must be an array");
+  }
+  const input = payload.input;
   const developerItems: Record<string, unknown>[] = [
     { type: "additional_tools", role: "developer", tools: opts.tools },
   ];
@@ -1281,15 +2400,15 @@ function finalizeResponsesPayload(
       content: [{ type: "input_text", text: instructions }],
     });
   }
-  payload.input = stripImageDetailFields([...developerItems, ...input]);
-  const reasoning = typeof payload.reasoning === "object"
-    && payload.reasoning !== null
-    && !Array.isArray(payload.reasoning)
-    ? payload.reasoning as Record<string, unknown>
-    : {};
+  payload.input = [...developerItems, ...input];
+  if (payload.reasoning == null) payload.reasoning = {};
+  if (!isRecordValue(payload.reasoning)) {
+    throw new ChatGPTOAuthProtocolError("internal Responses reasoning must be an object");
+  }
+  const reasoning = payload.reasoning;
   if (opts.endpoint === "responses") {
     if (reasoning.context != null && reasoning.context !== "all_turns") {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         "Responses Lite reasoning.context must be all_turns when explicitly provided",
       );
     }
@@ -1297,16 +2416,64 @@ function finalizeResponsesPayload(
     delete reasoning.mode;
   }
   reasoning.context = "all_turns";
-  payload.reasoning = reasoning;
   (payload as Record<PropertyKey, unknown>)[RESPONSES_LITE_PAYLOAD] = true;
 }
 
-function hasOriginalImageDetail(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(hasOriginalImageDetail);
-  if (typeof value !== "object" || value === null) return false;
-  const object = value as Record<string, unknown>;
-  if (object.type === "input_image" && object.detail === "original") return true;
-  return Object.values(object).some(hasOriginalImageDetail);
+function hasOriginalImageDetail(payload: Record<string, unknown>): boolean {
+  return responseInputImageParts(payload).some((part) => part.detail === "original");
+}
+
+function hasInputImage(payload: Record<string, unknown>): boolean {
+  return responseInputImageParts(payload).length > 0;
+}
+
+function requiredInputModalities(
+  payload: Record<string, unknown>,
+): Array<"text" | "image" | "audio"> {
+  const required = new Set<"text" | "image" | "audio">();
+  const collectParts = (parts: unknown): void => {
+    if (!Array.isArray(parts)) return;
+    for (const part of parts) {
+      if (!isRecordValue(part)) continue;
+      if (part.type === "input_text" || part.type === "output_text") required.add("text");
+      else if (part.type === "input_image") required.add("image");
+      else if (part.type === "input_audio") required.add("audio");
+    }
+  };
+  if (typeof payload.instructions === "string" && payload.instructions.length > 0) {
+    required.add("text");
+  }
+  if (!Array.isArray(payload.input)) return [...required];
+  for (const item of payload.input) {
+    if (!isRecordValue(item)) continue;
+    if (item.type === "message") {
+      collectParts(item.content);
+    } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+      if (typeof item.output === "string") required.add("text");
+      else collectParts(item.output);
+    }
+  }
+  return [...required];
+}
+
+function hasAnyImageDetail(payload: Record<string, unknown>): boolean {
+  return responseInputImageParts(payload).some((part) => part.detail != null);
+}
+
+function responseInputImageParts(
+  payload: Record<string, unknown>,
+): Record<string, unknown>[] {
+  if (!Array.isArray(payload.input)) return [];
+  const images: Record<string, unknown>[] = [];
+  for (const item of payload.input) {
+    if (!isRecordValue(item) || item.type !== "message" || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (const part of item.content) {
+      if (isRecordValue(part) && part.type === "input_image") images.push(part);
+    }
+  }
+  return images;
 }
 
 function isResponsesLitePayload(payload: Record<string, unknown>): boolean {
@@ -1328,7 +2495,7 @@ function filterCompactedHistoryItems(
   const compacted: Record<string, unknown>[] = [];
   for (const [index, item] of items.entries()) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      throw new ChatGPTOAuthError(`${source} item ${index} must be an object`);
+      throw new ChatGPTOAuthInvalidRequestError(`${source} item ${index} must be an object`);
     }
     const record = item as Record<string, unknown>;
     validateCompactedHistoryItem(record, source, index);
@@ -1345,37 +2512,47 @@ function validateCompactedHistoryItem(
   index: number,
 ): void {
   if (typeof item.type !== "string") {
-    throw new ChatGPTOAuthError(`${source} item ${index} must have a string type`);
+    throw new ChatGPTOAuthInvalidRequestError(`${source} item ${index} must have a string type`);
   }
-  if (item.type === "message") {
-    if (typeof item.role !== "string") {
-      throw new ChatGPTOAuthError(`${source} message item ${index} must have a string role`);
-    }
-    if (!Array.isArray(item.content)) {
-      throw new ChatGPTOAuthError(`${source} message item ${index} must have an array content field`);
-    }
-    validateMessageContentItems(item.content, source, index);
-    if (containsPromptCacheBreakpoint(item.content)) {
-      throw new ChatGPTOAuthError(
-        "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
+  try {
+    validateResponseItemOptionalFields(item, item.type);
+  } catch (err) {
+    if (err instanceof ChatGPTOAuthProtocolError) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} ${item.type} item ${index} is invalid: ${err.message}`,
       );
     }
+    throw err;
+  }
+  if (item.type === "message") {
+    if (
+      typeof item.role !== "string"
+      || !["user", "assistant", "developer"].includes(item.role)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} message item ${index} role must be one of: user, assistant, developer`,
+      );
+    }
+    if (!Array.isArray(item.content)) {
+      throw new ChatGPTOAuthInvalidRequestError(`${source} message item ${index} must have an array content field`);
+    }
+    validateMessageContentItems(item.content, source, index);
     return;
   }
   if (item.type === "agent_message") {
     if (typeof item.author !== "string" || typeof item.recipient !== "string") {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `${source} agent_message item ${index} must have string author and recipient fields`,
       );
     }
     if (!Array.isArray(item.content)) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `${source} agent_message item ${index} must have an array content field`,
       );
     }
     for (const [contentIndex, contentItem] of item.content.entries()) {
       if (typeof contentItem !== "object" || contentItem === null || Array.isArray(contentItem)) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `${source} agent_message item ${index} content item ${contentIndex} must be an object`,
         );
       }
@@ -1384,7 +2561,7 @@ function validateCompactedHistoryItem(
       const validEncrypted = part.type === "encrypted_content"
         && typeof part.encrypted_content === "string";
       if (!validInputText && !validEncrypted) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `${source} agent_message item ${index} content item ${contentIndex} is invalid`,
         );
       }
@@ -1393,7 +2570,7 @@ function validateCompactedHistoryItem(
   }
   if (item.type === "compaction" || item.type === "compaction_summary") {
     if (typeof item.encrypted_content !== "string") {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `${source} ${String(item.type)} item ${index} must have string encrypted_content`,
       );
     }
@@ -1405,10 +2582,59 @@ function validateCompactedHistoryItem(
     && item.encrypted_content != null
     && typeof item.encrypted_content !== "string"
   ) {
-    throw new ChatGPTOAuthError(
+    throw new ChatGPTOAuthInvalidRequestError(
       `${source} context_compaction item ${index} encrypted_content must be a string`,
     );
   }
+  if (item.type === "context_compaction") return;
+  if (item.type === "additional_tools") {
+    if (item.role !== "developer" || !Array.isArray(item.tools)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} additional_tools item ${index} must have developer role and an array tools field`,
+      );
+    }
+    if (item.tools.some((tool) => typeof tool !== "object" || tool === null || Array.isArray(tool))) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} additional_tools item ${index} tools must contain only objects`,
+      );
+    }
+    return;
+  }
+  if (item.type === "reasoning") {
+    if (
+      Object.hasOwn(item, "encrypted_content")
+      && item.encrypted_content != null
+      && typeof item.encrypted_content !== "string"
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} reasoning item ${index} encrypted_content must be a string or null`,
+      );
+    }
+    try {
+      reasoningFromResponseItems([item]);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthProtocolError) {
+        throw new ChatGPTOAuthInvalidRequestError(`${source} reasoning item ${index} is invalid: ${err.message}`);
+      }
+      throw err;
+    }
+    return;
+  }
+  if (item.type === "function_call") {
+    if (
+      typeof item.call_id !== "string"
+      || typeof item.name !== "string"
+      || typeof item.arguments !== "string"
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${source} function_call item ${index} requires string call_id/name/arguments`,
+      );
+    }
+    return;
+  }
+  throw new ChatGPTOAuthInvalidRequestError(
+    `${source} item ${index} has an unsupported type`,
+  );
 }
 
 function validateMessageContentItems(
@@ -1418,14 +2644,14 @@ function validateMessageContentItems(
 ): void {
   for (const [contentIndex, contentItem] of content.entries()) {
     if (typeof contentItem !== "object" || contentItem === null || Array.isArray(contentItem)) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `${source} message item ${index} content item ${contentIndex} must be an object`,
       );
     }
     const part = contentItem as Record<string, unknown>;
     if (part.type === "input_text" || part.type === "output_text") {
       if (typeof part.text !== "string") {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `${source} message item ${index} content item ${contentIndex} must have string text`,
         );
       }
@@ -1437,7 +2663,7 @@ function validateMessageContentItems(
     }
     if (part.type === "input_image") {
       if (typeof part.image_url !== "string") {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `${source} message item ${index} content item ${contentIndex} must have string image_url`,
         );
       }
@@ -1448,7 +2674,7 @@ function validateMessageContentItems(
           || !["auto", "low", "high", "original"].includes(part.detail)
         )
       ) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `${source} message item ${index} content item ${contentIndex} has invalid detail`,
         );
       }
@@ -1458,7 +2684,15 @@ function validateMessageContentItems(
       );
       continue;
     }
-    throw new ChatGPTOAuthError(
+    if (part.type === "input_audio") {
+      if (typeof part.audio_url !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `${source} message item ${index} content item ${contentIndex} must have string audio_url`,
+        );
+      }
+      continue;
+    }
+    throw new ChatGPTOAuthInvalidRequestError(
       `${source} message item ${index} content item ${contentIndex} has an unsupported type`,
     );
   }
@@ -1469,7 +2703,7 @@ function validatePromptCacheBreakpointValue(
   _source: string,
 ): void {
   if (value == null) return;
-  throw new ChatGPTOAuthError(
+  throw new ChatGPTOAuthInvalidRequestError(
     "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
   );
 }
@@ -1549,19 +2783,18 @@ function isContextualUserText(text: string): boolean {
 
 export function webSearchEventFromResponseItem(
   item: Record<string, unknown>,
-  allItems: Record<string, unknown>[] = [],
 ): StreamEvent | null {
   if (item.type !== "web_search_call") return null;
-  const rawId = String(item.id ?? item.call_id ?? crypto.randomUUID().replace(/-/g, ""));
-  const id = rawId.startsWith("srvtoolu_") ? rawId : `srvtoolu_${rawId.replace(/[^A-Za-z0-9_]/g, "")}`;
-  const action = (typeof item.action === "object" && item.action !== null && !Array.isArray(item.action))
-    ? item.action as Record<string, unknown>
-    : {};
+  if (typeof item.id !== "string") {
+    throw new ChatGPTOAuthProtocolError("web_search_call must contain a string id");
+  }
+  if (typeof item.action !== "object" || item.action === null || Array.isArray(item.action)) {
+    throw new ChatGPTOAuthProtocolError("web_search_call must contain an object action");
+  }
+  const id = item.id;
+  const action = item.action as Record<string, unknown>;
   const query = webSearchQueryFromAction(action);
   const sources = webSearchSourcesFromAction(action);
-  if (!sources.length && allItems.length) {
-    sources.push(...webSearchSourcesFromAnnotations(allItems));
-  }
   return {
     type: "web_search_call",
     id,
@@ -1571,56 +2804,80 @@ export function webSearchEventFromResponseItem(
 }
 
 function webSearchQueryFromAction(action: Record<string, unknown>): string {
-  const query = action.query;
-  if (typeof query === "string") return query;
-  const queries = action.queries;
-  if (Array.isArray(queries)) {
-    const first = queries.find((q): q is string => typeof q === "string" && q.length > 0);
-    if (first) return first;
+  const actionType = action.type;
+  if (typeof actionType !== "string") {
+    throw new ChatGPTOAuthProtocolError("web_search_call action.type must be a string");
   }
-  const url = action.url;
-  if (typeof url === "string") return url;
-  return "";
+  if (actionType !== "search") {
+    throw new ChatGPTOAuthProtocolError(
+      `web_search_call action type ${actionType} cannot be represented by this facade`,
+    );
+  }
+
+  const queries = action.queries;
+  if (
+    queries != null
+    && (
+      !Array.isArray(queries)
+      || queries.some((candidate) => typeof candidate !== "string")
+    )
+  ) {
+    throw new ChatGPTOAuthProtocolError(
+      "web_search_call action.queries must be an array of strings",
+    );
+  }
+  const query = action.query;
+  if (query != null && typeof query !== "string") {
+    throw new ChatGPTOAuthProtocolError("web_search_call action.query must be a string");
+  }
+  if (Array.isArray(queries) && queries.length > 1) {
+    throw new ChatGPTOAuthProtocolError(
+      "web_search_call action contains multiple queries that cannot be represented by this facade",
+    );
+  }
+  if (typeof query === "string") {
+    if (Array.isArray(queries) && queries.length === 1 && queries[0] !== query) {
+      throw new ChatGPTOAuthProtocolError("web_search_call action.query conflicts with action.queries");
+    }
+    return query;
+  }
+  if (Array.isArray(queries) && queries.length === 1) return queries[0] as string;
+  throw new ChatGPTOAuthProtocolError("web_search_call action must contain a query");
 }
 
 function webSearchSourcesFromAction(action: Record<string, unknown>): Record<string, unknown>[] {
+  if (!Object.hasOwn(action, "sources")) {
+    throw new ChatGPTOAuthProtocolError(
+      "web_search_call action.sources is required when sources were requested",
+    );
+  }
   return normalizeWebSearchSources(action.sources);
 }
 
-function webSearchSourcesFromAnnotations(items: Record<string, unknown>[]): Record<string, unknown>[] {
-  const rawSources: Record<string, unknown>[] = [];
-  for (const item of items) {
-    const content = item.content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (typeof part !== "object" || part === null) continue;
-      const annotations = (part as Record<string, unknown>).annotations;
-      if (!Array.isArray(annotations)) continue;
-      for (const ann of annotations) {
-        if (typeof ann !== "object" || ann === null) continue;
-        const a = ann as Record<string, unknown>;
-        if (a.type !== "url_citation") continue;
-        rawSources.push(a);
-      }
-    }
-  }
-  return normalizeWebSearchSources(rawSources);
-}
-
 function normalizeWebSearchSources(value: unknown): Record<string, unknown>[] {
-  if (!Array.isArray(value)) return [];
+  if (!Array.isArray(value)) {
+    throw new ChatGPTOAuthProtocolError("web_search_call action.sources must be an array");
+  }
   const out: Record<string, unknown>[] = [];
-  const seen = new Set<string>();
-  for (const source of value) {
-    if (typeof source !== "object" || source === null) continue;
+  for (const [index, source] of value.entries()) {
+    if (typeof source !== "object" || source === null || Array.isArray(source)) {
+      throw new ChatGPTOAuthProtocolError(`web_search source ${index} must be an object`);
+    }
     const s = source as Record<string, unknown>;
-    const url = typeof s.url === "string" ? s.url : "";
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
+    if (typeof s.url !== "string" || s.url.length === 0) {
+      throw new ChatGPTOAuthProtocolError(`web_search source ${index} requires a non-empty url`);
+    }
+    if (s.title != null && typeof s.title !== "string") {
+      throw new ChatGPTOAuthProtocolError(`web_search source ${index} title must be a string when provided`);
+    }
+    if (s.page_age != null && typeof s.page_age !== "string") {
+      throw new ChatGPTOAuthProtocolError(`web_search source ${index} page_age must be a string when provided`);
+    }
+    const url = s.url;
     const result: Record<string, unknown> = {
       type: "web_search_result",
       url,
-      title: typeof s.title === "string" ? s.title : url,
+      ...(typeof s.title === "string" ? { title: s.title } : {}),
     };
     if (typeof s.page_age === "string") result.page_age = s.page_age;
     out.push(result);
@@ -1629,7 +2886,7 @@ function normalizeWebSearchSources(value: unknown): Record<string, unknown>[] {
 }
 
 function effectiveReasoningEffort(
-  model: string,
+  capability: ModelCapability,
   reasoningEffort?: string,
   reasoning?: ReasoningOptions,
 ): string | undefined {
@@ -1645,15 +2902,14 @@ function effectiveReasoningEffort(
   }
   return reasoningEffort
     ?? nestedEffort
-    ?? (reasoning?.mode != null ? "medium" : undefined)
-    ?? capabilityForModel(model).defaultReasoningEffort;
+    ?? capability.defaultReasoningEffort;
 }
 
 export function setReasoningPayload(
   payload: Record<string, unknown>,
   reasoningEffort?: string,
   reasoning?: ReasoningOptions,
-  model?: string,
+  capability?: ModelCapability,
 ): void {
   if (reasoning != null && (typeof reasoning !== "object" || Array.isArray(reasoning))) {
     throw new ChatGPTOAuthInvalidRequestError("reasoning must be an object");
@@ -1685,6 +2941,11 @@ export function setReasoningPayload(
       "reasoning_effort must be a non-empty string when provided",
     );
   }
+  if (selectedEffort != null && selectedEffort !== selectedEffort.trim()) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "reasoning_effort must not contain surrounding whitespace",
+    );
+  }
   const mode = nested?.mode;
   if (mode != null && (typeof mode !== "string" || !REASONING_MODES.has(mode))) {
     throw new ChatGPTOAuthInvalidRequestError("reasoning.mode must be one of: standard, pro");
@@ -1698,24 +2959,23 @@ export function setReasoningPayload(
       "reasoning.context must be one of: auto, current_turn, all_turns",
     );
   }
-  const requestModel = model
-    ?? (typeof payload.model === "string" ? payload.model : undefined);
-  if (mode != null && !isGpt56Model(requestModel)) {
+  if (mode != null) {
     throw new ChatGPTOAuthInvalidRequestError(
-      "reasoning.mode is supported only by GPT-5.6 models",
-    );
-  }
-  if (mode === "pro") {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "reasoning.mode pro is not supported by the private Codex OAuth transport",
+      "reasoning.mode is not supported by the private Codex OAuth transport",
     );
   }
 
-  const existing = typeof payload.reasoning === "object"
-    && payload.reasoning !== null
-    && !Array.isArray(payload.reasoning)
-    ? payload.reasoning as Record<string, unknown>
-    : {};
+  let existing: Record<string, unknown> = {};
+  if (Object.hasOwn(payload, "reasoning")) {
+    if (
+      typeof payload.reasoning !== "object"
+      || payload.reasoning === null
+      || Array.isArray(payload.reasoning)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError("reasoning must be an object");
+    }
+    existing = payload.reasoning as Record<string, unknown>;
+  }
   const existingMode = mode == null ? existing.mode : undefined;
   if (
     existingMode != null
@@ -1723,29 +2983,28 @@ export function setReasoningPayload(
   ) {
     throw new ChatGPTOAuthInvalidRequestError("reasoning.mode must be one of: standard, pro");
   }
-  if (existingMode != null && !isGpt56Model(requestModel)) {
+  if (existingMode != null) {
     throw new ChatGPTOAuthInvalidRequestError(
-      "reasoning.mode is supported only by GPT-5.6 models",
-    );
-  }
-  if (existingMode === "pro") {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "reasoning.mode pro is not supported by the private Codex OAuth transport",
+      "reasoning.mode is not supported by the private Codex OAuth transport",
     );
   }
   const merged: Record<string, unknown> = { ...existing };
   delete merged.mode;
   if (selectedEffort != null) {
-    merged.effort = KNOWN_REASONING_EFFORT_VALUES.has(selectedEffort)
-      ? selectedEffort === "ultra" ? "max" : selectedEffort
-      : selectedEffort;
+    if (capability == null) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "model catalog capability is required when reasoning effort is provided",
+      );
+    }
+    merged.effort = wireReasoningEffort(selectedEffort, capability);
   }
-  // The private Codex request schema has no mode field. Public "standard"
-  // retains its public default-effort behavior but is omitted on the wire.
   if (context != null) merged.context = context;
   if (Object.keys(merged).length === 0) {
     delete payload.reasoning;
     return;
+  }
+  if (Object.hasOwn(payload, "include") && !Array.isArray(payload.include)) {
+    throw new ChatGPTOAuthInvalidRequestError("include must be an array");
   }
   payload.reasoning = merged;
   const include = Array.isArray(payload.include) ? payload.include : [];
@@ -1755,12 +3014,33 @@ export function setReasoningPayload(
   payload.include = include;
 }
 
-function isGpt56Model(model: string | undefined): boolean {
-  return typeof model === "string" && /^gpt-5\.6(?:$|-)/.test(model);
+export function wireReasoningEffort(effort: string, capability: ModelCapability): string {
+  const supported = capability.supportedReasoningEfforts.map((preset) => preset.effort);
+  if (effort !== "ultra") {
+    if (!supported.includes(effort)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "reasoning effort is not supported by the selected model",
+      );
+    }
+    return effort === "persistent" ? "disabled" : effort;
+  }
+  if (
+    capability.multiAgentReasoningEffort != null
+    && capability.multiAgentReasoningEffort !== "ultra"
+    && supported.includes(capability.multiAgentReasoningEffort)
+  ) {
+    return capability.multiAgentReasoningEffort;
+  }
+  if (supported.includes("max")) return "max";
+  const lastSupported = [...supported].reverse().find((candidate) => candidate !== "ultra");
+  if (lastSupported != null) return lastSupported;
+  throw new ChatGPTOAuthInvalidRequestError(
+    "reasoning effort ultra has no live wire mapping for the selected model",
+  );
 }
 
 function wireModel(model: string): string {
-  return model === "gpt-5.6" ? "gpt-5.6-sol" : model;
+  return model;
 }
 
 function rejectUnsupportedPrivateRequestFields(
@@ -1784,53 +3064,201 @@ function rejectUnsupportedPrivateRequestFields(
 function validatePromptCacheBreakpoints(
   payload: Record<string, unknown>,
 ): void {
-  if (!containsPromptCacheBreakpoint(payload.input)) return;
-  throw new ChatGPTOAuthInvalidRequestError(
-    "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
-  );
+  if (!Array.isArray(payload.input)) return;
+  for (const item of payload.input) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    if (record.prompt_cache_breakpoint != null) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
+      );
+    }
+    if (!Array.isArray(record.content)) continue;
+    for (const contentItem of record.content) {
+      if (
+        typeof contentItem === "object"
+        && contentItem !== null
+        && !Array.isArray(contentItem)
+        && (contentItem as Record<string, unknown>).prompt_cache_breakpoint != null
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
+        );
+      }
+    }
+  }
 }
 
-function containsPromptCacheBreakpoint(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsPromptCacheBreakpoint);
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Record<string, unknown>;
-  if (record.prompt_cache_breakpoint != null) return true;
-  return Object.values(record).some(containsPromptCacheBreakpoint);
+function validateAssistantMessageOutputItem(item: Record<string, unknown>): void {
+  if (item.type !== "message") {
+    throw new ChatGPTOAuthProtocolError(
+      "expected an assistant message output item",
+    );
+  }
+  if (item.role !== "assistant") {
+    throw new ChatGPTOAuthProtocolError("message output item role must be assistant");
+  }
+  if (!Array.isArray(item.content)) {
+    throw new ChatGPTOAuthProtocolError("message output item content must be an array");
+  }
+  for (const [index, part] of item.content.entries()) {
+    if (typeof part !== "object" || part === null || Array.isArray(part)) {
+      throw new ChatGPTOAuthProtocolError(
+        `message output item content ${index} must be an object`,
+      );
+    }
+    const contentPart = part as Record<string, unknown>;
+    if (contentPart.type !== "output_text") {
+      throw new ChatGPTOAuthProtocolError(
+        `message output item content ${index} has an unsupported type`,
+      );
+    }
+    if (typeof contentPart.text !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `message output item content ${index} text must be a string`,
+      );
+    }
+  }
+}
+
+function validateResponseOutputItem(item: Record<string, unknown>): void {
+  if (item.type === "custom_tool_call") {
+    throw new ChatGPTOAuthProtocolError(
+      "custom_tool_call is not supported by the public tool contract",
+    );
+  }
+  if (typeof item.type === "string") {
+    validateResponseItemOptionalFields(item, item.type);
+  }
+  switch (item.type) {
+    case "function_call":
+      toolCallFromResponseItem(item);
+      return;
+    case "image_generation_call":
+      imageGenerationFromItem(item);
+      return;
+    case "web_search_call":
+      webSearchEventFromResponseItem(item);
+      return;
+    case "reasoning":
+      reasoningFromResponseItems([item]);
+      if (
+        item.encrypted_content !== undefined
+        && item.encrypted_content !== null
+        && typeof item.encrypted_content !== "string"
+      ) {
+        throw new ChatGPTOAuthProtocolError(
+          "reasoning encrypted_content must be a string or null",
+        );
+      }
+      return;
+    case "message":
+      validateAssistantMessageOutputItem(item);
+      return;
+    default:
+      throw new ChatGPTOAuthProtocolError(
+        "response output item has an unsupported type",
+      );
+  }
+}
+
+function validateResponseItemOptionalFields(
+  item: Record<string, unknown>,
+  itemType: string,
+): void {
+  if (item.id != null && typeof item.id !== "string") {
+    throw new ChatGPTOAuthProtocolError(`${itemType} id must be a string or null`);
+  }
+
+  const metadata = item.internal_chat_message_metadata_passthrough;
+  if (metadata != null) {
+    if (!isRecordValue(metadata)) {
+      throw new ChatGPTOAuthProtocolError(
+        `${itemType} internal_chat_message_metadata_passthrough must be an object or null`,
+      );
+    }
+    if (metadata.turn_id != null && typeof metadata.turn_id !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `${itemType} internal_chat_message_metadata_passthrough.turn_id must be a string or null`,
+      );
+    }
+    if (
+      metadata.create_time != null
+      && (typeof metadata.create_time !== "number" || !Number.isFinite(metadata.create_time))
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        `${itemType} internal_chat_message_metadata_passthrough.create_time must be a JSON number or null`,
+      );
+    }
+  }
+
+  const requireNullableString = (field: string): void => {
+    if (item[field] != null && typeof item[field] !== "string") {
+      throw new ChatGPTOAuthProtocolError(`${itemType} ${field} must be a string or null`);
+    }
+  };
+
+  if (itemType === "message") {
+    if (item.phase != null && item.phase !== "commentary" && item.phase !== "final_answer") {
+      throw new ChatGPTOAuthProtocolError(
+        "message phase must be commentary, final_answer, or null",
+      );
+    }
+  } else if (itemType === "reasoning") {
+    requireNullableString("encrypted_content");
+  } else if (itemType === "function_call") {
+    requireNullableString("namespace");
+    if (
+      item.encrypted_function_args != null
+      && (!Array.isArray(item.encrypted_function_args)
+        || item.encrypted_function_args.some((value) => typeof value !== "string"))
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "function_call encrypted_function_args must be a string array or null",
+      );
+    }
+  } else if (itemType === "web_search_call") {
+    requireNullableString("status");
+  } else if (itemType === "image_generation_call") {
+    requireNullableString("revised_prompt");
+  }
+}
+
+function validateChatResponseItem(
+  item: Record<string, unknown>,
+): void {
+  validateResponseOutputItem(item);
+  if (item.type === "image_generation_call") {
+    throw new ChatGPTOAuthProtocolError(
+      "chat response contains an unsupported output item",
+    );
+  }
 }
 
 export function toolCallFromResponseItem(
   item: Record<string, unknown>,
 ): ToolCall | null {
-  if (
-    item.type !== "function_call" &&
-    item.type !== "custom_tool_call"
-  )
-    return null;
-  const name = item.name;
-  if (typeof name !== "string" || !name) return null;
-  const rawArgs = item.arguments ?? item.input ?? "{}";
-  let args: Record<string, unknown>;
-  if (typeof rawArgs === "string") {
-    try {
-      args = rawArgs ? JSON.parse(rawArgs) : {};
-    } catch {
-      args = { input: rawArgs };
-    }
-  } else if (
-    typeof rawArgs === "object" &&
-    rawArgs !== null &&
-    !Array.isArray(rawArgs)
-  ) {
-    args = rawArgs as Record<string, unknown>;
-  } else {
-    args = {};
+  if (item.type === "custom_tool_call") {
+    throw new ChatGPTOAuthProtocolError(
+      "custom_tool_call is not supported by the public tool contract",
+    );
   }
-  const callId = String(
-    item.call_id ??
-      item.id ??
-      crypto.randomUUID().replace(/-/g, ""),
-  );
-  return { id: callId, name, arguments: args };
+  if (item.type !== "function_call") return null;
+  const name = item.name;
+  if (typeof name !== "string") {
+    throw new ChatGPTOAuthProtocolError(`${String(item.type)} must contain a string name`);
+  }
+  const argumentField = "arguments";
+  const rawArgs = item[argumentField];
+  if (typeof rawArgs !== "string") {
+    throw new ChatGPTOAuthProtocolError(
+      `${String(item.type)} ${argumentField} must be a string`,
+    );
+  }
+  if (typeof item.call_id !== "string") {
+    throw new ChatGPTOAuthProtocolError(`${String(item.type)} must contain a string call_id`);
+  }
+  return { id: item.call_id, name, arguments: rawArgs };
 }
 
 export function textFromResponseItems(
@@ -1840,23 +3268,56 @@ export function textFromResponseItems(
   for (const item of items) {
     const itemType = item.type;
     if (itemType === "output_text" || itemType === "text") {
-      const text = item.text;
-      if (typeof text === "string" && text) parts.push(text);
+      throw new ChatGPTOAuthProtocolError(
+        `${String(itemType)} is not a supported top-level response item`,
+      );
+    }
+    if (itemType !== "message") {
+      if (![
+        "function_call",
+        "image_generation_call",
+        "reasoning",
+        "web_search_call",
+      ].includes(String(itemType))) {
+        throw new ChatGPTOAuthProtocolError(
+          "response output item has an unsupported type",
+        );
+      }
       continue;
     }
-    if (itemType !== "message") continue;
+    if (item.role !== "assistant") {
+      throw new ChatGPTOAuthProtocolError(
+        "response message item role must be assistant",
+      );
+    }
     const content = item.content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (typeof part === "string") {
-        if (part) parts.push(part);
-        continue;
+    if (!Array.isArray(content)) {
+      throw new ChatGPTOAuthProtocolError("message output item content must be an array");
+    }
+    for (const [index, part] of content.entries()) {
+      if (typeof part !== "object" || part === null || Array.isArray(part)) {
+        throw new ChatGPTOAuthProtocolError(
+          `message output item content ${index} must be an object`,
+        );
       }
-      if (typeof part !== "object" || part === null) continue;
       const p = part as Record<string, unknown>;
-      if (p.type !== "output_text" && p.type !== "text") continue;
+      if (p.type === "text") {
+        throw new ChatGPTOAuthProtocolError(
+          `message output item content ${index} type text is not supported`,
+        );
+      }
+      if (p.type !== "output_text") {
+        throw new ChatGPTOAuthProtocolError(
+          `message output item content ${index} has an unsupported type`,
+        );
+      }
       const text = p.text;
-      if (typeof text === "string" && text) parts.push(text);
+      if (typeof text !== "string") {
+        throw new ChatGPTOAuthProtocolError(
+          `message output item content ${index} text must be a string`,
+        );
+      }
+      if (text) parts.push(text);
     }
   }
   return parts.join("");
@@ -1866,24 +3327,32 @@ export function validateImageContentItems(
   images: ImageReference[],
 ): Record<string, unknown>[] {
   if (!Array.isArray(images)) {
-    throw new ChatGPTOAuthError("image references must be an array");
+    throw new ChatGPTOAuthInvalidRequestError("image references must be an array");
   }
   const items: Record<string, unknown>[] = [];
   for (let i = 0; i < images.length; i++) {
     const image = images[i];
     if (typeof image !== "object" || image === null) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `image reference ${i} must be an object`,
+      );
+    }
+    const unknownField = Object.keys(image).find(
+      (field) => !["image_url", "detail", "prompt_cache_breakpoint"].includes(field),
+    );
+    if (unknownField != null) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `image reference ${i} does not support field ${JSON.stringify(unknownField)}`,
       );
     }
     const imageUrl = image.image_url;
     if (typeof imageUrl !== "string" || !imageUrl.trim()) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `image reference ${i} requires image_url`,
       );
     }
     if (!imageUrl.startsWith("data:image/")) {
-      throw new ChatGPTOAuthError(
+      throw new ChatGPTOAuthInvalidRequestError(
         `image reference ${i} must be a data:image URL`,
       );
     }
@@ -1893,14 +3362,14 @@ export function validateImageContentItems(
     };
     if (image.detail != null) {
       if (typeof image.detail !== "string" || !IMAGE_DETAILS.has(image.detail)) {
-        throw new ChatGPTOAuthError(
+        throw new ChatGPTOAuthInvalidRequestError(
           `image reference ${i} detail must be one of: auto, low, high, original`,
         );
       }
       item.detail = image.detail;
     }
-    if (image.prompt_cache_breakpoint !== undefined) {
-      throw new ChatGPTOAuthError(
+    if (image.prompt_cache_breakpoint != null) {
+      throw new ChatGPTOAuthInvalidRequestError(
         "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
       );
     }
@@ -1914,20 +3383,26 @@ export function imageGenerationFromItem(
 ): Record<string, unknown> | null {
   if (item.type !== "image_generation_call") return null;
   const result = item.result;
-  if (typeof result !== "string" || !result.trim()) {
-    throw new ChatGPTOAuthError(
-      "image_generation_call returned empty result",
+  if (typeof result !== "string") {
+    throw new ChatGPTOAuthProtocolError(
+      "image_generation_call requires a string result",
     );
   }
+  if (item.id != null && typeof item.id !== "string") {
+    throw new ChatGPTOAuthProtocolError(
+      "image_generation_call id must be a string or null",
+    );
+  }
+  if (typeof item.status !== "string") {
+    throw new ChatGPTOAuthProtocolError("image_generation_call must contain a string status");
+  }
+  if (item.revised_prompt != null && typeof item.revised_prompt !== "string") {
+    throw new ChatGPTOAuthProtocolError("image_generation_call revised_prompt must be a string when provided");
+  }
   return {
-    id: String(
-      item.id ?? crypto.randomUUID().replace(/-/g, ""),
-    ),
-    status: String(item.status ?? "completed"),
-    revised_prompt:
-      typeof item.revised_prompt === "string"
-        ? item.revised_prompt
-        : null,
+    ...(item.id == null ? {} : { id: item.id }),
+    status: item.status,
+    ...(item.revised_prompt == null ? {} : { revised_prompt: item.revised_prompt }),
     result,
   };
 }
@@ -1940,45 +3415,56 @@ export function usageFromResponse(value: unknown): Usage | null {
   )
     return null;
   const v = value as Record<string, unknown>;
-  const prompt = v.input_tokens ?? v.prompt_tokens;
-  const completion = v.output_tokens ?? v.completion_tokens;
+  if (
+    [
+      "prompt_tokens",
+      "completion_tokens",
+      "prompt_tokens_details",
+      "cached_input_tokens",
+      "cache_read_input_tokens",
+      "cache_creation_input_tokens",
+    ].some((field) => Object.hasOwn(v, field))
+  ) return null;
+  const prompt = v.input_tokens;
+  const completion = v.output_tokens;
   const total = v.total_tokens;
-  if (typeof prompt !== "number" || typeof completion !== "number")
+  if (
+    !isNonNegativeSafeInteger(prompt)
+    || !isNonNegativeSafeInteger(completion)
+    || !isNonNegativeSafeInteger(total)
+    || total !== prompt + completion
+  )
     return null;
-  const tokenDetails =
-    v.input_tokens_details ?? v.prompt_tokens_details;
-  let cachedTokens = 0;
-  let cacheWriteTokens = 0;
-  if (typeof tokenDetails === "object" && tokenDetails !== null) {
-    const d = tokenDetails as Record<string, unknown>;
-    if (typeof d.cached_tokens === "number")
-      cachedTokens = d.cached_tokens;
-    if (typeof d.cache_write_tokens === "number")
-      cacheWriteTokens = d.cache_write_tokens;
-  }
-  if (cachedTokens === 0) {
-    if (typeof v.cached_input_tokens === "number") {
-      cachedTokens = v.cached_input_tokens;
-    } else if (typeof v.cache_read_input_tokens === "number") {
-      cachedTokens = v.cache_read_input_tokens;
-    }
-  }
-  if (cacheWriteTokens === 0) {
-    const topLevelCacheWrite = v.cache_write_tokens
-      ?? v.cache_write_input_tokens
-      ?? v.cache_creation_input_tokens;
-    if (typeof topLevelCacheWrite === "number") {
-      cacheWriteTokens = topLevelCacheWrite;
-    }
-  }
-  return {
+  const tokenDetails = v.input_tokens_details;
+  const result: Usage = {
     prompt_tokens: prompt,
     completion_tokens: completion,
-    total_tokens:
-      typeof total === "number" ? total : prompt + completion,
-    cached_tokens: cachedTokens,
-    cache_write_tokens: cacheWriteTokens,
+    total_tokens: total,
   };
+  if (tokenDetails == null) return result;
+  if (typeof tokenDetails !== "object" || Array.isArray(tokenDetails)) return null;
+  const d = tokenDetails as Record<string, unknown>;
+  if (!isNonNegativeSafeInteger(d.cached_tokens)) return null;
+  result.cached_tokens = d.cached_tokens;
+  const cacheWriteTokens = d.cache_write_tokens;
+  if (cacheWriteTokens != null) {
+    if (!isNonNegativeSafeInteger(cacheWriteTokens)) return null;
+    result.cache_write_tokens = cacheWriteTokens;
+  }
+  return result;
+}
+
+export function requireSubagentHeaderValue(value: unknown): string {
+  if (typeof value !== "string" || !/^[\x21-\x7E]+$/.test(value)) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "subagent must be a non-empty visible ASCII token without whitespace",
+    );
+  }
+  return value;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export { REMOTE_COMPACTION_MARKER };

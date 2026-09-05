@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -14,7 +14,7 @@ pub enum MessageRole {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: HashMap<String, serde_json::Value>,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone)]
@@ -41,9 +41,14 @@ impl Message {
         name: Option<String>,
     ) -> Result<Self, MessageError> {
         if role == MessageRole::Tool {
-            if tool_call_id.is_none() || name.is_none() {
+            if tool_call_id.is_none() {
                 return Err(MessageError::Validation(
-                    "tool messages require tool_call_id and name".to_string(),
+                    "tool messages require a string tool_call_id".to_string(),
+                ));
+            }
+            if name.as_deref().is_some_and(str::is_empty) {
+                return Err(MessageError::Validation(
+                    "tool message name must be non-empty when provided".to_string(),
                 ));
             }
         } else if tool_call_id.is_some() || name.is_some() {
@@ -80,40 +85,15 @@ pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
-    pub cached_tokens: i64,
-    pub cache_write_tokens: i64,
-}
-
-impl Usage {
-    pub fn new(
-        prompt_tokens: i64,
-        completion_tokens: i64,
-        total_tokens: Option<i64>,
-        cached_tokens: i64,
-    ) -> Self {
-        let total = total_tokens.unwrap_or(prompt_tokens + completion_tokens);
-        Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: total,
-            cached_tokens,
-            cache_write_tokens: 0,
-        }
-    }
-
-    pub fn cache_hit_rate(&self) -> f64 {
-        if self.prompt_tokens <= 0 {
-            return 0.0;
-        }
-        self.cached_tokens as f64 / self.prompt_tokens as f64
-    }
+    pub cached_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AssistantResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
-    pub finish_reason: String,
+    pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
     pub reasoning_content: Option<String>,
     pub raw: Option<serde_json::Value>,
@@ -123,8 +103,10 @@ pub struct AssistantResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {
     pub name: String,
-    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub parameters: serde_json::Value,
+    pub strict: bool,
 }
 
 #[cfg(test)]
@@ -158,6 +140,20 @@ mod tests {
     }
 
     #[test]
+    fn test_message_tool_name_is_optional() {
+        let msg = Message::new(
+            MessageRole::Tool,
+            "output".to_string(),
+            vec![],
+            Some("call-1".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-1"));
+        assert!(msg.name.is_none());
+    }
+
+    #[test]
     fn test_message_non_tool_with_tool_call_id() {
         let result = Message::new(
             MessageRole::User,
@@ -174,7 +170,7 @@ mod tests {
         let tc = ToolCall {
             id: "c1".to_string(),
             name: "fn".to_string(),
-            arguments: HashMap::new(),
+            arguments: "{}".to_string(),
         };
         let result = Message::new(MessageRole::User, "hi".to_string(), vec![tc], None, None);
         assert!(result.is_err());
@@ -185,7 +181,7 @@ mod tests {
         let tc = ToolCall {
             id: "c1".to_string(),
             name: "fn".to_string(),
-            arguments: HashMap::new(),
+            arguments: "{}".to_string(),
         };
         let msg =
             Message::new(MessageRole::Assistant, "".to_string(), vec![tc], None, None).unwrap();
@@ -193,27 +189,53 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_auto_total() {
-        let u = Usage::new(100, 50, None, 20);
+    fn usage_preserves_explicit_total() {
+        let u = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(20),
+            cache_write_tokens: None,
+        };
         assert_eq!(u.total_tokens, 150);
-        assert_eq!(u.cached_tokens, 20);
+        assert_eq!(u.cached_tokens, Some(20));
     }
 
     #[test]
-    fn test_usage_explicit_total() {
-        let u = Usage::new(100, 50, Some(200), 0);
-        assert_eq!(u.total_tokens, 200);
+    fn usage_preserves_cache_write_tokens() {
+        let u = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(0),
+            cache_write_tokens: Some(9),
+        };
+        assert_eq!(u.cache_write_tokens, Some(9));
     }
 
     #[test]
-    fn test_usage_cache_hit_rate() {
-        let u = Usage::new(100, 50, None, 80);
-        assert!((u.cache_hit_rate() - 0.8).abs() < f64::EPSILON);
+    fn usage_serialization_keeps_actual_counts() {
+        let u = Usage {
+            prompt_tokens: 4,
+            completion_tokens: 3,
+            total_tokens: 7,
+            cached_tokens: Some(2),
+            cache_write_tokens: None,
+        };
+        let value = serde_json::to_value(u).unwrap();
+        assert_eq!(value["prompt_tokens"], 4);
+        assert_eq!(value["completion_tokens"], 3);
+        assert_eq!(value["total_tokens"], 7);
     }
 
     #[test]
-    fn test_usage_cache_hit_rate_zero_prompt() {
-        let u = Usage::new(0, 50, None, 0);
-        assert!((u.cache_hit_rate() - 0.0).abs() < f64::EPSILON);
+    fn usage_deserialization_requires_all_required_counts() {
+        assert!(serde_json::from_value::<Usage>(serde_json::json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "cache_write_tokens": null
+        }))
+        .is_err());
     }
 }

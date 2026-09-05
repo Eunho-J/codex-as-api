@@ -1,28 +1,109 @@
 use crate::auth::{self, AuthError, ChatGPTTokenData};
 use crate::messages::{AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage};
 use crate::model_capabilities::{
-    apply_model_capability_fields, build_codex_client_metadata, capability_for_model,
-    resolve_codex_metadata_enabled, should_enable_parallel_tool_calls, strip_image_detail_fields,
-    use_responses_lite, LITE_HEADER_NAME, LITE_HEADER_VALUE, SESSION_ID_KEY,
+    apply_model_capability_fields, build_codex_client_metadata, resolve_codex_metadata_enabled,
+    should_enable_parallel_tool_calls, use_responses_lite, LITE_HEADER_NAME, LITE_HEADER_VALUE,
+    SESSION_ID_KEY, THREAD_ID_KEY,
 };
-use crate::protocol::{reasoning_from_response_items, response_failure_message};
+use crate::model_catalog::{
+    CatalogError, CatalogKey, ModelCatalogCache, ModelCatalogSnapshot, ModelInfo,
+    DEFAULT_CATALOG_TTL,
+};
+use crate::protocol::{
+    reasoning_from_response_items, reasoning_parts_from_response_items, response_failure_message,
+};
+use crate::strict_json;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::BufRead;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const CHATGPT_OAUTH_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub const CHATGPT_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
-// This matches reqwest::blocking's existing default operation timeout. Response reads apply the
-// duration per read, so long-lived active SSE streams do not acquire a new total-time cutoff.
-pub const CHATGPT_OAUTH_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// The pinned Codex provider applies a 300-second idle timeout to each stream read rather than a
+// total lifetime cutoff, so active long-lived SSE responses remain valid.
+pub const CHATGPT_OAUTH_DEFAULT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+pub(crate) const MODEL_CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const REMOTE_COMPACTION_MARKER: &str = "[Remote Responses compacted history]";
 const CODEX_CLI_ORIGINATOR: &str = "codex_cli_rs";
-const CODEX_CLI_VERSION_ENV: &str = "CODEX_AS_API_CODEX_CLI_VERSION";
 const CODEX_UPSTREAM_CONTRACT_JSON: &str =
     include_str!("../../config/codex-upstream-contract.json");
 static CODEX_COMPATIBILITY_VERSION: OnceLock<String> = OnceLock::new();
 const RESPONSE_CHAIN_CAPACITY: usize = 256;
+
+fn has_malformed_percent_escape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (0..bytes.len()).any(|index| {
+        bytes[index] == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+    })
+}
+
+fn ensure_catalog_account_unchanged(
+    initial_account_id: &str,
+    refreshed_account_id: &str,
+) -> Result<(), CatalogError> {
+    if initial_account_id != refreshed_account_id {
+        return Err(CatalogError::Auth(
+            "authenticated account changed during model catalog refresh".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn catalog_error_from_refresh(error: AuthError) -> CatalogError {
+    match error {
+        AuthError::RefreshUpstreamHttp { status, message } => {
+            CatalogError::RefreshUpstreamHttp { status, message }
+        }
+        AuthError::RefreshTransport(message) => CatalogError::RefreshTransport(message),
+        AuthError::RefreshProtocol(message) => CatalogError::RefreshProtocol(message),
+        AuthError::Internal(message) => CatalogError::Internal(message),
+        error @ AuthError::WriteCleanup { .. } => CatalogError::Internal(error.to_string()),
+        error => CatalogError::Auth(error.to_string()),
+    }
+}
+
+fn redact_failure_event(value: &mut Value, secrets: &[&str]) {
+    match value {
+        Value::String(text) => *text = auth::redact_text(text, secrets),
+        Value::Array(items) => {
+            for item in items {
+                redact_failure_event(item, secrets);
+            }
+        }
+        Value::Object(fields) => {
+            for item in fields.values_mut() {
+                redact_failure_event(item, secrets);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn redact_upstream_failure_event(mut event: Value, secrets: &[&str]) -> Value {
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed" | "response.incomplete")
+    ) {
+        redact_failure_event(&mut event, secrets);
+    }
+    event
+}
+
+fn optional_header_text<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
 
 fn resolve_prompt_cache_key(
     explicit: Option<&str>,
@@ -43,6 +124,590 @@ fn resolve_prompt_cache_key(
         .cloned())
 }
 
+fn validate_client_metadata_reserved_keys(
+    client_metadata: Option<&HashMap<String, String>>,
+) -> Result<(), ProviderError> {
+    let Some(metadata) = client_metadata else {
+        return Ok(());
+    };
+    for key in [SESSION_ID_KEY, THREAD_ID_KEY] {
+        if metadata
+            .get(key)
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ProviderError::InvalidRequest(format!(
+                "client_metadata.{key} must be a non-empty string when provided"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod live_catalog_tests {
+    use super::*;
+
+    fn model_with_levels(levels: &[&str], multi_agent: Option<&str>) -> Arc<ModelInfo> {
+        let default_reasoning = levels.iter().copied().find(|effort| *effort != "ultra");
+        let levels: Vec<Value> = levels
+            .iter()
+            .map(|effort| json!({"effort": effort, "description": effort}))
+            .collect();
+        let body = serde_json::to_vec(&json!({
+            "models": [{
+                "slug": "live-model",
+                "display_name": "Live Model",
+                "description": "test",
+                "default_reasoning_level": default_reasoning,
+                "supported_reasoning_levels": levels,
+                "multi_agent_reasoning_effort": multi_agent,
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "service_tiers": [],
+                "default_service_tier": null,
+                "support_verbosity": true,
+                "default_verbosity": "medium",
+                "supports_image_detail_original": true,
+                "context_window": 100000,
+                "max_context_window": 120000,
+                "auto_compact_token_limit": null,
+                "input_modalities": ["text", "image"],
+                "use_responses_lite": false
+            }]
+        }))
+        .unwrap();
+        crate::model_catalog::parse_models_response(&body).unwrap()[0].clone()
+    }
+
+    #[test]
+    fn response_history_is_scoped_by_account() {
+        let store = ResponseChainStore::new(4);
+        store
+            .commit("account-a", "response-1", &[json!({"a": 1})], &[])
+            .unwrap();
+        assert!(store.resolve("account-a", "response-1").is_ok());
+        assert!(store.resolve("account-b", "response-1").is_err());
+    }
+
+    #[test]
+    fn ultra_uses_live_multi_agent_then_max_then_last_supported() {
+        let explicit = model_with_levels(&["low", "max", "xhigh"], Some("xhigh"));
+        assert_eq!(
+            resolve_reasoning_effort(&explicit, "ultra").unwrap(),
+            "xhigh"
+        );
+        let max = model_with_levels(&["low", "max"], None);
+        assert_eq!(resolve_reasoning_effort(&max, "ultra").unwrap(), "max");
+        let last = model_with_levels(&["low", "high"], None);
+        assert_eq!(resolve_reasoning_effort(&last, "ultra").unwrap(), "high");
+        let none = model_with_levels(&["ultra"], None);
+        assert!(resolve_reasoning_effort(&none, "ultra").is_err());
+        let self_mapping = model_with_levels(&["ultra"], Some("ultra"));
+        assert!(resolve_reasoning_effort(&self_mapping, "ultra").is_err());
+    }
+
+    #[test]
+    fn persistent_reasoning_maps_to_disabled() {
+        let model = model_with_levels(&["persistent"], None);
+        assert_eq!(
+            resolve_reasoning_effort(&model, "persistent").unwrap(),
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn malformed_upstream_tool_image_and_web_items_fail() {
+        assert!(tool_call_from_response_item(&json!({
+            "type": "function_call",
+            "name": "tool",
+            "arguments": "{}"
+        }))
+        .is_err());
+        assert!(tool_call_from_response_item(&json!({
+            "type": "function_call",
+            "name": "tool",
+            "id": "item-id",
+            "arguments": {}
+        }))
+        .is_err());
+        assert!(tool_call_from_response_item(&json!({
+            "type": "custom_tool_call",
+            "name": "tool",
+            "call_id": "call-id",
+            "arguments": "{}"
+        }))
+        .is_err());
+        assert!(image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "result": "data"
+        }))
+        .is_err());
+        assert!(web_search_event_from_response_item(
+            &json!({"type": "web_search_call", "id": "call", "action": {}}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn image_generation_optional_fields_are_validated_without_fabrication() {
+        let missing = image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": "data"
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing, json!({"status": "completed", "result": "data"}));
+
+        let null = image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "id": null,
+            "status": "completed",
+            "result": "data",
+            "revised_prompt": null
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(null, json!({"status": "completed", "result": "data"}));
+
+        let present = image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "result": "data",
+            "revised_prompt": ""
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(present["id"], "image-1");
+        assert_eq!(present["revised_prompt"], "");
+
+        let empty = image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "id": "",
+            "status": "",
+            "result": ""
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty, json!({"id": "", "status": "", "result": ""}));
+
+        for invalid_id in [json!(1), json!(false)] {
+            assert!(image_generation_from_item(&json!({
+                "type": "image_generation_call",
+                "id": invalid_id,
+                "status": "completed",
+                "result": "data"
+            }))
+            .is_err());
+        }
+        assert!(image_generation_from_item(&json!({
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": "data",
+            "revised_prompt": 1
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn response_item_optional_fields_follow_pinned_nullable_and_additive_contract() {
+        let valid = [
+            json!({
+                "type": "message",
+                "id": "",
+                "role": "assistant",
+                "content": [],
+                "phase": "final_answer",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": null,
+                    "create_time": 1.5,
+                    "content_item_kinds": {"future": true}
+                },
+                "future": true
+            }),
+            json!({
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "text", "text": "raw", "future": true}],
+                "encrypted_content": null,
+                "future": true
+            }),
+            json!({
+                "type": "function_call",
+                "name": "",
+                "call_id": "",
+                "arguments": "not-json",
+                "namespace": null,
+                "encrypted_function_args": ["a", ""],
+                "future": true
+            }),
+            json!({
+                "type": "web_search_call",
+                "id": "",
+                "status": null,
+                "action": {"type": "search", "query": "q", "sources": []},
+                "future": true
+            }),
+            json!({
+                "type": "image_generation_call",
+                "id": "",
+                "status": "",
+                "result": "",
+                "revised_prompt": null,
+                "future": true
+            }),
+        ];
+        for item in &valid {
+            validate_added_response_output_item(item).unwrap();
+        }
+
+        let invalid = [
+            json!({"type": "message", "id": 1, "role": "assistant", "content": []}),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "internal_chat_message_metadata_passthrough": []
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "internal_chat_message_metadata_passthrough": {"turn_id": 1}
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "internal_chat_message_metadata_passthrough": {"create_time": "now"}
+            }),
+            json!({"type": "message", "role": "assistant", "content": [], "phase": "future"}),
+            json!({
+                "type": "function_call",
+                "name": "f",
+                "call_id": "c",
+                "arguments": "{}",
+                "namespace": 1
+            }),
+            json!({
+                "type": "function_call",
+                "name": "f",
+                "call_id": "c",
+                "arguments": "{}",
+                "encrypted_function_args": [1]
+            }),
+            json!({"type": "custom_tool_call", "name": "f", "call_id": "c", "input": "", "status": 1}),
+            json!({"type": "web_search_call", "status": 1}),
+            json!({"type": "image_generation_call", "status": "", "result": "", "revised_prompt": 1}),
+        ];
+        for item in &invalid {
+            assert!(validate_added_response_output_item(item).is_err());
+        }
+    }
+
+    #[test]
+    fn image_generation_and_inspection_reject_endpoint_incompatible_items() {
+        let image = json!({
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": "encoded-image"
+        });
+        let message = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "visible"}]
+        });
+        let function = json!({
+            "type": "function_call",
+            "name": "lookup",
+            "call_id": "call-1",
+            "arguments": "{}"
+        });
+        let web = json!({
+            "type": "web_search_call",
+            "id": "search-1",
+            "action": {"type": "search", "query": "q", "sources": []}
+        });
+
+        for unexpected in [&message, &function, &web] {
+            assert!(matches!(
+                image_generations_from_response_items(&[image.clone(), unexpected.clone()]),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+        for unexpected in [&function, &image, &web] {
+            assert!(matches!(
+                inspection_text_from_response_items(&[message.clone(), unexpected.clone()]),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+        assert_eq!(
+            inspection_text_from_response_items(&[
+                json!({"type": "reasoning", "summary": [], "content": []}),
+                message
+            ])
+            .unwrap(),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn unknown_upstream_event_types_are_ignored() {
+        assert!(validate_response_event(&json!({"type": "response.future_event"})).is_ok());
+        assert!(validate_response_event(&json!({"type": ""})).is_ok());
+
+        let mut block = vec!["data: {\"type\":\"response.future_telemetry\"}".to_string()];
+        let mut delivered = 0;
+        assert!(!emit_sse_block(&mut block, &[], &mut |_event| {
+            delivered += 1;
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn known_unsupported_semantic_event_types_fail_immediately() {
+        for event_type in [
+            "response.file_search_call.in_progress",
+            "response.file_search_call.searching",
+            "response.file_search_call.completed",
+            "response.code_interpreter_call.in_progress",
+            "response.code_interpreter_call.interpreting",
+            "response.code_interpreter_call_code.delta",
+            "response.code_interpreter_call_code.done",
+            "response.code_interpreter_call.completed",
+            "response.mcp_call.in_progress",
+            "response.mcp_call_arguments.delta",
+            "response.mcp_call_arguments.done",
+            "response.mcp_call.completed",
+            "response.mcp_call.failed",
+            "response.mcp_list_tools.in_progress",
+            "response.mcp_list_tools.completed",
+            "response.mcp_list_tools.failed",
+            "response.shell_call_command.added",
+            "response.shell_call_command.delta",
+            "response.shell_call_command.done",
+            "response.shell_call_output_content.delta",
+            "response.shell_call_output_content.done",
+            "response.audio.delta",
+            "response.audio.done",
+            "response.audio.transcript.delta",
+            "response.audio.transcript.done",
+            "response.refusal.delta",
+            "response.refusal.done",
+            "response.output_text.annotation.added",
+            "response.custom_tool_call_input.delta",
+            "response.custom_tool_call_input.done",
+        ] {
+            assert!(matches!(
+                validate_response_event(&json!({"type": event_type})),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn content_part_events_accept_output_text_and_reject_unrepresentable_parts() {
+        for event_type in ["response.content_part.added", "response.content_part.done"] {
+            assert!(validate_response_event(&json!({
+                "type": event_type,
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                    "logprobs": []
+                }
+            }))
+            .is_ok());
+
+            for part in [
+                Value::Null,
+                json!({"type": "refusal", "refusal": "blocked"}),
+                json!({"type": "future_content", "value": "opaque"}),
+                json!({"type": "output_text"}),
+                json!({"type": "output_text", "text": "ok", "annotations": {}}),
+                json!({"type": "output_text", "text": "ok", "logprobs": {}}),
+            ] {
+                assert!(matches!(
+                    validate_response_event(&json!({"type": event_type, "part": part})),
+                    Err(ProviderError::UpstreamProtocol(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_added_semantic_items_fail_immediately() {
+        for item_type in [
+            "tool_search_call",
+            "computer_call",
+            "file_search_call",
+            "code_interpreter_call",
+            "mcp_call",
+            "local_shell_call",
+        ] {
+            assert!(matches!(
+                validate_response_event(&json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": item_type}
+                })),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn openai_function_tool_strict_mode_is_forwarded() {
+        let tool = ToolSchema {
+            name: "lookup".to_string(),
+            description: Some("Lookup".to_string()),
+            parameters: json!({"type": "object", "properties": {}}),
+            strict: true,
+        };
+        assert_eq!(tool_schema_to_response_dict(&tool).unwrap()["strict"], true);
+    }
+
+    #[test]
+    fn web_search_event_preserves_the_upstream_id_and_query() {
+        let event = web_search_event_from_response_item(&json!({
+            "type": "web_search_call",
+            "id": "raw-web.id-1",
+            "action": {"type": "search", "query": "live query", "sources": []}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(event["id"], "raw-web.id-1");
+        assert_eq!(event["input"]["query"], "live query");
+    }
+
+    #[test]
+    fn web_search_event_validates_queries_and_preserves_duplicate_sources() {
+        let event = web_search_event_from_response_item(&json!({
+            "type": "web_search_call",
+            "id": "raw-web.id-2",
+            "action": {
+                "type": "search",
+                "query": "preferred query",
+                "queries": ["preferred query"],
+                "sources": [
+                    {"url": "https://example.test", "title": "", "page_age": null},
+                    {"url": "https://example.test", "title": "", "page_age": null}
+                ]
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(event["input"]["query"], "preferred query");
+        let content = event["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0], content[1]);
+        assert_eq!(content[0]["title"], "");
+        assert!(content[0].get("page_age").is_none());
+
+        assert!(matches!(
+            web_search_event_from_response_item(&json!({
+                "type": "web_search_call",
+                "id": "raw-web.id-3",
+                "action": {"type": "search", "query": "query", "sources": null}
+            })),
+            Err(ProviderError::UpstreamProtocol(_))
+        ));
+
+        for (action, expected) in [
+            (
+                json!({"query": "direct", "queries": null, "sources": []}),
+                "direct",
+            ),
+            (
+                json!({"query": null, "queries": ["fallback"], "sources": []}),
+                "fallback",
+            ),
+            (json!({"query": "", "sources": []}), ""),
+            (
+                json!({"query": "same", "queries": ["same"], "sources": []}),
+                "same",
+            ),
+        ] {
+            let event = web_search_event_from_response_item(&json!({
+                "type": "web_search_call",
+                "id": "",
+                "action": {
+                    "type": "search",
+                    "query": action.get("query"),
+                    "queries": action.get("queries"),
+                    "sources": action.get("sources"),
+                },
+            }))
+            .unwrap()
+            .unwrap();
+            assert_eq!(event["id"], "");
+            assert_eq!(event["input"]["query"], expected);
+        }
+
+        for id in [None, Some(Value::Null)] {
+            let mut item = json!({
+                "type": "web_search_call",
+                "action": {"type": "search", "query": "q", "sources": []},
+            });
+            if let Some(id) = id {
+                item["id"] = id;
+            }
+            assert!(matches!(
+                web_search_event_from_response_item(&item),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+
+        for action in [
+            json!({"query": "query", "sources": []}),
+            json!({"type": "search", "queries": ["first", "second"], "sources": []}),
+            json!({"type": "search", "query": "first", "queries": ["second"], "sources": []}),
+            json!({"type": "search", "sources": []}),
+            json!({"type": "search", "queries": [], "sources": []}),
+            json!({"type": "open_page", "url": "https://example.test", "sources": []}),
+            json!({"type": "find_in_page", "pattern": "needle", "sources": []}),
+            json!({"type": "future_action", "sources": []}),
+        ] {
+            assert!(matches!(
+                web_search_event_from_response_item(&json!({
+                    "type": "web_search_call",
+                    "id": "raw-web.id-invalid",
+                    "action": action,
+                })),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn completed_event_ignores_additive_output_without_done_items() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp",
+                "output": [{"type": "message", "role": "assistant", "content": []}]
+            }
+        });
+        assert!(validate_response_event(&event).is_ok());
+    }
+
+    #[test]
+    fn provider_timeout_override_must_be_positive() {
+        assert!(matches!(
+            ChatGPTOAuthProvider::new(
+                String::new(),
+                "https://example.test/backend-api/codex".to_string(),
+                None,
+                Some(std::time::Duration::ZERO),
+            ),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+}
+
 fn pinned_codex_compatibility_version() -> &'static str {
     CODEX_COMPATIBILITY_VERSION.get_or_init(|| {
         let contract: Value = serde_json::from_str(CODEX_UPSTREAM_CONTRACT_JSON)
@@ -57,18 +722,11 @@ fn pinned_codex_compatibility_version() -> &'static str {
     })
 }
 
-fn resolve_codex_cli_version() -> Result<String, String> {
-    if let Ok(value) = std::env::var(CODEX_CLI_VERSION_ENV) {
-        if !value.trim().is_empty() {
-            return normalize_codex_cli_version(&value)
-                .ok_or_else(|| format!("{CODEX_CLI_VERSION_ENV} must be a semantic version"));
-        }
-    }
-    Ok(pinned_codex_compatibility_version().to_string())
-}
-
 fn normalize_codex_cli_version(value: &str) -> Option<String> {
-    let version = value.trim();
+    if value != value.trim() {
+        return None;
+    }
+    let version = value;
     if version.is_empty() {
         return None;
     }
@@ -112,18 +770,8 @@ fn normalize_codex_cli_version(value: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-fn codex_cli_headers() -> Result<HashMap<String, String>, String> {
-    let version = resolve_codex_cli_version()?;
-    codex_cli_headers_for_version(Some(&version))
-}
-
-fn codex_cli_headers_for_version(version: Option<&str>) -> Result<HashMap<String, String>, String> {
-    let raw = version
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| pinned_codex_compatibility_version().to_string());
-    let version = normalize_codex_cli_version(&raw)
-        .ok_or_else(|| "Codex compatibility version must be a semantic version".to_string())?;
+fn codex_cli_headers() -> HashMap<String, String> {
+    let version = pinned_codex_compatibility_version();
     let mut headers = HashMap::new();
     headers.insert("originator".to_string(), CODEX_CLI_ORIGINATOR.to_string());
     headers.insert(
@@ -134,7 +782,7 @@ fn codex_cli_headers_for_version(version: Option<&str>) -> Result<HashMap<String
             env!("CARGO_PKG_VERSION")
         )),
     );
-    Ok(headers)
+    headers
 }
 
 fn codex_os_info() -> String {
@@ -160,13 +808,41 @@ fn sanitize_header_value(value: &str) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("{0}")]
-    Auth(#[from] AuthError),
+    Auth(AuthError),
     #[error("{0}")]
     InvalidRequest(String),
     #[error("{0}")]
     Request(String),
     #[error("{message}")]
     UpstreamHttp { status: u16, message: String },
+    #[error("{0}")]
+    UpstreamTransport(String),
+    #[error("{0}")]
+    CatalogUnavailable(String),
+    #[error("requested model is not present in the authenticated model catalog")]
+    ModelNotFound(String),
+    #[error("{0}")]
+    UpstreamProtocol(String),
+}
+
+impl From<AuthError> for ProviderError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::RefreshUpstreamHttp { status, message } => {
+                Self::UpstreamHttp { status, message }
+            }
+            AuthError::RefreshTransport(message) => Self::UpstreamTransport(message),
+            AuthError::RefreshProtocol(message) => Self::UpstreamProtocol(message),
+            AuthError::Internal(message) => Self::Request(message),
+            error @ AuthError::WriteCleanup { .. } => Self::Request(error.to_string()),
+            error => Self::Auth(error),
+        }
+    }
+}
+
+pub struct ResolvedModel {
+    pub snapshot: Arc<ModelCatalogSnapshot>,
+    pub model: Arc<ModelInfo>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,20 +856,35 @@ struct FinalizedResponsesRequest {
     payload: Value,
     use_responses_lite: bool,
     conversation_input: Vec<Value>,
+    account_id: String,
+    comp_hash: Option<String>,
 }
 
 pub struct PreparedChatStream {
     request: FinalizedResponsesRequest,
     extra_headers: HashMap<String, String>,
+    cancellation: Option<Arc<AtomicBool>>,
+}
+
+impl PreparedChatStream {
+    pub fn cancel_when(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
 }
 
 #[derive(Default)]
 struct ChatStreamState {
     final_output: Vec<Value>,
-    reasoning_parts: Vec<String>,
+    tool_call_ids: HashSet<String>,
+    text_parts: Vec<String>,
+    reasoning_summary_parts: Vec<String>,
+    reasoning_raw_parts: Vec<String>,
     emitted_tool_call: bool,
+    emitted_web_search: bool,
     saw_text_delta: bool,
-    saw_reasoning_delta: bool,
+    saw_reasoning_summary_delta: bool,
+    saw_reasoning_raw_delta: bool,
     saw_completed: bool,
     completed_response_id: Option<String>,
     pending_finish: Option<Value>,
@@ -201,8 +892,14 @@ struct ChatStreamState {
 
 #[derive(Default)]
 struct ResponseChainStoreInner {
-    chains: HashMap<String, Vec<Value>>,
-    lru: VecDeque<String>,
+    chains: HashMap<(String, String), ResponseChain>,
+    lru: VecDeque<(String, String)>,
+}
+
+#[derive(Clone)]
+struct ResponseChain {
+    history: Vec<Value>,
+    comp_hash: Option<String>,
 }
 
 struct ResponseChainStore {
@@ -218,7 +915,17 @@ impl ResponseChainStore {
         }
     }
 
-    fn resolve(&self, response_id: &str) -> Result<Vec<Value>, ProviderError> {
+    #[cfg(test)]
+    fn resolve(&self, account_id: &str, response_id: &str) -> Result<Vec<Value>, ProviderError> {
+        self.resolve_for_model(account_id, response_id, None)
+    }
+
+    fn resolve_for_model(
+        &self,
+        account_id: &str,
+        response_id: &str,
+        current_comp_hash: Option<&str>,
+    ) -> Result<Vec<Value>, ProviderError> {
         if response_id.trim().is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "previous_response_id must be a non-empty string".to_string(),
@@ -228,21 +935,50 @@ impl ResponseChainStore {
         let mut inner = self.inner.lock().map_err(|_| {
             ProviderError::Request("response chain store lock is poisoned".to_string())
         })?;
-        let history = inner.chains.get(response_id).cloned().ok_or_else(|| {
-            ProviderError::InvalidRequest(format!(
-                "previous_response_id {response_id:?} is unknown or has been evicted"
-            ))
+        let key = (account_id.to_string(), response_id.to_string());
+        let chain = inner.chains.get(&key).cloned().ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "previous_response_id is unknown or has been evicted".to_string(),
+            )
         })?;
-        inner.lru.retain(|id| id != response_id);
-        inner.lru.push_back(response_id.to_string());
-        Ok(history)
+        if chain.comp_hash.as_deref().is_some()
+            && current_comp_hash.is_some()
+            && chain.comp_hash.as_deref() != current_comp_hash
+        {
+            return Err(ProviderError::InvalidRequest(
+                "previous_response_id requires compaction because the model compatibility hash changed"
+                    .to_string(),
+            ));
+        }
+        inner.lru.retain(|candidate| candidate != &key);
+        inner.lru.push_back(key);
+        Ok(chain.history)
     }
 
+    #[cfg(test)]
     fn commit(
         &self,
+        account_id: &str,
         response_id: &str,
         conversation_input: &[Value],
         response_output: &[Value],
+    ) -> Result<(), ProviderError> {
+        self.commit_for_model(
+            account_id,
+            response_id,
+            conversation_input,
+            response_output,
+            None,
+        )
+    }
+
+    fn commit_for_model(
+        &self,
+        account_id: &str,
+        response_id: &str,
+        conversation_input: &[Value],
+        response_output: &[Value],
+        comp_hash: Option<&str>,
     ) -> Result<(), ProviderError> {
         if response_id.is_empty() || self.capacity == 0 {
             return Ok(());
@@ -255,9 +991,16 @@ impl ResponseChainStore {
         let mut inner = self.inner.lock().map_err(|_| {
             ProviderError::Request("response chain store lock is poisoned".to_string())
         })?;
-        inner.lru.retain(|id| id != response_id);
-        inner.chains.insert(response_id.to_string(), history);
-        inner.lru.push_back(response_id.to_string());
+        let key = (account_id.to_string(), response_id.to_string());
+        inner.lru.retain(|candidate| candidate != &key);
+        inner.chains.insert(
+            key.clone(),
+            ResponseChain {
+                history,
+                comp_hash: comp_hash.map(str::to_string),
+            },
+        );
+        inner.lru.push_back(key);
         while inner.chains.len() > self.capacity {
             let Some(evicted_id) = inner.lru.pop_front() else {
                 break;
@@ -290,8 +1033,9 @@ pub struct ChatGPTOAuthProvider {
     pub model: String,
     pub base_url: String,
     pub auth_json_path: Option<String>,
-    pub timeout: Option<std::time::Duration>,
+    pub timeout: std::time::Duration,
     response_chains: ResponseChainStore,
+    model_catalog: ModelCatalogCache,
 }
 
 impl ChatGPTOAuthProvider {
@@ -300,143 +1044,378 @@ impl ChatGPTOAuthProvider {
         base_url: String,
         auth_json_path: Option<String>,
         timeout: Option<std::time::Duration>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProviderError> {
+        Self::with_catalog_ttl(
             model,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             auth_json_path,
-            timeout: Some(timeout.unwrap_or(CHATGPT_OAUTH_DEFAULT_TIMEOUT)),
-            response_chains: ResponseChainStore::new(RESPONSE_CHAIN_CAPACITY),
-        }
-    }
-
-    pub fn chat(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        temperature: Option<f64>,
-        reasoning_effort: Option<&str>,
-        max_tokens: Option<i64>,
-        stop: Option<&[String]>,
-        prompt_cache_key: Option<&str>,
-        subagent: Option<&str>,
-        memgen_request: Option<bool>,
-        previous_response_id: Option<&str>,
-        model: Option<&str>,
-        tool_choice: Option<&Value>,
-        service_tier: Option<&str>,
-        text: Option<&Value>,
-        client_metadata: Option<&HashMap<String, String>>,
-        codex_metadata: Option<bool>,
-        responses_lite: Option<&Value>,
-        parallel_tool_calls: Option<bool>,
-    ) -> Result<AssistantResponse, ProviderError> {
-        self.chat_with_controls(
-            messages,
-            tools,
-            temperature,
-            reasoning_effort,
-            max_tokens,
-            stop,
-            prompt_cache_key,
-            subagent,
-            memgen_request,
-            previous_response_id,
-            model,
-            tool_choice,
-            service_tier,
-            text,
-            client_metadata,
-            codex_metadata,
-            responses_lite,
-            parallel_tool_calls,
-            &GenerationControls::default(),
+            timeout,
+            DEFAULT_CATALOG_TTL,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn chat_with_controls(
+    fn with_catalog_ttl(
+        model: String,
+        base_url: String,
+        auth_json_path: Option<String>,
+        timeout: Option<std::time::Duration>,
+        catalog_ttl: std::time::Duration,
+    ) -> Result<Self, ProviderError> {
+        let timeout = timeout.unwrap_or(CHATGPT_OAUTH_DEFAULT_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(ProviderError::InvalidRequest(
+                "provider timeout must be greater than zero".to_string(),
+            ));
+        }
+        if catalog_ttl.is_zero() {
+            return Err(ProviderError::InvalidRequest(
+                "model catalog TTL must be greater than zero".to_string(),
+            ));
+        }
+        if !model.is_empty() && model != model.trim() {
+            return Err(ProviderError::InvalidRequest(
+                "model must not contain surrounding whitespace".to_string(),
+            ));
+        }
+        if base_url != base_url.trim() {
+            return Err(ProviderError::InvalidRequest(
+                "provider base URL must not contain surrounding whitespace".to_string(),
+            ));
+        }
+        if base_url
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(ProviderError::InvalidRequest(
+                "provider base URL must not contain whitespace or control characters".to_string(),
+            ));
+        }
+        if has_malformed_percent_escape(&base_url) {
+            return Err(ProviderError::InvalidRequest(
+                "provider base URL contains a malformed percent escape".to_string(),
+            ));
+        }
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let has_raw_authority = base_url
+            .split_once("://")
+            .is_some_and(|(_, rest)| !rest.split('/').next().unwrap_or("").is_empty());
+        let parsed_base_url = reqwest::Url::parse(&base_url).map_err(|_| {
+            ProviderError::InvalidRequest("provider base URL is invalid".to_string())
+        })?;
+        if !matches!(parsed_base_url.scheme(), "http" | "https")
+            || parsed_base_url.host_str().is_none()
+            || !has_raw_authority
+        {
+            return Err(ProviderError::InvalidRequest(
+                "provider base URL must be an absolute HTTP(S) URL with a hostname".to_string(),
+            ));
+        }
+        if !parsed_base_url.username().is_empty()
+            || parsed_base_url.password().is_some()
+            || parsed_base_url.query().is_some()
+            || parsed_base_url.fragment().is_some()
+        {
+            return Err(ProviderError::InvalidRequest(
+                "provider base URL must not contain credentials, query, or fragment".to_string(),
+            ));
+        }
+        Ok(Self {
+            model,
+            base_url,
+            auth_json_path,
+            timeout,
+            response_chains: ResponseChainStore::new(RESPONSE_CHAIN_CAPACITY),
+            model_catalog: ModelCatalogCache::new(catalog_ttl),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_with_catalog_ttl(
+        model: String,
+        base_url: String,
+        auth_json_path: Option<String>,
+        timeout: Option<std::time::Duration>,
+        catalog_ttl: std::time::Duration,
+    ) -> Result<Self, ProviderError> {
+        Self::with_catalog_ttl(model, base_url, auth_json_path, timeout, catalog_ttl)
+    }
+
+    pub fn model_catalog_snapshot(&self) -> Result<Arc<ModelCatalogSnapshot>, ProviderError> {
+        let token = auth::token_for_request(self.auth_json_path.as_deref())?;
+        let client_version = pinned_codex_compatibility_version().to_string();
+        let key = CatalogKey {
+            account_id: token.account_id.clone(),
+            base_url: self.base_url.clone(),
+            client_version: client_version.clone(),
+        };
+        self.model_catalog
+            .snapshot(key, || self.fetch_models(token, &client_version))
+            .map_err(|error| match error {
+                CatalogError::Invalid(message) => ProviderError::CatalogUnavailable(format!(
+                    "model catalog response is invalid: {message}"
+                )),
+                CatalogError::Auth(message) => ProviderError::Auth(AuthError::OAuth(message)),
+                CatalogError::RefreshUpstreamHttp { status, message } => {
+                    ProviderError::UpstreamHttp { status, message }
+                }
+                CatalogError::RefreshTransport(message) => {
+                    ProviderError::UpstreamTransport(message)
+                }
+                CatalogError::RefreshProtocol(message) => ProviderError::UpstreamProtocol(message),
+                CatalogError::Internal(message) => ProviderError::Request(message),
+                CatalogError::UpstreamHttp { status, message } => {
+                    ProviderError::UpstreamHttp { status, message }
+                }
+                CatalogError::Request(message) => ProviderError::CatalogUnavailable(format!(
+                    "model catalog request failed: {message}"
+                )),
+            })
+    }
+
+    pub fn resolve_model(&self, requested: Option<&str>) -> Result<ResolvedModel, ProviderError> {
+        if requested
+            .is_some_and(|requested| requested.trim().is_empty() || requested != requested.trim())
+        {
+            return Err(ProviderError::InvalidRequest(
+                "model must be a non-empty string".to_string(),
+            ));
+        }
+        let snapshot = self.model_catalog_snapshot()?;
+        Self::resolve_model_from_snapshot(snapshot, requested)
+    }
+
+    fn resolve_model_from_snapshot(
+        snapshot: Arc<ModelCatalogSnapshot>,
+        requested: Option<&str>,
+    ) -> Result<ResolvedModel, ProviderError> {
+        let model = match requested {
+            Some(requested) => snapshot.model(requested),
+            None => snapshot.default_model(),
+        }
+        .ok_or_else(|| {
+            requested.map_or_else(
+                || {
+                    ProviderError::CatalogUnavailable(
+                        "upstream model catalog has no model with list visibility for default selection"
+                            .to_string(),
+                    )
+                },
+                |requested| ProviderError::ModelNotFound(requested.to_string()),
+            )
+        })?;
+        if requested.is_none() && (model.slug.trim().is_empty() || model.slug != model.slug.trim())
+        {
+            return Err(ProviderError::CatalogUnavailable(
+                "default model publishes an unusable slug".to_string(),
+            ));
+        }
+        Ok(ResolvedModel { snapshot, model })
+    }
+
+    pub(crate) fn configured_or_default_model_from_snapshot(
         &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        temperature: Option<f64>,
-        reasoning_effort: Option<&str>,
-        max_tokens: Option<i64>,
-        stop: Option<&[String]>,
-        prompt_cache_key: Option<&str>,
-        subagent: Option<&str>,
-        memgen_request: Option<bool>,
-        previous_response_id: Option<&str>,
-        model: Option<&str>,
-        tool_choice: Option<&Value>,
-        service_tier: Option<&str>,
-        text: Option<&Value>,
-        client_metadata: Option<&HashMap<String, String>>,
-        codex_metadata: Option<bool>,
-        responses_lite: Option<&Value>,
-        parallel_tool_calls: Option<bool>,
-        controls: &GenerationControls,
+        snapshot: Arc<ModelCatalogSnapshot>,
+    ) -> Result<ResolvedModel, ProviderError> {
+        if !self.model.is_empty()
+            && (self.model.trim().is_empty() || self.model != self.model.trim())
+        {
+            return Err(ProviderError::CatalogUnavailable(
+                "configured model is unusable".to_string(),
+            ));
+        }
+        let configured = (!self.model.is_empty()).then_some(self.model.as_str());
+        Self::resolve_model_from_snapshot(snapshot, configured).map_err(|error| match error {
+            ProviderError::ModelNotFound(_) if configured.is_some() => {
+                ProviderError::CatalogUnavailable(
+                    "configured model is unavailable in the authenticated catalog".to_string(),
+                )
+            }
+            error => error,
+        })
+    }
+
+    pub fn configured_or_default_model(&self) -> Result<ResolvedModel, ProviderError> {
+        let snapshot = self.model_catalog_snapshot()?;
+        self.configured_or_default_model_from_snapshot(snapshot)
+    }
+
+    fn fetch_models(
+        &self,
+        initial_token: ChatGPTTokenData,
+        client_version: &str,
+    ) -> Result<(Vec<u8>, Option<String>), CatalogError> {
+        let initial_account_id = initial_token.account_id.clone();
+        let mut token = initial_token;
+        for attempt in 0..2 {
+            let headers = headers_for_token(&token)
+                .map_err(|error| CatalogError::Request(error.to_string()))?;
+            let url = format!("{}/models?client_version={client_version}", self.base_url);
+            let client = reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| CatalogError::Request(error.to_string()))?;
+            let mut builder = client.get(url);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            builder = builder.header(reqwest::header::ACCEPT, "application/json");
+            builder = builder.timeout(MODEL_CATALOG_TIMEOUT);
+            let response = builder.send().map_err(|error| {
+                CatalogError::Request(auth::redact_text(
+                    &error.to_string(),
+                    &[
+                        token.access_token.as_str(),
+                        token.refresh_token.as_str(),
+                        token.id_token.as_str(),
+                        token.account_id.as_str(),
+                    ],
+                ))
+            })?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                token =
+                    auth::refresh_after_unauthorized(&token).map_err(catalog_error_from_refresh)?;
+                ensure_catalog_account_unchanged(&initial_account_id, &token.account_id)?;
+                continue;
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                let body = response
+                    .text()
+                    .map_err(|error| CatalogError::UpstreamHttp {
+                        status: 401,
+                        message: format!("HTTP 401 and failed to read error body: {error}"),
+                    })?;
+                return Err(CatalogError::UpstreamHttp {
+                    status: 401,
+                    message: format!(
+                        "ChatGPT OAuth upstream returned HTTP 401 after one refresh: {}",
+                        auth::redact_text(
+                            &body,
+                            &[
+                                token.access_token.as_str(),
+                                token.refresh_token.as_str(),
+                                token.id_token.as_str(),
+                                token.account_id.as_str(),
+                            ],
+                        )
+                    ),
+                });
+            }
+            if !status.is_success() {
+                let body = response.text().map_err(|error| {
+                    CatalogError::UpstreamHttp {
+                        status: status.as_u16(),
+                        message: format!(
+                            "ChatGPT OAuth model catalog request failed: HTTP {} and could not read the error body: {error}",
+                            status.as_u16()
+                        ),
+                    }
+                })?;
+                return Err(CatalogError::UpstreamHttp {
+                    status: status.as_u16(),
+                    message: format!(
+                        "ChatGPT OAuth model catalog request failed: HTTP {}: {}",
+                        status.as_u16(),
+                        auth::redact_text(
+                            &body,
+                            &[
+                                token.access_token.as_str(),
+                                token.refresh_token.as_str(),
+                                token.id_token.as_str(),
+                                token.account_id.as_str(),
+                            ],
+                        )
+                    ),
+                });
+            }
+            let etag = optional_header_text(response.headers(), "etag").map(str::to_string);
+            let bytes = response
+                .bytes()
+                .map_err(|error| CatalogError::Request(error.to_string()))?;
+            return Ok((bytes.to_vec(), etag));
+        }
+        Err(CatalogError::Request(
+            "authentication retry did not complete".to_string(),
+        ))
+    }
+
+    pub fn chat_prepared(
+        &self,
+        prepared: PreparedChatStream,
     ) -> Result<AssistantResponse, ProviderError> {
         let mut content_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut finish_reason = "stop".to_string();
+        let mut finish_reason: Option<String> = None;
+        let mut saw_finish = false;
         let mut raw_events: Vec<Value> = Vec::new();
         let mut usage: Option<Usage> = None;
         let mut response_id: Option<String> = None;
+        let mut tool_call_ids: HashSet<String> = HashSet::new();
 
-        let events = self.chat_stream_with_controls(
-            messages,
-            tools,
-            temperature,
-            reasoning_effort,
-            max_tokens,
-            stop,
-            prompt_cache_key,
-            subagent,
-            memgen_request,
-            previous_response_id,
-            model,
-            tool_choice,
-            service_tier,
-            text,
-            client_metadata,
-            codex_metadata,
-            responses_lite,
-            parallel_tool_calls,
-            controls,
-        )?;
+        let mut events = Vec::new();
+        self.stream_prepared_chat(prepared, |event| {
+            events.push(event);
+            Ok(())
+        })?;
 
         for event in events {
             raw_events.push(event.clone());
-            let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let typ = event.get("type").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::UpstreamProtocol(
+                    "normalized response event requires a string type".to_string(),
+                )
+            })?;
             match typ {
                 "content" => {
-                    if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                        content_parts.push(text.to_string());
-                    }
+                    let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
+                        ProviderError::UpstreamProtocol(
+                            "content event requires a string text".to_string(),
+                        )
+                    })?;
+                    content_parts.push(text.to_string());
                 }
                 "reasoning_delta" | "reasoning_raw_delta" => {
-                    if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                        reasoning_parts.push(text.to_string());
-                    }
+                    let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
+                        ProviderError::UpstreamProtocol(
+                            "reasoning event requires a string text".to_string(),
+                        )
+                    })?;
+                    reasoning_parts.push(text.to_string());
                 }
                 "tool_call" => {
                     let id = event
                         .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "tool_call event requires a string id".to_string(),
+                            )
+                        })?
                         .to_string();
                     let name = event
                         .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "tool_call event requires a string name".to_string(),
+                            )
+                        })?
                         .to_string();
                     let arguments = event
                         .get("arguments")
-                        .and_then(|v| v.as_object())
-                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                        .unwrap_or_default();
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "tool_call event requires string arguments".to_string(),
+                            )
+                        })?;
+                    if !tool_call_ids.insert(id.clone()) {
+                        return Err(ProviderError::UpstreamProtocol(format!(
+                            "provider response contains duplicate call_id {id:?}"
+                        )));
+                    }
                     tool_calls.push(ToolCall {
                         id,
                         name,
@@ -444,22 +1423,56 @@ impl ChatGPTOAuthProvider {
                     });
                 }
                 "finish" => {
-                    if let Some(fr) = event.get("finish_reason").and_then(|v| v.as_str()) {
-                        finish_reason = fr.to_string();
+                    if saw_finish {
+                        return Err(ProviderError::UpstreamProtocol(
+                            "normalized response contains more than one finish event".to_string(),
+                        ));
                     }
-                    if let Some(rc) = event.get("reasoning_content").and_then(|v| v.as_str()) {
-                        reasoning_parts = vec![rc.to_string()];
+                    saw_finish = true;
+                    finish_reason = match event.get("finish_reason") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+                        Some(_) => {
+                            return Err(ProviderError::UpstreamProtocol(
+                                "finish event finish_reason must be non-empty or null".to_string(),
+                            ));
+                        }
+                    };
+                    match event.get("reasoning_content") {
+                        None | Some(Value::Null) => {}
+                        Some(Value::String(reasoning)) => {
+                            reasoning_parts = vec![reasoning.clone()];
+                        }
+                        Some(_) => {
+                            return Err(ProviderError::UpstreamProtocol(
+                                "finish event reasoning_content must be a string or null"
+                                    .to_string(),
+                            ));
+                        }
                     }
-                    if let Some(u) = usage_from_response(event.get("usage").unwrap_or(&Value::Null))
-                    {
-                        usage = Some(u);
-                    }
-                    response_id = event
-                        .get("response_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    usage = match event.get("usage") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(parse_usage(value)?),
+                    };
+                    response_id = Some(
+                        event
+                            .get("response_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                ProviderError::UpstreamProtocol(
+                                    "finish event requires a non-empty response_id".to_string(),
+                                )
+                            })?
+                            .to_string(),
+                    );
                 }
-                _ => {}
+                "web_search_call" | "reasoning_section_break" => {}
+                _ => {
+                    return Err(ProviderError::UpstreamProtocol(format!(
+                        "unsupported normalized response event type {typ:?}"
+                    )));
+                }
             }
         }
 
@@ -473,6 +1486,16 @@ impl ChatGPTOAuthProvider {
         };
 
         let tail_events = compact_raw_events(&raw_events);
+        if !saw_finish {
+            return Err(ProviderError::UpstreamProtocol(
+                "normalized response ended before a finish event".to_string(),
+            ));
+        }
+        let response_id = response_id.ok_or_else(|| {
+            ProviderError::UpstreamProtocol(
+                "normalized response finish event did not provide a response id".to_string(),
+            )
+        })?;
 
         Ok(AssistantResponse {
             content: content_parts.join(""),
@@ -481,56 +1504,12 @@ impl ChatGPTOAuthProvider {
             usage,
             reasoning_content,
             raw: Some(json!({"events": tail_events})),
-            response_id,
+            response_id: Some(response_id),
         })
     }
 
-    pub fn chat_stream(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        temperature: Option<f64>,
-        reasoning_effort: Option<&str>,
-        max_tokens: Option<i64>,
-        stop: Option<&[String]>,
-        prompt_cache_key: Option<&str>,
-        subagent: Option<&str>,
-        memgen_request: Option<bool>,
-        previous_response_id: Option<&str>,
-        model: Option<&str>,
-        tool_choice: Option<&Value>,
-        service_tier: Option<&str>,
-        text: Option<&Value>,
-        client_metadata: Option<&HashMap<String, String>>,
-        codex_metadata: Option<bool>,
-        responses_lite: Option<&Value>,
-        parallel_tool_calls: Option<bool>,
-    ) -> Result<Vec<Value>, ProviderError> {
-        self.chat_stream_with_controls(
-            messages,
-            tools,
-            temperature,
-            reasoning_effort,
-            max_tokens,
-            stop,
-            prompt_cache_key,
-            subagent,
-            memgen_request,
-            previous_response_id,
-            model,
-            tool_choice,
-            service_tier,
-            text,
-            client_metadata,
-            codex_metadata,
-            responses_lite,
-            parallel_tool_calls,
-            &GenerationControls::default(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn chat_stream_with_controls(
+    pub fn prepare_chat_stream_for_resolved_model_with_controls(
         &self,
         messages: &[Message],
         tools: Option<&[ToolSchema]>,
@@ -542,59 +1521,7 @@ impl ChatGPTOAuthProvider {
         subagent: Option<&str>,
         memgen_request: Option<bool>,
         previous_response_id: Option<&str>,
-        model: Option<&str>,
-        tool_choice: Option<&Value>,
-        service_tier: Option<&str>,
-        text: Option<&Value>,
-        client_metadata: Option<&HashMap<String, String>>,
-        codex_metadata: Option<bool>,
-        responses_lite: Option<&Value>,
-        parallel_tool_calls: Option<bool>,
-        controls: &GenerationControls,
-    ) -> Result<Vec<Value>, ProviderError> {
-        let prepared = self.prepare_chat_stream_with_controls(
-            messages,
-            tools,
-            temperature,
-            reasoning_effort,
-            max_tokens,
-            stop,
-            prompt_cache_key,
-            subagent,
-            memgen_request,
-            previous_response_id,
-            model,
-            tool_choice,
-            service_tier,
-            text,
-            client_metadata,
-            codex_metadata,
-            responses_lite,
-            parallel_tool_calls,
-            controls,
-        )?;
-        let mut result_events = Vec::new();
-        self.stream_prepared_chat(prepared, |event| {
-            result_events.push(event);
-            Ok(())
-        })?;
-        Ok(result_events)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare_chat_stream_with_controls(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        temperature: Option<f64>,
-        reasoning_effort: Option<&str>,
-        max_tokens: Option<i64>,
-        stop: Option<&[String]>,
-        prompt_cache_key: Option<&str>,
-        subagent: Option<&str>,
-        memgen_request: Option<bool>,
-        previous_response_id: Option<&str>,
-        model: Option<&str>,
+        resolved: ResolvedModel,
         tool_choice: Option<&Value>,
         service_tier: Option<&str>,
         text: Option<&Value>,
@@ -604,7 +1531,7 @@ impl ChatGPTOAuthProvider {
         parallel_tool_calls: Option<bool>,
         controls: &GenerationControls,
     ) -> Result<PreparedChatStream, ProviderError> {
-        let _ = temperature;
+        validate_private_request_controls(temperature, max_tokens, stop)?;
         let request = self.responses_payload_with_controls(
             messages,
             tools,
@@ -613,7 +1540,7 @@ impl ChatGPTOAuthProvider {
             prompt_cache_key,
             max_tokens,
             previous_response_id,
-            model,
+            &resolved,
             tool_choice,
             service_tier,
             text,
@@ -629,6 +1556,12 @@ impl ChatGPTOAuthProvider {
             extra_headers.insert(LITE_HEADER_NAME.to_string(), LITE_HEADER_VALUE.to_string());
         }
         if let Some(sa) = subagent {
+            if sa.is_empty() || !sa.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+                return Err(ProviderError::InvalidRequest(
+                    "subagent must contain only visible ASCII characters without spaces"
+                        .to_string(),
+                ));
+            }
             extra_headers.insert("x-openai-subagent".to_string(), sa.to_string());
         }
         if let Some(mg) = memgen_request {
@@ -637,11 +1570,12 @@ impl ChatGPTOAuthProvider {
                 if mg { "true" } else { "false" }.to_string(),
             );
         }
-        let _ = self.headers()?;
+        let _ = self.headers_for_account(&request.account_id)?;
 
         Ok(PreparedChatStream {
             request,
             extra_headers,
+            cancellation: None,
         })
     }
 
@@ -654,31 +1588,63 @@ impl ChatGPTOAuthProvider {
         F: FnMut(Value) -> Result<(), ProviderError>,
     {
         let conversation_input = prepared.request.conversation_input.clone();
+        let account_id = prepared.request.account_id.clone();
+        let comp_hash = prepared.request.comp_hash.clone();
         let mut state = ChatStreamState::default();
 
         self.request_sse_each(
             "/responses",
             &prepared.request.payload,
             Some(&prepared.extra_headers),
+            &account_id,
+            prepared.cancellation,
             |event| {
-                let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let typ = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::UpstreamProtocol(
+                            "ChatGPT OAuth event requires a string type".to_string(),
+                        )
+                    })?;
                 match typ {
                     "response.output_text.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                            if !delta.is_empty() {
-                                state.saw_text_delta = true;
-                                emit(json!({"type": "content", "text": delta}))?;
-                            }
+                        let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "response.output_text.delta requires a string delta".to_string(),
+                            )
+                        })?;
+                        if !delta.is_empty() {
+                            state.saw_text_delta = true;
+                            state.text_parts.push(delta.to_string());
+                            emit(json!({"type": "content", "text": delta}))?;
                         }
                     }
                     "response.output_item.done" => {
                         let item = event.get("item").ok_or_else(|| {
-                            ProviderError::Request(
+                            ProviderError::UpstreamProtocol(
                                 "response.output_item.done must contain an object item".to_string(),
                             )
                         })?;
+                        if item.get("type").and_then(Value::as_str)
+                            == Some("image_generation_call")
+                        {
+                            return Err(ProviderError::UpstreamProtocol(
+                                "image_generation_call cannot be represented by normal chat"
+                                    .to_string(),
+                            ));
+                        }
+                        let tool_call = tool_call_from_response_item(item)?;
+                        if let Some(tc) = &tool_call {
+                            if !state.tool_call_ids.insert(tc.id.clone()) {
+                                return Err(ProviderError::UpstreamProtocol(format!(
+                                    "provider response contains duplicate call_id {:?}",
+                                    tc.id
+                                )));
+                            }
+                        }
                         state.final_output.push(item.clone());
-                        if let Some(tc) = tool_call_from_response_item(item) {
+                        if let Some(tc) = tool_call {
                             state.emitted_tool_call = true;
                             emit(json!({
                                 "type": "tool_call",
@@ -687,7 +1653,8 @@ impl ChatGPTOAuthProvider {
                                 "arguments": tc.arguments,
                             }))?;
                         }
-                        if let Some(web_search) = web_search_event_from_response_item(item, &[]) {
+                        if let Some(web_search) = web_search_event_from_response_item(item)? {
+                            state.emitted_web_search = true;
                             emit(web_search)?;
                         }
                     }
@@ -695,92 +1662,159 @@ impl ChatGPTOAuthProvider {
                         emit(json!({
                             "type": "reasoning_section_break",
                             "summary_index": event.get("summary_index"),
-                            "part_index": event.get("part_index"),
                         }))?;
                     }
                     "response.reasoning_summary_text.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                            if !delta.is_empty() {
-                                state.saw_reasoning_delta = true;
-                                state.reasoning_parts.push(delta.to_string());
-                                emit(json!({
-                                    "type": "reasoning_delta",
-                                    "text": delta,
-                                    "summary_index": event.get("summary_index"),
-                                }))?;
-                            }
+                        let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "response.reasoning_summary_text.delta requires a string delta"
+                                    .to_string(),
+                            )
+                        })?;
+                        state.saw_reasoning_summary_delta = true;
+                        state.reasoning_summary_parts.push(delta.to_string());
+                        if !delta.is_empty() {
+                            emit(json!({
+                                "type": "reasoning_delta",
+                                "text": delta,
+                                "summary_index": event.get("summary_index"),
+                            }))?;
                         }
                     }
                     "response.reasoning_text.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                            if !delta.is_empty() {
-                                state.saw_reasoning_delta = true;
-                                state.reasoning_parts.push(delta.to_string());
-                                emit(json!({
-                                    "type": "reasoning_raw_delta",
-                                    "text": delta,
-                                    "summary_index": event.get("summary_index"),
-                                }))?;
-                            }
+                        let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "response.reasoning_text.delta requires a string delta".to_string(),
+                            )
+                        })?;
+                        state.saw_reasoning_raw_delta = true;
+                        state.reasoning_raw_parts.push(delta.to_string());
+                        if !delta.is_empty() {
+                            emit(json!({
+                                "type": "reasoning_raw_delta",
+                                "text": delta,
+                                "content_index": event.get("content_index"),
+                            }))?;
                         }
                     }
                     "response.failed" => {
-                        return Err(ProviderError::Request(response_failure_message(
+                        return Err(ProviderError::UpstreamTransport(response_failure_message(
                             &event, "failed",
                         )));
                     }
                     "response.incomplete" => {
-                        return Err(ProviderError::Request(response_failure_message(
+                        return Err(ProviderError::UpstreamTransport(response_failure_message(
                             &event,
                             "incomplete",
                         )));
                     }
                     "response.completed" => {
                         state.saw_completed = true;
-                        let mut usage_val = Value::Null;
-                        let mut response_id = Value::Null;
-                        if let Some(response) = event.get("response").and_then(|v| v.as_object()) {
-                            response_id = response.get("id").cloned().unwrap_or(Value::Null);
-                            state.completed_response_id = response
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .filter(|id| !id.is_empty())
-                                .map(str::to_string);
-                            usage_val = response.get("usage").cloned().unwrap_or(Value::Null);
-                            if !state.saw_text_delta {
-                                let final_text = text_from_response_items(&state.final_output);
-                                if !final_text.is_empty() {
-                                    state.saw_text_delta = true;
-                                    emit(json!({"type": "content", "text": final_text}))?;
-                                }
+                        let response = event
+                            .get("response")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                ProviderError::UpstreamProtocol(
+                                    "response.completed requires a response object".to_string(),
+                                )
+                            })?;
+                        let response_id = response
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                ProviderError::UpstreamProtocol(
+                                    "response.completed requires a non-empty response id"
+                                        .to_string(),
+                                )
+                            })?
+                            .to_string();
+                        state.completed_response_id = Some(response_id.clone());
+                        let usage_val = match response.get("usage") {
+                            None | Some(Value::Null) => None,
+                            Some(value) => {
+                                parse_usage(value)?;
+                                Some(value.clone())
                             }
-                            if !state.saw_reasoning_delta {
-                                let completed_reasoning = reasoning_from_response_items(
-                                    &state
-                                        .final_output
-                                        .iter()
-                                        .filter(|item| item.is_object())
-                                        .cloned()
-                                        .collect::<Vec<_>>(),
-                                );
-                                if !completed_reasoning.is_empty() {
-                                    state.saw_reasoning_delta = true;
-                                    state.reasoning_parts.push(completed_reasoning.clone());
-                                    emit(json!({
-                                        "type": "reasoning_delta",
-                                        "text": completed_reasoning,
-                                    }))?;
-                                }
+                        };
+                        let end_turn = match response.get("end_turn") {
+                            None | Some(Value::Null) => None,
+                            Some(Value::Bool(value)) => Some(*value),
+                            Some(_) => {
+                                return Err(ProviderError::UpstreamProtocol(
+                                    "response.completed response.end_turn must be a boolean or null"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        let final_text = text_from_response_items(&state.final_output)?;
+                        if state.saw_text_delta {
+                            if state.text_parts.join("") != final_text {
+                                return Err(ProviderError::UpstreamProtocol(
+                                    "response.completed output text does not match streamed output text"
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            if !final_text.is_empty() {
+                                state.saw_text_delta = true;
+                                state.text_parts.push(final_text.clone());
+                                emit(json!({"type": "content", "text": final_text}))?;
                             }
                         }
-                        let reasoning_joined = state.reasoning_parts.join("");
-                        state.pending_finish = Some(json!({
+                        let (completed_summary, completed_raw) =
+                            reasoning_parts_from_response_items(&state.final_output)
+                                .map_err(ProviderError::UpstreamProtocol)?;
+                        if state.saw_reasoning_summary_delta {
+                            if state.reasoning_summary_parts.join("") != completed_summary {
+                                return Err(ProviderError::UpstreamProtocol(
+                                    "response.completed reasoning summary does not match streamed reasoning summary"
+                                        .to_string(),
+                                ));
+                            }
+                        } else if !completed_summary.is_empty() {
+                            state.reasoning_summary_parts.push(completed_summary.clone());
+                            emit(json!({
+                                "type": "reasoning_delta",
+                                "text": completed_summary,
+                            }))?;
+                        }
+                        if state.saw_reasoning_raw_delta {
+                            if state.reasoning_raw_parts.join("") != completed_raw {
+                                return Err(ProviderError::UpstreamProtocol(
+                                    "response.completed reasoning content does not match streamed reasoning content"
+                                        .to_string(),
+                                ));
+                            }
+                        } else if !completed_raw.is_empty() {
+                            state.reasoning_raw_parts.push(completed_raw.clone());
+                            emit(json!({
+                                "type": "reasoning_raw_delta",
+                                "text": completed_raw,
+                            }))?;
+                        }
+                        let reasoning_joined = state.reasoning_summary_parts.join("")
+                            + &state.reasoning_raw_parts.join("");
+                        let finish_reason = if state.emitted_tool_call {
+                            Some("tool_calls")
+                        } else if end_turn == Some(false) {
+                            None
+                        } else {
+                            Some("stop")
+                        };
+                        let mut finish = json!({
                             "type": "finish",
-                            "finish_reason": if state.emitted_tool_call { "tool_calls" } else { "stop" },
-                            "usage": usage_val,
+                            "finish_reason": finish_reason,
                             "reasoning_content": if reasoning_joined.is_empty() { Value::Null } else { Value::String(reasoning_joined) },
                             "response_id": response_id,
-                        }));
+                        });
+                        if let Some(usage) = usage_val {
+                            finish
+                                .as_object_mut()
+                                .expect("finish literal must be an object")
+                                .insert("usage".to_string(), usage);
+                        }
+                        state.pending_finish = Some(finish);
                     }
                     _ => {}
                 }
@@ -789,72 +1823,58 @@ impl ChatGPTOAuthProvider {
         )?;
 
         if !state.saw_completed {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::UpstreamProtocol(
                 "ChatGPT OAuth response stream ended before response.completed".to_string(),
             ));
         }
 
         if let Some(response_id) = state.completed_response_id {
-            self.response_chains
-                .commit(&response_id, &conversation_input, &state.final_output)?;
+            self.response_chains.commit_for_model(
+                &account_id,
+                &response_id,
+                &conversation_input,
+                &state.final_output,
+                comp_hash.as_deref(),
+            )?;
         }
         emit(state.pending_finish.ok_or_else(|| {
-            ProviderError::Request("response.completed did not produce a finish event".to_string())
+            ProviderError::UpstreamProtocol(
+                "response.completed did not produce a finish event".to_string(),
+            )
         })?)?;
 
         Ok(())
     }
 
-    pub fn generate_image(
-        &self,
-        prompt: &str,
-        reference_images: &[HashMap<String, String>],
-        size: Option<&str>,
-        reasoning_effort: Option<&str>,
-        model: Option<&str>,
-        responses_lite: Option<&Value>,
-    ) -> Result<Vec<Value>, ProviderError> {
-        self.generate_image_with_controls(
-            prompt,
-            reference_images,
-            size,
-            reasoning_effort,
-            model,
-            responses_lite,
-            &GenerationControls::default(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_image_with_controls(
+    pub fn generate_image_for_resolved_model_with_controls(
         &self,
         prompt: &str,
-        reference_images: &[HashMap<String, String>],
+        reference_images: &[Value],
         size: Option<&str>,
         reasoning_effort: Option<&str>,
-        model: Option<&str>,
+        resolved: ResolvedModel,
         responses_lite: Option<&Value>,
         controls: &GenerationControls,
     ) -> Result<Vec<Value>, ProviderError> {
-        if prompt.trim().is_empty() {
-            return Err(ProviderError::Request(
-                "image generation prompt is required".to_string(),
+        validate_generate_image_input(prompt, reference_images, size)?;
+        if !resolved
+            .model
+            .input_modalities
+            .iter()
+            .any(|modality| modality == "image")
+        {
+            return Err(ProviderError::InvalidRequest(
+                "image generation is not supported by the requested model".to_string(),
             ));
         }
 
         let mut content: Vec<Value> = vec![json!({"type": "input_text", "text": prompt})];
-        let validated = validate_image_content_items(reference_images)?;
+        let validated = validate_image_content_values(reference_images)?;
         content.extend(validated);
 
-        if let Some(s) = size {
-            if s != "auto" {
-                let new_text = format!("{}\n\nRequested output size/aspect: {}", prompt, s);
-                content[0] = json!({"type": "input_text", "text": new_text});
-            }
-        }
-
         let mut payload = json!({
-            "model": model.unwrap_or(&self.model),
+            "model": resolved.model.slug,
             "instructions": "Use the image_generation tool to create the requested image. Return the generated image through an image_generation_call result.",
             "input": [{"type": "message", "role": "user", "content": content}],
             "tools": [{"type": "image_generation", "output_format": "png"}],
@@ -863,7 +1883,6 @@ impl ChatGPTOAuthProvider {
             "stream": true,
             "store": false,
             "include": [],
-            "prompt_cache_key": uuid::Uuid::new_v4().to_string(),
         });
 
         set_reasoning_payload_with_options(
@@ -871,12 +1890,15 @@ impl ChatGPTOAuthProvider {
             reasoning_effort,
             controls.reasoning.as_ref(),
         )?;
-        let request_model = model.unwrap_or(&self.model);
-        apply_generation_controls(payload.as_object_mut().unwrap(), request_model, controls)?;
+        apply_generation_controls(
+            payload.as_object_mut().unwrap(),
+            &resolved.model.slug,
+            controls,
+        )?;
         let merged_text = merge_text_verbosity(None, controls.verbosity.as_deref())?;
         let request = finalize_responses_request(
             payload,
-            request_model,
+            &resolved,
             responses_lite,
             merged_text.as_ref(),
             None,
@@ -884,15 +1906,10 @@ impl ChatGPTOAuthProvider {
         )?;
         let output_items = self.collect_response_output_items(request)?;
 
-        let mut generated: Vec<Value> = Vec::new();
-        for item in &output_items {
-            if let Some(img) = image_generation_from_item(item)? {
-                generated.push(img);
-            }
-        }
+        let generated = image_generations_from_response_items(&output_items)?;
 
         if generated.is_empty() {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::UpstreamProtocol(
                 "image generation response returned no image_generation_call".to_string(),
             ));
         }
@@ -900,102 +1917,21 @@ impl ChatGPTOAuthProvider {
         Ok(generated)
     }
 
-    pub fn inspect_images(
-        &self,
-        prompt: &str,
-        images: &[HashMap<String, String>],
-        reasoning_effort: Option<&str>,
-        model: Option<&str>,
-        responses_lite: Option<&Value>,
-    ) -> Result<String, ProviderError> {
-        self.inspect_images_with_controls(
-            prompt,
-            images,
-            reasoning_effort,
-            model,
-            responses_lite,
-            &GenerationControls::default(),
-        )
-    }
-
-    pub fn inspect_images_with_controls(
-        &self,
-        prompt: &str,
-        images: &[HashMap<String, String>],
-        reasoning_effort: Option<&str>,
-        model: Option<&str>,
-        responses_lite: Option<&Value>,
-        controls: &GenerationControls,
-    ) -> Result<String, ProviderError> {
-        if prompt.trim().is_empty() {
-            return Err(ProviderError::Request(
-                "image inspection prompt is required".to_string(),
-            ));
-        }
-
-        let mut content: Vec<Value> = vec![json!({"type": "input_text", "text": prompt})];
-        let validated = validate_image_content_items(images)?;
-        content.extend(validated);
-
-        let mut payload = json!({
-            "model": model.unwrap_or(&self.model),
-            "instructions": "Inspect the attached image(s) and answer the user's review prompt directly.",
-            "input": [{"type": "message", "role": "user", "content": content}],
-            "tools": [],
-            "tool_choice": "auto",
-            "parallel_tool_calls": false,
-            "stream": true,
-            "store": false,
-            "include": [],
-            "prompt_cache_key": uuid::Uuid::new_v4().to_string(),
-        });
-
-        set_reasoning_payload_with_options(
-            payload.as_object_mut().unwrap(),
-            reasoning_effort,
-            controls.reasoning.as_ref(),
-        )?;
-        let request_model = model.unwrap_or(&self.model);
-        apply_generation_controls(payload.as_object_mut().unwrap(), request_model, controls)?;
-        let merged_text = merge_text_verbosity(None, controls.verbosity.as_deref())?;
-        let request = finalize_responses_request(
-            payload,
-            request_model,
-            responses_lite,
-            merged_text.as_ref(),
-            None,
-            ResponsesEndpointKind::Standard,
-        )?;
-        let output_items = self.collect_response_output_items(request)?;
-        let text = text_from_response_items(&output_items).trim().to_string();
-
-        if text.is_empty() {
-            return Err(ProviderError::Request(
-                "image inspection response returned empty content".to_string(),
-            ));
-        }
-
-        Ok(text)
-    }
-
-    pub fn inspect_image_values_with_controls(
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_image_values_for_resolved_model_with_controls(
         &self,
         prompt: &str,
         images: &[Value],
         reasoning_effort: Option<&str>,
-        model: Option<&str>,
+        resolved: ResolvedModel,
         responses_lite: Option<&Value>,
         controls: &GenerationControls,
     ) -> Result<String, ProviderError> {
-        if prompt.trim().is_empty() {
-            return Err(ProviderError::Request(
-                "image inspection prompt is required".to_string(),
-            ));
-        }
+        validate_inspect_image_values_input(prompt, images)?;
         let mut content: Vec<Value> = vec![json!({"type": "input_text", "text": prompt})];
         content.extend(validate_image_content_values(images)?);
         let mut payload = json!({
-            "model": model.unwrap_or(&self.model),
+            "model": resolved.model.slug,
             "instructions": "Inspect the attached image(s) and answer the user's review prompt directly.",
             "input": [{"type": "message", "role": "user", "content": content}],
             "tools": [],
@@ -1004,106 +1940,65 @@ impl ChatGPTOAuthProvider {
             "stream": true,
             "store": false,
             "include": [],
-            "prompt_cache_key": uuid::Uuid::new_v4().to_string(),
         });
         set_reasoning_payload_with_options(
             payload.as_object_mut().unwrap(),
             reasoning_effort,
             controls.reasoning.as_ref(),
         )?;
-        let request_model = model.unwrap_or(&self.model);
-        apply_generation_controls(payload.as_object_mut().unwrap(), request_model, controls)?;
+        apply_generation_controls(
+            payload.as_object_mut().unwrap(),
+            &resolved.model.slug,
+            controls,
+        )?;
         let merged_text = merge_text_verbosity(None, controls.verbosity.as_deref())?;
         let request = finalize_responses_request(
             payload,
-            request_model,
+            &resolved,
             responses_lite,
             merged_text.as_ref(),
             None,
             ResponsesEndpointKind::Standard,
         )?;
         let output_items = self.collect_response_output_items(request)?;
-        let text = text_from_response_items(&output_items).trim().to_string();
+        let text = inspection_text_from_response_items(&output_items)?;
         if text.is_empty() {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::UpstreamProtocol(
                 "image inspection response returned empty content".to_string(),
             ));
         }
         Ok(text)
     }
 
-    pub fn compact_messages(
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_messages_for_resolved_model_with_controls(
         &self,
         messages: &[Message],
         tools: Option<&[ToolSchema]>,
         reasoning_effort: Option<&str>,
-        model: Option<&str>,
-        responses_lite: Option<&Value>,
-    ) -> Result<String, ProviderError> {
-        self.compact_messages_with_prompt_cache_options(
-            messages,
-            tools,
-            reasoning_effort,
-            model,
-            responses_lite,
-            None,
-        )
-    }
-
-    pub fn compact_messages_with_prompt_cache_options(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        reasoning_effort: Option<&str>,
-        model: Option<&str>,
-        responses_lite: Option<&Value>,
-        prompt_cache_options: Option<&Value>,
-    ) -> Result<String, ProviderError> {
-        let controls = CompactControls {
-            prompt_cache_options: prompt_cache_options.cloned(),
-            ..CompactControls::default()
-        };
-        self.compact_messages_with_controls(
-            messages,
-            tools,
-            reasoning_effort,
-            model,
-            responses_lite,
-            &controls,
-        )
-    }
-
-    pub fn compact_messages_with_controls(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        reasoning_effort: Option<&str>,
-        model: Option<&str>,
+        resolved: ResolvedModel,
         responses_lite: Option<&Value>,
         controls: &CompactControls,
     ) -> Result<String, ProviderError> {
         let (base_instructions, mut input_items) = split_instructions_and_input(messages)?;
-        if let Some(tools) = tools {
-            for tool in tools {
-                if let Some(error) = tool
-                    .parameters
-                    .get("__codex_as_api_error")
-                    .and_then(Value::as_str)
-                {
-                    return Err(ProviderError::InvalidRequest(error.to_string()));
-                }
-            }
-        }
-        let tools_payload: Vec<Value> = tools
-            .map(|tools| tools.iter().map(tool_schema_to_response_dict).collect())
-            .unwrap_or_default();
+        let tools_payload: Vec<Value> = match tools {
+            Some(tools) => tools
+                .iter()
+                .map(tool_schema_to_response_dict)
+                .collect::<Result<_, _>>()?,
+            None => Vec::new(),
+        };
         if let Some(previous_response_id) = &controls.previous_response_id {
-            let mut history = self.response_chains.resolve(previous_response_id)?;
+            let mut history = self.response_chains.resolve_for_model(
+                &resolved.snapshot.key.account_id,
+                previous_response_id,
+                resolved.model.comp_hash.as_deref(),
+            )?;
             history.append(&mut input_items);
             input_items = history;
         }
         let mut payload = json!({
-            "model": model.unwrap_or(&self.model),
+            "model": resolved.model.slug,
             "input": input_items,
             "tools": tools_payload,
             "parallel_tool_calls": false,
@@ -1116,7 +2011,6 @@ impl ChatGPTOAuthProvider {
         }
 
         set_reasoning_payload(payload.as_object_mut().unwrap(), reasoning_effort)?;
-        let request_model = model.unwrap_or(&self.model);
         if let Some(key) = &controls.prompt_cache_key {
             if key.is_empty() {
                 return Err(ProviderError::InvalidRequest(
@@ -1134,27 +2028,34 @@ impl ChatGPTOAuthProvider {
         };
         apply_generation_controls(
             payload.as_object_mut().unwrap(),
-            request_model,
+            &resolved.model.slug,
             &generation_controls,
         )?;
         let merged_text =
             merge_text_verbosity(controls.text.as_ref(), controls.verbosity.as_deref())?;
         let request = finalize_responses_request(
             payload,
-            request_model,
+            &resolved,
             responses_lite,
             merged_text.as_ref(),
             controls.service_tier.as_deref(),
             ResponsesEndpointKind::Compact,
         )?;
         let extra_headers = responses_lite_headers(request.use_responses_lite);
-        let data = self.post_json("/responses/compact", &request.payload, Some(&extra_headers))?;
+        let data = self.post_json(
+            "/responses/compact",
+            &request.payload,
+            Some(&extra_headers),
+            &request.account_id,
+        )?;
 
         let output = data
             .get("output")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                ProviderError::Request("remote compact response missing output array".to_string())
+                ProviderError::UpstreamProtocol(
+                    "remote compact response missing output array".to_string(),
+                )
             })?;
 
         let compacted_history = filter_compacted_history_items(output)?;
@@ -1167,113 +2068,49 @@ impl ChatGPTOAuthProvider {
         request: FinalizedResponsesRequest,
     ) -> Result<Vec<Value>, ProviderError> {
         let mut output_items: Vec<Value> = Vec::new();
-        let mut saw_completed = false;
-        let mut seen_keys: HashSet<String> = HashSet::new();
-
-        let append_item = |item: &Value, items: &mut Vec<Value>, seen: &mut HashSet<String>| {
-            let mut key_parts = vec![item
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()];
-
-            let mut found_id = false;
-            for field in &["id", "call_id"] {
-                if let Some(s) = item.get(field).and_then(|v| v.as_str()) {
-                    if !s.is_empty() {
-                        key_parts.push(s.to_string());
-                        found_id = true;
-                        break;
-                    }
-                }
-            }
-            if !found_id {
-                key_parts.push(serde_json::to_string(item).unwrap_or_default());
-            }
-
-            let key = key_parts.join("\x1f");
-            if seen.contains(&key) {
-                return;
-            }
-            seen.insert(key);
-            items.push(item.clone());
-        };
+        let mut completed_response: Option<&Value> = None;
 
         let extra_headers = responses_lite_headers(request.use_responses_lite);
-        let events = self.post_sse("/responses", &request.payload, Some(&extra_headers))?;
+        let events = self.post_sse(
+            "/responses",
+            &request.payload,
+            Some(&extra_headers),
+            &request.account_id,
+        )?;
         for event in &events {
             let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match typ {
                 "response.output_item.done" => {
                     if let Some(item) = event.get("item") {
                         if item.is_object() {
-                            append_item(item, &mut output_items, &mut seen_keys);
+                            output_items.push(item.clone());
                         }
                     }
                 }
                 "response.failed" => {
-                    return Err(ProviderError::Request(response_failure_message(
+                    return Err(ProviderError::UpstreamTransport(response_failure_message(
                         event, "failed",
                     )));
                 }
                 "response.incomplete" => {
-                    return Err(ProviderError::Request(response_failure_message(
+                    return Err(ProviderError::UpstreamTransport(response_failure_message(
                         event,
                         "incomplete",
                     )));
                 }
                 "response.completed" => {
-                    saw_completed = true;
+                    completed_response = event.get("response");
                 }
                 _ => {}
             }
         }
 
-        if !saw_completed {
-            return Err(ProviderError::Request(
+        if completed_response.is_none() {
+            return Err(ProviderError::UpstreamProtocol(
                 "ChatGPT OAuth response stream ended before response.completed".to_string(),
             ));
         }
-
         Ok(output_items)
-    }
-
-    fn responses_payload(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolSchema]>,
-        reasoning_effort: Option<&str>,
-        stop: Option<&[String]>,
-        prompt_cache_key: Option<&str>,
-        max_tokens: Option<i64>,
-        previous_response_id: Option<&str>,
-        model: Option<&str>,
-        tool_choice: Option<&Value>,
-        service_tier: Option<&str>,
-        text: Option<&Value>,
-        client_metadata: Option<&HashMap<String, String>>,
-        codex_metadata: Option<bool>,
-        responses_lite: Option<&Value>,
-        parallel_tool_calls: Option<bool>,
-    ) -> Result<FinalizedResponsesRequest, ProviderError> {
-        self.responses_payload_with_controls(
-            messages,
-            tools,
-            reasoning_effort,
-            stop,
-            prompt_cache_key,
-            max_tokens,
-            previous_response_id,
-            model,
-            tool_choice,
-            service_tier,
-            text,
-            client_metadata,
-            codex_metadata,
-            responses_lite,
-            parallel_tool_calls,
-            &GenerationControls::default(),
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1286,7 +2123,7 @@ impl ChatGPTOAuthProvider {
         prompt_cache_key: Option<&str>,
         max_tokens: Option<i64>,
         previous_response_id: Option<&str>,
-        model: Option<&str>,
+        resolved: &ResolvedModel,
         tool_choice: Option<&Value>,
         service_tier: Option<&str>,
         text: Option<&Value>,
@@ -1296,56 +2133,49 @@ impl ChatGPTOAuthProvider {
         parallel_tool_calls: Option<bool>,
         controls: &GenerationControls,
     ) -> Result<FinalizedResponsesRequest, ProviderError> {
-        if let Some(stop_values) = stop {
-            if stop_values.iter().any(|value| !value.is_empty()) {
-                return Err(ProviderError::InvalidRequest(
-                    "stop is not supported by the private Codex OAuth HTTP transport".to_string(),
-                ));
-            }
-        }
+        validate_private_request_controls(None, max_tokens, stop)?;
+        validate_normalized_tool_choice(tool_choice)?;
+        validate_client_metadata_reserved_keys(client_metadata)?;
         let (instructions, mut input_items) = split_instructions_and_input(messages)?;
 
-        if instructions.is_empty() {
-            return Err(ProviderError::Request(
-                "ChatGPT OAuth Responses request requires system instructions".to_string(),
-            ));
-        }
-
-        if let Some(ts) = tools {
-            for tool in ts {
-                if let Some(error) = tool
-                    .parameters
-                    .get("__codex_as_api_error")
-                    .and_then(|v| v.as_str())
-                {
-                    return Err(ProviderError::InvalidRequest(error.to_string()));
-                }
-            }
-        }
-
         let tools_array: Vec<Value> = match tools {
-            Some(ts) => ts.iter().map(tool_schema_to_response_dict).collect(),
+            Some(ts) => ts
+                .iter()
+                .map(tool_schema_to_response_dict)
+                .collect::<Result<_, _>>()?,
             None => vec![],
         };
-        let request_model = model.unwrap_or(&self.model);
-
         if let Some(previous_response_id) = previous_response_id {
-            let mut history = self.response_chains.resolve(previous_response_id)?;
+            let mut history = self.response_chains.resolve_for_model(
+                &resolved.snapshot.key.account_id,
+                previous_response_id,
+                resolved.model.comp_hash.as_deref(),
+            )?;
             history.append(&mut input_items);
             input_items = history;
         }
 
+        let lite = use_responses_lite(&resolved.model, responses_lite)
+            .map_err(ProviderError::InvalidRequest)?;
+        let parallel_tool_calls = should_enable_parallel_tool_calls(parallel_tool_calls, lite)
+            .map_err(ProviderError::InvalidRequest)?;
+
         let mut payload = json!({
-            "model": request_model,
-            "instructions": instructions,
+            "model": resolved.model.slug,
             "input": input_items,
             "tools": tools_array,
             "tool_choice": tool_choice.cloned().unwrap_or(json!("auto")),
-            "parallel_tool_calls": should_enable_parallel_tool_calls(request_model, parallel_tool_calls, false),
+            "parallel_tool_calls": parallel_tool_calls,
             "stream": true,
             "store": false,
             "include": [],
         });
+        if !instructions.is_empty() {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("instructions".to_string(), Value::String(instructions));
+        }
         if tools_array
             .iter()
             .any(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("web_search"))
@@ -1362,7 +2192,6 @@ impl ChatGPTOAuthProvider {
                 .unwrap()
                 .insert("prompt_cache_key".to_string(), Value::String(key));
         }
-        let _ = max_tokens; // ChatGPT Codex backend rejects max_output_tokens for this endpoint.
         if let Some(cm) = client_metadata {
             let map: serde_json::Map<String, Value> = cm
                 .iter()
@@ -1392,11 +2221,15 @@ impl ChatGPTOAuthProvider {
             reasoning_effort,
             controls.reasoning.as_ref(),
         )?;
-        apply_generation_controls(payload.as_object_mut().unwrap(), request_model, controls)?;
+        apply_generation_controls(
+            payload.as_object_mut().unwrap(),
+            &resolved.model.slug,
+            controls,
+        )?;
         let merged_text = merge_text_verbosity(text, controls.verbosity.as_deref())?;
         finalize_responses_request(
             payload,
-            request_model,
+            resolved,
             responses_lite,
             merged_text.as_ref(),
             service_tier,
@@ -1406,18 +2239,42 @@ impl ChatGPTOAuthProvider {
 
     fn headers(&self) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
         let token = auth::token_for_request(self.auth_json_path.as_deref())?;
-        let mut headers = HashMap::new();
-        headers.extend(codex_cli_headers().map_err(ProviderError::Request)?);
-        headers.insert(
-            "Authorization".to_string(),
-            format!("Bearer {}", token.access_token),
-        );
-        headers.insert("ChatGPT-Account-Id".to_string(), token.account_id.clone());
-        headers.insert("Content-Type".to_string(), "application/json".to_string());
-        if token.fedramp {
-            headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
+        let headers = headers_for_token(&token)?;
+        Ok((headers, token))
+    }
+
+    fn headers_for_account(
+        &self,
+        expected_account_id: &str,
+    ) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
+        let (headers, token) = self.headers()?;
+        if token.account_id != expected_account_id {
+            return Err(ProviderError::Auth(AuthError::Refresh(
+                "ChatGPT OAuth account changed after model resolution".to_string(),
+            )));
         }
         Ok((headers, token))
+    }
+
+    fn observe_models_etag(
+        &self,
+        token: &ChatGPTTokenData,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<(), ProviderError> {
+        let Some(etag) = optional_header_text(headers, "x-models-etag") else {
+            return Ok(());
+        };
+        let client_version = pinned_codex_compatibility_version().to_string();
+        self.model_catalog
+            .observe_etag(
+                &CatalogKey {
+                    account_id: token.account_id.clone(),
+                    base_url: self.base_url.clone(),
+                    client_version,
+                },
+                Some(etag),
+            )
+            .map_err(|error| ProviderError::CatalogUnavailable(error.to_string()))
     }
 
     fn post_json(
@@ -1425,13 +2282,16 @@ impl ChatGPTOAuthProvider {
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
+        expected_account_id: &str,
     ) -> Result<Value, ProviderError> {
-        let raw = self.request_json(path, payload, extra_headers)?;
-        let data: Value = serde_json::from_slice(&raw).map_err(|_| {
-            ProviderError::Request("ChatGPT OAuth response must be a JSON object".to_string())
+        let raw = self.request_json(path, payload, extra_headers, expected_account_id)?;
+        let data = strict_json::parse_slice(&raw).map_err(|error| {
+            ProviderError::UpstreamProtocol(format!(
+                "ChatGPT OAuth response must be valid JSON: {error}"
+            ))
         })?;
         if !data.is_object() {
-            return Err(ProviderError::Request(
+            return Err(ProviderError::UpstreamProtocol(
                 "ChatGPT OAuth response must be a JSON object".to_string(),
             ));
         }
@@ -1443,8 +2303,9 @@ impl ChatGPTOAuthProvider {
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
+        expected_account_id: &str,
     ) -> Result<Vec<Value>, ProviderError> {
-        self.request_sse(path, payload, extra_headers)
+        self.request_sse(path, payload, extra_headers, expected_account_id)
     }
 
     fn request_sse(
@@ -1452,12 +2313,20 @@ impl ChatGPTOAuthProvider {
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
+        expected_account_id: &str,
     ) -> Result<Vec<Value>, ProviderError> {
         let mut events = Vec::new();
-        self.request_sse_each(path, payload, extra_headers, |event| {
-            events.push(event);
-            Ok(())
-        })?;
+        self.request_sse_each(
+            path,
+            payload,
+            extra_headers,
+            expected_account_id,
+            None,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )?;
         Ok(events)
     }
 
@@ -1466,106 +2335,182 @@ impl ChatGPTOAuthProvider {
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
+        expected_account_id: &str,
+        cancellation: Option<Arc<AtomicBool>>,
         mut on_event: F,
     ) -> Result<(), ProviderError>
     where
         F: FnMut(Value) -> Result<(), ProviderError>,
     {
-        for attempt in 0..2 {
-            let (mut headers, token) = self.headers()?;
-            headers.insert("Accept".to_string(), "text/event-stream".to_string());
-            if let Some(eh) = extra_headers {
-                for (k, v) in eh {
-                    headers.insert(k.clone(), v.clone());
-                }
-            }
-            let token_values = [
-                token.access_token.as_str(),
-                token.refresh_token.as_str(),
-                token.id_token.as_str(),
-                token.account_id.as_str(),
-            ];
-
-            let url = format!("{}{}", self.base_url, path);
-            let body = serde_json::to_vec(payload).unwrap();
-
-            let mut builder = reqwest::blocking::Client::new().post(&url);
-            for (k, v) in &headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            if let Some(t) = self.timeout {
-                builder = builder.timeout(t);
-            }
-            builder = builder.body(body);
-
-            match builder.send() {
-                Ok(response) => {
-                    let status = response.status();
-                    if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                        auth::refresh_after_unauthorized(&token)?;
-                        continue;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        runtime.block_on(async {
+            for attempt in 0..2 {
+                let auth_json_path = self.auth_json_path.clone();
+                let expected_account_id = expected_account_id.to_string();
+                let (mut headers, token) = tokio::task::spawn_blocking(move || {
+                    let token = auth::token_for_request(auth_json_path.as_deref())?;
+                    if token.account_id != expected_account_id {
+                        return Err(ProviderError::Auth(AuthError::Refresh(
+                            "ChatGPT OAuth account changed after model resolution".to_string(),
+                        )));
                     }
-                    if !status.is_success() {
-                        let body_text = response.text().unwrap_or_default();
-                        let redacted = auth::redact_text(&body_text, &token_values);
-                        return Err(ProviderError::UpstreamHttp {
+                    let headers = headers_for_token(&token)?;
+                    Ok((headers, token))
+                })
+                .await
+                .map_err(|error| {
+                    ProviderError::Request(format!("ChatGPT OAuth credential worker failed: {error}"))
+                })??;
+                headers.insert("Accept".to_string(), "text/event-stream".to_string());
+                if let Some(eh) = extra_headers {
+                    for (key, value) in eh {
+                        headers.insert(key.clone(), value.clone());
+                    }
+                }
+                let token_values = [
+                    token.access_token.as_str(),
+                    token.refresh_token.as_str(),
+                    token.id_token.as_str(),
+                    token.account_id.as_str(),
+                ];
+                let body = serde_json::to_vec(payload).map_err(|error| {
+                    ProviderError::InvalidRequest(format!(
+                        "failed to serialize ChatGPT OAuth request: {error}"
+                    ))
+                })?;
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(self.timeout)
+                    .read_timeout(self.timeout)
+                    .build()
+                    .map_err(|error| ProviderError::Request(error.to_string()))?;
+                let mut builder = client.post(format!("{}{}", self.base_url, path));
+                for (key, value) in &headers {
+                    builder = builder.header(key.as_str(), value.as_str());
+                }
+                let response = tokio::select! {
+                    response = builder.body(body).send() => response,
+                    () = wait_for_cancellation(cancellation.clone()) => {
+                        return Err(ProviderError::Request(
+                            "SSE downstream client disconnected".to_string(),
+                        ));
+                    }
+                }.map_err(|error| {
+                    ProviderError::UpstreamTransport(format!(
+                        "ChatGPT OAuth request failed: {}",
+                        auth::redact_text(&error.to_string(), &token_values)
+                    ))
+                })?;
+                let status = response.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                    tokio::task::spawn_blocking(move || auth::refresh_after_unauthorized(&token))
+                        .await
+                        .map_err(|error| {
+                            ProviderError::Request(format!(
+                                "ChatGPT OAuth refresh worker failed: {error}"
+                            ))
+                        })??;
+                    continue;
+                }
+                if !status.is_success() {
+                    let body_text = tokio::select! {
+                        body = tokio::time::timeout(self.timeout, response.text()) => body,
+                        () = wait_for_cancellation(cancellation.clone()) => {
+                            return Err(ProviderError::Request(
+                                "SSE downstream client disconnected".to_string(),
+                            ));
+                        }
+                    }
+                    .map_err(|_| ProviderError::UpstreamHttp {
+                        status: status.as_u16(),
+                        message: format!(
+                            "ChatGPT OAuth request failed: HTTP {} and the error body exceeded its total timeout",
+                            status.as_u16(),
+                        ),
+                    })?
+                    .map_err(|error| {
+                        ProviderError::UpstreamHttp {
                             status: status.as_u16(),
                             message: format!(
-                                "ChatGPT OAuth request failed: HTTP {}: {}",
+                                "ChatGPT OAuth request failed: HTTP {} and could not read the error body: {}",
                                 status.as_u16(),
-                                redacted
-                            ),
-                        });
-                    }
-
-                    let reader = std::io::BufReader::new(response);
-                    let mut block: Vec<String> = Vec::new();
-
-                    for line_result in reader.lines() {
-                        let line = line_result.map_err(|error| {
-                            ProviderError::Request(format!(
-                                "ChatGPT OAuth SSE read failed: {}",
                                 auth::redact_text(&error.to_string(), &token_values)
-                            ))
-                        })?;
-                        if line.is_empty() {
-                            if let Some(event) = decode_sse_block(&block)? {
-                                validate_response_event(&event)?;
-                                let terminal = is_terminal_response_event(&event);
-                                on_event(event)?;
-                                if terminal {
-                                    return Ok(());
-                                }
-                            }
-                            block.clear();
-                            continue;
+                            ),
                         }
-                        block.push(line);
-                    }
-                    if !block.is_empty() {
-                        if let Some(event) = decode_sse_block(&block)? {
-                            validate_response_event(&event)?;
-                            let terminal = is_terminal_response_event(&event);
-                            on_event(event)?;
-                            if terminal {
-                                return Ok(());
-                            }
-                        }
-                    }
-
-                    return Ok(());
+                    })?;
+                    return Err(ProviderError::UpstreamHttp {
+                        status: status.as_u16(),
+                        message: format!(
+                            "ChatGPT OAuth request failed: HTTP {}: {}",
+                            status.as_u16(),
+                            auth::redact_text(&body_text, &token_values)
+                        ),
+                    });
                 }
-                Err(e) => {
-                    let msg = auth::redact_text(&e.to_string(), &token_values);
-                    return Err(ProviderError::Request(format!(
-                        "ChatGPT OAuth request failed: {}",
-                        msg
-                    )));
+
+                self.observe_models_etag(&token, response.headers())?;
+                let mut bytes_stream = response.bytes_stream();
+                let mut raw_buffer = Vec::<u8>::new();
+                let mut block = Vec::<String>::new();
+                loop {
+                    let next = tokio::select! {
+                        next = tokio::time::timeout(self.timeout, bytes_stream.next()) => next,
+                        () = wait_for_cancellation(cancellation.clone()) => {
+                            return Err(ProviderError::Request(
+                                "SSE downstream client disconnected".to_string(),
+                            ));
+                        }
+                    }
+                        .map_err(|_| {
+                            ProviderError::UpstreamTransport(
+                                "ChatGPT OAuth SSE stream exceeded its idle timeout".to_string(),
+                            )
+                        })?;
+                    let Some(chunk) = next else {
+                        if !raw_buffer.is_empty()
+                            && consume_sse_line(
+                                &raw_buffer,
+                                &mut block,
+                                &token_values,
+                                &mut on_event,
+                            )?
+                        {
+                            return Ok(());
+                        }
+                        if !block.is_empty()
+                            && emit_sse_block(&mut block, &token_values, &mut on_event)?
+                        {
+                            return Ok(());
+                        }
+                        return Ok(());
+                    };
+                    let chunk = chunk.map_err(|error| {
+                        ProviderError::UpstreamTransport(format!(
+                            "ChatGPT OAuth SSE read failed: {}",
+                            auth::redact_text(&error.to_string(), &token_values)
+                        ))
+                    })?;
+                    raw_buffer.extend_from_slice(&chunk);
+                    while let Some(newline) = raw_buffer.iter().position(|byte| *byte == b'\n') {
+                        let mut remainder = raw_buffer.split_off(newline + 1);
+                        std::mem::swap(&mut raw_buffer, &mut remainder);
+                        remainder.truncate(newline);
+                        if consume_sse_line(
+                            &remainder,
+                            &mut block,
+                            &token_values,
+                            &mut on_event,
+                        )? {
+                            return Ok(());
+                        }
+                    }
                 }
             }
-        }
-
-        unreachable!("ChatGPT OAuth request retry state")
+            unreachable!("ChatGPT OAuth request retry state")
+        })
     }
 
     fn request_json(
@@ -1573,9 +2518,10 @@ impl ChatGPTOAuthProvider {
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
+        expected_account_id: &str,
     ) -> Result<Vec<u8>, ProviderError> {
         for attempt in 0..2 {
-            let (mut headers, token) = self.headers()?;
+            let (mut headers, token) = self.headers_for_account(expected_account_id)?;
             if let Some(eh) = extra_headers {
                 for (k, v) in eh {
                     headers.insert(k.clone(), v.clone());
@@ -1589,15 +2535,21 @@ impl ChatGPTOAuthProvider {
             ];
 
             let url = format!("{}{}", self.base_url, path);
-            let body = serde_json::to_vec(payload).unwrap();
+            let body = serde_json::to_vec(payload).map_err(|error| {
+                ProviderError::InvalidRequest(format!(
+                    "failed to serialize ChatGPT OAuth request: {error}"
+                ))
+            })?;
 
-            let mut builder = reqwest::blocking::Client::new().post(&url);
+            let client = reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| ProviderError::Request(error.to_string()))?;
+            let mut builder = client.post(&url);
             for (k, v) in &headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            if let Some(t) = self.timeout {
-                builder = builder.timeout(t);
-            }
+            builder = builder.timeout(self.timeout);
             builder = builder.body(body);
 
             match builder.send() {
@@ -1608,7 +2560,16 @@ impl ChatGPTOAuthProvider {
                         continue;
                     }
                     if !status.is_success() {
-                        let body_text = response.text().unwrap_or_default();
+                        let body_text = response.text().map_err(|error| {
+                            ProviderError::UpstreamHttp {
+                                status: status.as_u16(),
+                                message: format!(
+                                    "ChatGPT OAuth request failed: HTTP {} and could not read the error body: {}",
+                                    status.as_u16(),
+                                    auth::redact_text(&error.to_string(), &token_values)
+                                ),
+                            }
+                        })?;
                         let redacted = auth::redact_text(&body_text, &token_values);
                         return Err(ProviderError::UpstreamHttp {
                             status: status.as_u16(),
@@ -1619,8 +2580,9 @@ impl ChatGPTOAuthProvider {
                             ),
                         });
                     }
+                    self.observe_models_etag(&token, response.headers())?;
                     let bytes = response.bytes().map_err(|e| {
-                        ProviderError::Request(format!(
+                        ProviderError::UpstreamTransport(format!(
                             "ChatGPT OAuth request failed: {}",
                             auth::redact_text(&e.to_string(), &token_values)
                         ))
@@ -1629,7 +2591,7 @@ impl ChatGPTOAuthProvider {
                 }
                 Err(e) => {
                     let msg = auth::redact_text(&e.to_string(), &token_values);
-                    return Err(ProviderError::Request(format!(
+                    return Err(ProviderError::UpstreamTransport(format!(
                         "ChatGPT OAuth request failed: {}",
                         msg
                     )));
@@ -1641,48 +2603,86 @@ impl ChatGPTOAuthProvider {
     }
 }
 
-fn validate_image_content_items(
-    images: &[HashMap<String, String>],
-) -> Result<Vec<Value>, ProviderError> {
-    let mut items: Vec<Value> = Vec::new();
-    for (index, image) in images.iter().enumerate() {
-        let image_url = image.get("image_url").map(|s| s.as_str()).unwrap_or("");
-        if image_url.trim().is_empty() {
-            return Err(ProviderError::Request(format!(
-                "image reference {} requires image_url",
-                index
-            )));
-        }
-        if !image_url.starts_with("data:image/") {
-            return Err(ProviderError::Request(format!(
-                "image reference {} must be a data:image URL",
-                index
-            )));
-        }
-        let mut item = json!({"type": "input_image", "image_url": image_url});
-        if let Some(detail) = image.get("detail") {
-            if !matches!(detail.as_str(), "auto" | "low" | "high" | "original") {
-                return Err(ProviderError::InvalidRequest(
-                    "image detail must be one of: auto, low, high, original".to_string(),
-                ));
-            }
-            item["detail"] = Value::String(detail.clone());
-        }
-        items.push(item);
+async fn wait_for_cancellation(cancellation: Option<Arc<AtomicBool>>) {
+    let Some(cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    Ok(items)
 }
 
-fn validate_image_content_values(images: &[Value]) -> Result<Vec<Value>, ProviderError> {
+fn headers_for_token(token: &ChatGPTTokenData) -> Result<HashMap<String, String>, ProviderError> {
+    let mut headers = codex_cli_headers();
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Bearer {}", token.access_token),
+    );
+    headers.insert("ChatGPT-Account-Id".to_string(), token.account_id.clone());
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+    if token.fedramp {
+        headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
+    }
+    Ok(headers)
+}
+
+fn validate_generate_image_input(
+    prompt: &str,
+    reference_images: &[Value],
+    size: Option<&str>,
+) -> Result<(), ProviderError> {
+    if prompt.trim().is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "image generation prompt is required".to_string(),
+        ));
+    }
+    validate_image_content_values(reference_images)?;
+    if size.is_some_and(|size| size != "auto") {
+        return Err(ProviderError::InvalidRequest(
+            "image size is not supported by the Codex OAuth HTTP transport".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_inspect_image_values_input(
+    prompt: &str,
+    images: &[Value],
+) -> Result<(), ProviderError> {
+    if prompt.trim().is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "image inspection prompt is required".to_string(),
+        ));
+    }
+    validate_image_content_values(images)?;
+    Ok(())
+}
+
+pub(crate) fn validate_image_content_values(images: &[Value]) -> Result<Vec<Value>, ProviderError> {
     let mut items = Vec::new();
     for (index, image) in images.iter().enumerate() {
         let object = image.as_object().ok_or_else(|| {
             ProviderError::InvalidRequest(format!("image reference {index} must be an object"))
         })?;
+        if let Some(field) = object.keys().find(|field| {
+            !matches!(
+                field.as_str(),
+                "image_url" | "detail" | "prompt_cache_breakpoint"
+            )
+        }) {
+            return Err(ProviderError::InvalidRequest(format!(
+                "image reference {index} contains unknown field {field:?}"
+            )));
+        }
         let image_url = object
             .get("image_url")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(format!(
+                    "image reference {index} requires a string image_url"
+                ))
+            })?;
         if image_url.trim().is_empty() {
             return Err(ProviderError::InvalidRequest(format!(
                 "image reference {index} requires image_url"
@@ -1706,20 +2706,14 @@ fn validate_image_content_values(images: &[Value]) -> Result<Vec<Value>, Provide
                 normalized.insert("detail".to_string(), detail.clone());
             }
         }
-        if let Some(breakpoint) = object.get("prompt_cache_breakpoint") {
-            if breakpoint.is_null() {
-                items.push(Value::Object(normalized));
-                continue;
-            }
-            let valid = breakpoint.as_object().is_some_and(|object| {
-                object.len() == 1 && object.get("mode").and_then(Value::as_str) == Some("explicit")
-            });
-            if !valid {
-                return Err(ProviderError::InvalidRequest(
-                    "image prompt_cache_breakpoint must be {\"mode\":\"explicit\"}".to_string(),
-                ));
-            }
-            normalized.insert("prompt_cache_breakpoint".to_string(), breakpoint.clone());
+        if object
+            .get("prompt_cache_breakpoint")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(ProviderError::InvalidRequest(
+                "prompt_cache_breakpoint is not supported by the Codex OAuth HTTP transport"
+                    .to_string(),
+            ));
         }
         items.push(Value::Object(normalized));
     }
@@ -1730,45 +2724,90 @@ fn image_generation_from_item(item: &Value) -> Result<Option<Value>, ProviderErr
     if item.get("type").and_then(|v| v.as_str()) != Some("image_generation_call") {
         return Ok(None);
     }
-    let result = item.get("result").and_then(|v| v.as_str()).unwrap_or("");
-    if result.trim().is_empty() {
-        return Err(ProviderError::Request(
-            "image_generation_call returned empty result".to_string(),
-        ));
-    }
-    let id = item
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    let status = item
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
-    let revised_prompt = item
-        .get("revised_prompt")
-        .and_then(|v| v.as_str())
-        .map(|s| Value::String(s.to_string()))
-        .unwrap_or(Value::Null);
+    let result = item.get("result").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol(
+            "image_generation_call requires a string result".to_string(),
+        )
+    })?;
+    let id = match item.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(
+                "image_generation_call id must be a string or null".to_string(),
+            ));
+        }
+    };
+    let status = item.get("status").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol(
+            "image_generation_call requires a string status".to_string(),
+        )
+    })?;
+    let revised_prompt = match item.get("revised_prompt") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(
+                "image_generation_call revised_prompt must be a string or null".to_string(),
+            ));
+        }
+    };
 
-    Ok(Some(json!({
-        "id": id,
-        "status": status,
-        "revised_prompt": revised_prompt,
-        "result": result,
-    })))
+    let mut image = serde_json::Map::from_iter([
+        ("status".to_string(), Value::String(status.to_string())),
+        ("result".to_string(), Value::String(result.to_string())),
+    ]);
+    if let Some(id) = id {
+        image.insert("id".to_string(), Value::String(id.to_string()));
+    }
+    if let Some(revised_prompt) = revised_prompt {
+        image.insert(
+            "revised_prompt".to_string(),
+            Value::String(revised_prompt.to_string()),
+        );
+    }
+    Ok(Some(Value::Object(image)))
+}
+
+fn image_generations_from_response_items(items: &[Value]) -> Result<Vec<Value>, ProviderError> {
+    let mut generated = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => validate_response_output_item(item)?,
+            Some("image_generation_call") => {
+                if let Some(image) = image_generation_from_item(item)? {
+                    generated.push(image);
+                }
+            }
+            _ => {
+                return Err(ProviderError::UpstreamProtocol(
+                    "image generation response contains an unsupported output item".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(generated)
+}
+
+fn inspection_text_from_response_items(items: &[Value]) -> Result<String, ProviderError> {
+    for item in items {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("reasoning" | "message")
+        ) {
+            return Err(ProviderError::UpstreamProtocol(
+                "image inspection response contains an unsupported output item".to_string(),
+            ));
+        }
+        validate_response_output_item(item)?;
+    }
+    Ok(text_from_response_items(items)?.trim().to_string())
 }
 
 fn decode_sse_block(lines: &[String]) -> Result<Option<Value>, ProviderError> {
     let data_lines: Vec<&str> = lines
         .iter()
-        .filter_map(|line| {
-            if line.starts_with("data:") {
-                Some(line[5..].trim())
-            } else {
-                None
-            }
-        })
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
         .collect();
 
     if data_lines.is_empty() {
@@ -1780,17 +2819,78 @@ fn decode_sse_block(lines: &[String]) -> Result<Option<Value>, ProviderError> {
         return Ok(None);
     }
 
-    let event: Value = serde_json::from_str(&joined).map_err(|error| {
-        ProviderError::Request(format!(
+    let event = strict_json::parse_str(&joined).map_err(|error| {
+        ProviderError::UpstreamProtocol(format!(
             "ChatGPT OAuth SSE event must be valid JSON: {error}"
         ))
     })?;
     if event.is_object() {
         Ok(Some(event))
     } else {
-        Err(ProviderError::Request(
+        Err(ProviderError::UpstreamProtocol(
             "ChatGPT OAuth SSE event must be a JSON object".to_string(),
         ))
+    }
+}
+
+fn emit_sse_block<F>(
+    block: &mut Vec<String>,
+    token_values: &[&str],
+    on_event: &mut F,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(Value) -> Result<(), ProviderError>,
+{
+    let Some(event) = decode_sse_block(block)? else {
+        block.clear();
+        return Ok(false);
+    };
+    block.clear();
+    let event = redact_upstream_failure_event(event, token_values);
+    validate_response_event(&event)?;
+    if !event
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_known_response_event_type)
+    {
+        return Ok(false);
+    }
+    let terminal = is_terminal_response_event(&event);
+    on_event(event)?;
+    Ok(terminal)
+}
+
+fn consume_sse_line<F>(
+    raw_line: &[u8],
+    block: &mut Vec<String>,
+    token_values: &[&str],
+    on_event: &mut F,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(Value) -> Result<(), ProviderError>,
+{
+    let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    let line = std::str::from_utf8(raw_line).map_err(|_| {
+        ProviderError::UpstreamProtocol(
+            "ChatGPT OAuth SSE stream contains invalid UTF-8".to_string(),
+        )
+    })?;
+    if line.is_empty() {
+        return emit_sse_block(block, token_values, on_event);
+    }
+    block.push(line.to_string());
+    Ok(false)
+}
+
+#[cfg(test)]
+fn classify_sse_line_read_error(error: std::io::Error, secrets: &[&str]) -> ProviderError {
+    let message = auth::redact_text(&error.to_string(), secrets);
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        ProviderError::UpstreamProtocol(format!(
+            "ChatGPT OAuth SSE stream contains invalid text data: {message}"
+        ))
+    } else {
+        ProviderError::UpstreamTransport(format!("ChatGPT OAuth SSE read failed: {message}"))
     }
 }
 
@@ -1801,23 +2901,212 @@ fn is_terminal_response_event(event: &Value) -> bool {
     )
 }
 
+fn is_known_response_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.created"
+            | "response.metadata"
+            | "codex.response.metadata"
+            | "responsesapi.websocket_timing"
+            | "response.in_progress"
+            | "response.queued"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed"
+            | "response.image_generation_call.in_progress"
+            | "response.image_generation_call.generating"
+            | "response.image_generation_call.partial_image"
+            | "response.image_generation_call.completed"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.completed"
+    )
+}
+
+fn is_unsupported_response_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.file_search_call.in_progress"
+            | "response.file_search_call.searching"
+            | "response.file_search_call.completed"
+            | "response.code_interpreter_call.in_progress"
+            | "response.code_interpreter_call.interpreting"
+            | "response.code_interpreter_call_code.delta"
+            | "response.code_interpreter_call_code.done"
+            | "response.code_interpreter_call.completed"
+            | "response.mcp_call.in_progress"
+            | "response.mcp_call_arguments.delta"
+            | "response.mcp_call_arguments.done"
+            | "response.mcp_call.completed"
+            | "response.mcp_call.failed"
+            | "response.mcp_list_tools.in_progress"
+            | "response.mcp_list_tools.completed"
+            | "response.mcp_list_tools.failed"
+            | "response.shell_call_command.added"
+            | "response.shell_call_command.delta"
+            | "response.shell_call_command.done"
+            | "response.shell_call_output_content.delta"
+            | "response.shell_call_output_content.done"
+            | "response.audio.delta"
+            | "response.audio.done"
+            | "response.audio.transcript.delta"
+            | "response.audio.transcript.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.output_text.annotation.added"
+            | "response.custom_tool_call_input.delta"
+            | "response.custom_tool_call_input.done"
+    )
+}
+
 fn validate_response_event(event: &Value) -> Result<(), ProviderError> {
-    if event.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
-        if !event.get("item").is_some_and(Value::is_object) {
-            return Err(ProviderError::Request(
-                "response.output_item.done must contain an object item".to_string(),
+    let event_type = event.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol(
+            "ChatGPT OAuth SSE event requires a string type".to_string(),
+        )
+    })?;
+    if event_type == "error" {
+        return Err(ProviderError::UpstreamTransport(response_failure_message(
+            event, "error",
+        )));
+    }
+    if is_unsupported_response_event_type(event_type) {
+        return Err(ProviderError::UpstreamProtocol(
+            "ChatGPT OAuth SSE event has an unsupported semantic type".to_string(),
+        ));
+    }
+    if !is_known_response_event_type(event_type) {
+        return Ok(());
+    }
+    if event_type == "response.created" {
+        if !event.get("response").is_some_and(Value::is_object) {
+            return Err(ProviderError::UpstreamProtocol(
+                "response.created must contain an object response".to_string(),
             ));
         }
         return Ok(());
     }
-    if event.get("type").and_then(Value::as_str) != Some("response.completed") {
+    if event_type == "response.output_item.added" {
+        let item = event
+            .get("item")
+            .filter(|item| item.is_object())
+            .ok_or_else(|| {
+                ProviderError::UpstreamProtocol(
+                    "response.output_item.added must contain an object item".to_string(),
+                )
+            })?;
+        validate_added_response_output_item(item)?;
+        return Ok(());
+    }
+    if event_type == "response.output_item.done" {
+        let item = event
+            .get("item")
+            .filter(|item| item.is_object())
+            .ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!("{event_type} must contain an object item"))
+            })?;
+        validate_response_output_item(item)?;
+        return Ok(());
+    }
+    if matches!(
+        event_type,
+        "response.content_part.added" | "response.content_part.done"
+    ) {
+        let part = event
+            .get("part")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!("{event_type} must contain an object part"))
+            })?;
+        if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{event_type} has an unsupported semantic part type"
+            )));
+        }
+        if !part.get("text").is_some_and(Value::is_string) {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{event_type} output_text part requires a text string"
+            )));
+        }
+        if part
+            .get("annotations")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{event_type} output_text annotations must be an array"
+            )));
+        }
+        if part.get("logprobs").is_some_and(|value| !value.is_array()) {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{event_type} output_text logprobs must be an array"
+            )));
+        }
+        return Ok(());
+    }
+    if event_type == "response.output_text.delta"
+        && !event.get("delta").is_some_and(Value::is_string)
+    {
+        return Err(ProviderError::UpstreamProtocol(format!(
+            "{event_type} requires a string delta"
+        )));
+    }
+    if event_type == "response.reasoning_summary_text.delta"
+        && (event.get("delta").is_none_or(|value| !value.is_string())
+            || !event.get("summary_index").is_some_and(Value::is_i64))
+    {
+        return Err(ProviderError::UpstreamProtocol(
+            "response.reasoning_summary_text.delta requires a string delta and integer summary_index"
+                .to_string(),
+        ));
+    }
+    if event_type == "response.reasoning_summary_text.done"
+        && (event.get("item_id").is_none_or(|value| !value.is_string())
+            || !event.get("text").is_some_and(Value::is_string)
+            || !event.get("summary_index").is_some_and(Value::is_i64))
+    {
+        return Err(ProviderError::UpstreamProtocol(
+            "response.reasoning_summary_text.done requires string item_id/text and integer summary_index"
+                .to_string(),
+        ));
+    }
+    if event_type == "response.reasoning_text.delta"
+        && (event.get("delta").is_none_or(|value| !value.is_string())
+            || !event.get("content_index").is_some_and(Value::is_i64))
+    {
+        return Err(ProviderError::UpstreamProtocol(
+            "response.reasoning_text.delta requires a string delta and integer content_index"
+                .to_string(),
+        ));
+    }
+    if event_type == "response.reasoning_summary_part.added"
+        && !event.get("summary_index").is_some_and(Value::is_i64)
+    {
+        return Err(ProviderError::UpstreamProtocol(
+            "response.reasoning_summary_part.added requires integer summary_index".to_string(),
+        ));
+    }
+    if event_type != "response.completed" {
         return Ok(());
     }
     let response = event
         .get("response")
         .and_then(Value::as_object)
         .ok_or_else(|| {
-            ProviderError::Request(
+            ProviderError::UpstreamProtocol(
                 "ChatGPT OAuth response.completed requires a response object".to_string(),
             )
         })?;
@@ -1826,9 +3115,330 @@ fn validate_response_event(event: &Value) -> Result<(), ProviderError> {
         .and_then(Value::as_str)
         .is_none_or(str::is_empty)
     {
-        return Err(ProviderError::Request(
+        return Err(ProviderError::UpstreamProtocol(
             "ChatGPT OAuth response.completed requires a non-empty response id".to_string(),
         ));
+    }
+    if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+        parse_usage(usage)?;
+    }
+    if response
+        .get("end_turn")
+        .is_some_and(|value| !value.is_null() && !value.is_boolean())
+    {
+        return Err(ProviderError::UpstreamProtocol(
+            "ChatGPT OAuth response.completed response.end_turn must be a boolean or null"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_added_response_output_item(item: &Value) -> Result<(), ProviderError> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol(
+                "response.output_item.added item requires a non-empty string type".to_string(),
+            )
+        })?;
+    if item_type == "custom_tool_call" {
+        return Err(ProviderError::UpstreamProtocol(
+            "custom_tool_call is not supported by the public tool contract".to_string(),
+        ));
+    }
+    validate_response_item_optional_fields(item, item_type)?;
+    match item_type {
+        "function_call" => {
+            for field in ["name", "arguments", "call_id"] {
+                if !item.get(field).is_some_and(Value::is_string) {
+                    return Err(ProviderError::UpstreamProtocol(format!(
+                        "response.output_item.added {item_type} requires string {field}"
+                    )));
+                }
+            }
+        }
+        "message" => {
+            if !item.get("role").is_some_and(Value::is_string) {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response.output_item.added message requires string role and content array"
+                        .to_string(),
+                ));
+            }
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "response.output_item.added message requires string role and content array"
+                            .to_string(),
+                    )
+                })?;
+            for (index, part) in content.iter().enumerate() {
+                let Some(object) = part.as_object() else {
+                    return Err(ProviderError::UpstreamProtocol(format!(
+                        "response.output_item.added message content[{index}] must be an object"
+                    )));
+                };
+                let value_field = match object.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text") => "text",
+                    Some("input_image") => "image_url",
+                    Some("input_audio") => "audio_url",
+                    _ => {
+                        return Err(ProviderError::UpstreamProtocol(format!(
+                            "response.output_item.added message content[{index}] is invalid"
+                        )));
+                    }
+                };
+                if !object.get(value_field).is_some_and(Value::is_string) {
+                    return Err(ProviderError::UpstreamProtocol(format!(
+                        "response.output_item.added message content[{index}] is invalid"
+                    )));
+                }
+            }
+        }
+        "reasoning" => {
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "response.output_item.added reasoning requires a summary array".to_string(),
+                    )
+                })?;
+            for (index, part) in summary.iter().enumerate() {
+                let valid = part.as_object().is_some_and(|object| {
+                    object.get("type").and_then(Value::as_str) == Some("summary_text")
+                        && object.get("text").is_some_and(Value::is_string)
+                });
+                if !valid {
+                    return Err(ProviderError::UpstreamProtocol(format!(
+                        "response.output_item.added reasoning summary[{index}] is invalid"
+                    )));
+                }
+            }
+            if let Some(content) = item.get("content").filter(|value| !value.is_null()) {
+                let content = content.as_array().ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "response.output_item.added reasoning content must be an array or null"
+                            .to_string(),
+                    )
+                })?;
+                for (index, part) in content.iter().enumerate() {
+                    let valid = part.as_object().is_some_and(|object| {
+                        matches!(
+                            object.get("type").and_then(Value::as_str),
+                            Some("reasoning_text" | "text")
+                        ) && object.get("text").is_some_and(Value::is_string)
+                    });
+                    if !valid {
+                        return Err(ProviderError::UpstreamProtocol(format!(
+                            "response.output_item.added reasoning content[{index}] is invalid"
+                        )));
+                    }
+                }
+            }
+            if item
+                .get("encrypted_content")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response.output_item.added reasoning encrypted_content must be a string or null"
+                        .to_string(),
+                ));
+            }
+        }
+        "web_search_call" => {
+            if item
+                .get("status")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response.output_item.added web_search_call status must be a string or null"
+                        .to_string(),
+                ));
+            }
+            if item
+                .get("action")
+                .is_some_and(|value| !value.is_null() && !value.is_object())
+            {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response.output_item.added web_search_call action must be an object or null"
+                        .to_string(),
+                ));
+            }
+        }
+        "image_generation_call" => {
+            image_generation_from_item(item)?;
+        }
+        _ => {
+            return Err(ProviderError::UpstreamProtocol(
+                "response.output_item.added item has an unsupported type".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_response_output_item(item: &Value) -> Result<(), ProviderError> {
+    let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol("response output item requires a string type".to_string())
+    })?;
+    if item_type == "custom_tool_call" {
+        return Err(ProviderError::UpstreamProtocol(
+            "custom_tool_call is not supported by the public tool contract".to_string(),
+        ));
+    }
+    validate_response_item_optional_fields(item, item_type)?;
+    match item_type {
+        "function_call" => {
+            tool_call_from_response_item(item)?;
+        }
+        "image_generation_call" => {
+            image_generation_from_item(item)?;
+        }
+        "web_search_call" => {
+            web_search_event_from_response_item(item)?;
+        }
+        "message" => {
+            if item.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response message item role must be 'assistant'".to_string(),
+                ));
+            }
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "response message item requires a content array".to_string(),
+                    )
+                })?;
+            for (index, part) in content.iter().enumerate() {
+                let object = part.as_object().ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(format!(
+                        "response message content item {index} must be an object"
+                    ))
+                })?;
+                let part_type = object.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(format!(
+                        "response message content item {index} requires a string type"
+                    ))
+                })?;
+                match part_type {
+                    "output_text" => {
+                        if !object.get("text").is_some_and(Value::is_string) {
+                            return Err(ProviderError::UpstreamProtocol(format!(
+                                "response message content item {index} requires string text"
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(ProviderError::UpstreamProtocol(format!(
+                            "response message content item {index} has an unsupported type"
+                        )));
+                    }
+                }
+            }
+        }
+        "reasoning" => {
+            reasoning_from_response_items(std::slice::from_ref(item))
+                .map_err(ProviderError::UpstreamProtocol)?;
+            if !matches!(
+                item.get("encrypted_content"),
+                None | Some(Value::Null | Value::String(_))
+            ) {
+                return Err(ProviderError::UpstreamProtocol(
+                    "reasoning encrypted_content must be a string or null".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(ProviderError::UpstreamProtocol(
+                "response output item has an unsupported type".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_response_item_optional_fields(
+    item: &Value,
+    item_type: &str,
+) -> Result<(), ProviderError> {
+    let nullable_string = |field: &str| -> Result<(), ProviderError> {
+        if !matches!(item.get(field), None | Some(Value::Null | Value::String(_))) {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{item_type} {field} must be a string or null"
+            )));
+        }
+        Ok(())
+    };
+
+    nullable_string("id")?;
+    if let Some(metadata) = item
+        .get("internal_chat_message_metadata_passthrough")
+        .filter(|value| !value.is_null())
+    {
+        let metadata = metadata.as_object().ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!(
+                "{item_type} internal_chat_message_metadata_passthrough must be an object or null"
+            ))
+        })?;
+        if !matches!(
+            metadata.get("turn_id"),
+            None | Some(Value::Null | Value::String(_))
+        ) {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{item_type} internal_chat_message_metadata_passthrough.turn_id must be a string or null"
+            )));
+        }
+        if !matches!(
+            metadata.get("create_time"),
+            None | Some(Value::Null | Value::Number(_))
+        ) {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "{item_type} internal_chat_message_metadata_passthrough.create_time must be a JSON number or null"
+            )));
+        }
+    }
+
+    match item_type {
+        "message" => match item.get("phase") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) if value == "commentary" || value == "final_answer" => {}
+            _ => {
+                return Err(ProviderError::UpstreamProtocol(
+                    "message phase must be commentary, final_answer, or null".to_string(),
+                ));
+            }
+        },
+        "reasoning" => nullable_string("encrypted_content")?,
+        "function_call" => {
+            nullable_string("namespace")?;
+            if let Some(encrypted_args) = item
+                .get("encrypted_function_args")
+                .filter(|value| !value.is_null())
+            {
+                let encrypted_args = encrypted_args.as_array().ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "function_call encrypted_function_args must be a string array or null"
+                            .to_string(),
+                    )
+                })?;
+                if encrypted_args.iter().any(|value| !value.is_string()) {
+                    return Err(ProviderError::UpstreamProtocol(
+                        "function_call encrypted_function_args must be a string array or null"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        "web_search_call" => nullable_string("status")?,
+        "image_generation_call" => nullable_string("revised_prompt")?,
+        _ => {}
     }
     Ok(())
 }
@@ -1863,6 +3473,7 @@ pub fn split_instructions_and_input(
     ))
 }
 
+#[cfg(test)]
 pub fn messages_to_response_items(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
     let refs: Vec<&Message> = messages.iter().collect();
     messages_to_response_items_refs(&refs)
@@ -1872,42 +3483,48 @@ fn messages_to_response_items_refs(messages: &[&Message]) -> Result<Vec<Value>, 
     let mut items: Vec<Value> = Vec::new();
 
     for message in messages {
-        if message.role != MessageRole::User
-            && message.structured_content.as_ref().is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.get("prompt_cache_breakpoint")
-                        .is_some_and(|value| !value.is_null())
-                })
+        if message.structured_content.as_ref().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("prompt_cache_breakpoint")
+                    .is_some_and(|value| !value.is_null())
             })
-        {
+        }) {
             return Err(ProviderError::InvalidRequest(
-                "prompt_cache_breakpoint is supported only on user text/image content".to_string(),
+                "prompt_cache_breakpoint is not supported by the Codex OAuth HTTP transport"
+                    .to_string(),
             ));
         }
         if message.role == MessageRole::System
             && message.content.starts_with(REMOTE_COMPACTION_MARKER)
         {
             let raw = message.content[REMOTE_COMPACTION_MARKER.len()..].trim();
-            let parsed: Value = serde_json::from_str(raw).map_err(|error| {
-                ProviderError::Request(format!(
+            let parsed = strict_json::parse_str(raw).map_err(|error| {
+                ProviderError::InvalidRequest(format!(
                     "remote compaction marker must contain valid JSON: {error}"
                 ))
             })?;
             let compacted = parsed.as_array().ok_or_else(|| {
-                ProviderError::Request(
+                ProviderError::InvalidRequest(
                     "remote compaction marker must contain a JSON array".to_string(),
                 )
             })?;
-            items.extend(filter_compacted_history_items(compacted)?);
+            items.extend(filter_compacted_history_items(compacted).map_err(
+                |error| match error {
+                    ProviderError::UpstreamProtocol(message) => {
+                        ProviderError::InvalidRequest(message)
+                    }
+                    other => other,
+                },
+            )?);
             continue;
         }
 
         if message.role == MessageRole::Tool {
-            let call_id = message
-                .tool_call_id
-                .as_deref()
-                .or(message.name.as_deref())
-                .unwrap_or("tool-call");
+            let call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "tool messages require a string tool_call_id".to_string(),
+                )
+            })?;
             items.push(json!({
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -1930,16 +3547,22 @@ fn messages_to_response_items_refs(messages: &[&Message]) -> Result<Vec<Value>, 
                     "type": "function_call",
                     "call_id": tc.id,
                     "name": tc.name,
-                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+                    "arguments": tc.arguments,
                 }));
             }
             continue;
         }
 
-        let role = if message.role == MessageRole::Assistant {
-            "assistant"
-        } else {
-            "user"
+        let role = match message.role {
+            MessageRole::Assistant => "assistant",
+            MessageRole::Developer => "developer",
+            MessageRole::User => "user",
+            MessageRole::System | MessageRole::Tool => {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "unsupported internal message role {:?}",
+                    message.role
+                )));
+            }
         };
         items.push(message_item(
             role,
@@ -1994,7 +3617,6 @@ fn message_item(
     for image_url in images {
         content_items.push(json!({"type": "input_image", "image_url": image_url}));
     }
-    content_items[0] = json!({"type": typ, "text": if content.is_empty() { "" } else { content }});
     json!({
         "type": "message",
         "role": role,
@@ -2002,7 +3624,7 @@ fn message_item(
     })
 }
 
-fn tool_schema_to_response_dict(tool: &ToolSchema) -> Value {
+fn tool_schema_to_response_dict(tool: &ToolSchema) -> Result<Value, ProviderError> {
     if tool
         .parameters
         .get("__codex_as_api_tool_type")
@@ -2014,31 +3636,55 @@ fn tool_schema_to_response_dict(tool: &ToolSchema) -> Value {
             .get("openai_tool")
             .filter(|v| v.is_object())
             .cloned()
-            .unwrap_or_else(|| json!({"type": "web_search", "external_web_access": true}));
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "web_search tool metadata requires an openai_tool object".to_string(),
+                )
+            });
     }
-    json!({
+    let mut output = json!({
         "type": "function",
         "name": tool.name,
-        "description": tool.description,
         "parameters": tool.parameters,
-        "strict": false,
-    })
+        "strict": tool.strict,
+    });
+    if let Some(description) = tool.description.as_ref() {
+        output
+            .as_object_mut()
+            .expect("function tool payload is an object")
+            .insert(
+                "description".to_string(),
+                Value::String(description.clone()),
+            );
+    }
+    Ok(output)
 }
 
 fn finalize_responses_request(
     mut payload: Value,
-    model: &str,
+    resolved: &ResolvedModel,
     responses_lite: Option<&Value>,
     text: Option<&Value>,
     service_tier: Option<&str>,
     endpoint: ResponsesEndpointKind,
 ) -> Result<FinalizedResponsesRequest, ProviderError> {
-    if !capability_for_model(model).supports_image_detail_original
-        && value_has_original_image_detail(&payload)
-    {
-        return Err(ProviderError::InvalidRequest(format!(
-            "image detail 'original' is not supported for model {model:?}"
-        )));
+    let model = &resolved.model;
+    for modality in required_input_modalities(&payload) {
+        if !model
+            .input_modalities
+            .iter()
+            .any(|supported| supported == modality)
+        {
+            return Err(ProviderError::InvalidRequest(format!(
+                "the requested model does not support {modality} input"
+            )));
+        }
+    }
+    let has_image_detail = value_has_image_detail(&payload);
+    if !model.supports_image_detail_original && value_has_original_image_detail(&payload) {
+        return Err(ProviderError::InvalidRequest(
+            "image detail 'original' is not supported for the requested model".to_string(),
+        ));
     }
     let payload_object = payload.as_object_mut().ok_or_else(|| {
         ProviderError::InvalidRequest("Responses request payload must be an object".to_string())
@@ -2057,47 +3703,24 @@ fn finalize_responses_request(
             )));
         }
     }
-    if payload_object
-        .get("input")
-        .is_some_and(value_has_prompt_cache_breakpoint)
-    {
-        return Err(ProviderError::InvalidRequest(
-            "prompt_cache_breakpoint is not supported by the Codex OAuth HTTP transport"
-                .to_string(),
-        ));
-    }
     if let Some(mode) = payload_object
         .get("reasoning")
         .and_then(Value::as_object)
         .and_then(|reasoning| reasoning.get("mode"))
         .cloned()
     {
-        match mode.as_str() {
-            Some("standard") => {
+        match mode {
+            Value::Null => {
                 if let Some(reasoning) = payload_object
                     .get_mut("reasoning")
                     .and_then(Value::as_object_mut)
                 {
                     reasoning.remove("mode");
                 }
-            }
-            None if mode.is_null() => {
-                if let Some(reasoning) = payload_object
-                    .get_mut("reasoning")
-                    .and_then(Value::as_object_mut)
-                {
-                    reasoning.remove("mode");
-                }
-            }
-            Some("pro") => {
-                return Err(ProviderError::InvalidRequest(
-                    "reasoning.mode pro is not supported by the Codex OAuth HTTP transport"
-                        .to_string(),
-                ));
             }
             _ => {
                 return Err(ProviderError::InvalidRequest(
-                    "reasoning.mode must be one of: standard, pro".to_string(),
+                    "reasoning.mode is not supported by the Codex OAuth HTTP transport".to_string(),
                 ));
             }
         }
@@ -2106,11 +3729,8 @@ fn finalize_responses_request(
         .get("input")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
-    payload_object.insert(
-        "model".to_string(),
-        Value::String(wire_model_id(model).to_string()),
-    );
+        .ok_or_else(|| ProviderError::InvalidRequest("Responses input must be an array".into()))?;
+    payload_object.insert("model".to_string(), Value::String(model.slug.clone()));
     apply_model_capability_fields(payload_object, model, text, service_tier)
         .map_err(ProviderError::InvalidRequest)?;
     if payload_object
@@ -2119,27 +3739,60 @@ fn finalize_responses_request(
         .and_then(|reasoning| reasoning.get("effort"))
         .is_none()
     {
-        if let Some(default_effort) = capability_for_model(model).default_reasoning_effort {
-            set_reasoning_payload_with_options(payload_object, Some(&default_effort), None)?;
+        if let Some(default_reasoning_level) = model.default_reasoning_level.as_deref() {
+            set_reasoning_payload_with_options(
+                payload_object,
+                Some(default_reasoning_level),
+                None,
+            )?;
         }
+    }
+    if let Some(effort) = payload_object
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        let wire_effort = resolve_reasoning_effort(model, &effort)?;
+        payload_object
+            .get_mut("reasoning")
+            .and_then(Value::as_object_mut)
+            .expect("reasoning was read as an object")
+            .insert("effort".to_string(), Value::String(wire_effort));
+    }
+    let reasoning_summary = (model.supports_reasoning_summary_parameter
+        && model.default_reasoning_summary != "none")
+        .then_some(model.default_reasoning_summary.as_str());
+    if let Some(summary) = reasoning_summary {
+        let reasoning = payload_object
+            .entry("reasoning".to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest("reasoning must be an object".to_string())
+            })?;
+        reasoning.insert("summary".to_string(), Value::String(summary.to_string()));
+    } else if let Some(reasoning) = payload_object
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+    {
+        reasoning.remove("summary");
     }
 
     match endpoint {
         ResponsesEndpointKind::Standard => {
-            if payload_object.get("reasoning").is_some() {
-                let include = payload_object
-                    .entry("include".to_string())
-                    .or_insert_with(|| json!([]));
-                if !include.is_array() {
-                    *include = json!([]);
-                }
-                let include_items = include.as_array_mut().unwrap();
-                if !include_items
-                    .iter()
-                    .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
-                {
-                    include_items.push(json!("reasoning.encrypted_content"));
-                }
+            let include = payload_object
+                .entry("include".to_string())
+                .or_insert_with(|| json!([]));
+            let include_items = include.as_array_mut().ok_or_else(|| {
+                ProviderError::InvalidRequest("include must be an array".to_string())
+            })?;
+            if !include_items
+                .iter()
+                .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
+            {
+                include_items.push(json!("reasoning.encrypted_content"));
             }
         }
         ResponsesEndpointKind::Compact => {
@@ -2149,6 +3802,16 @@ fn finalize_responses_request(
 
     let lite = use_responses_lite(model, responses_lite).map_err(ProviderError::InvalidRequest)?;
     if lite {
+        if has_image_detail {
+            return Err(ProviderError::InvalidRequest(
+                "image detail is not supported by Responses Lite".to_string(),
+            ));
+        }
+        if payload_object.get("parallel_tool_calls") == Some(&Value::Bool(true)) {
+            return Err(ProviderError::InvalidRequest(
+                "parallel_tool_calls=true is not supported by Responses Lite".to_string(),
+            ));
+        }
         match endpoint {
             ResponsesEndpointKind::Standard => match payload_object.get("tool_choice") {
                 None => {
@@ -2172,19 +3835,169 @@ fn finalize_responses_request(
         payload,
         use_responses_lite: lite,
         conversation_input,
+        account_id: resolved.snapshot.key.account_id.clone(),
+        comp_hash: resolved.model.comp_hash.clone(),
+    })
+}
+
+pub(crate) fn resolve_reasoning_effort(
+    model: &ModelInfo,
+    requested: &str,
+) -> Result<String, ProviderError> {
+    if requested.is_empty() || requested != requested.trim() {
+        return Err(ProviderError::InvalidRequest(
+            "reasoning_effort must be a non-empty string without surrounding whitespace"
+                .to_string(),
+        ));
+    }
+    if requested == "ultra" {
+        let candidate = model
+            .multi_agent_reasoning_effort
+            .as_ref()
+            .filter(|effort| {
+                effort.as_str() != "ultra"
+                    && model
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|level| level.effort.as_str() == effort.as_str())
+            })
+            .cloned()
+            .or_else(|| {
+                model
+                    .supported_reasoning_levels
+                    .iter()
+                    .find(|level| level.effort == "max")
+                    .map(|level| level.effort.clone())
+            })
+            .or_else(|| {
+                model
+                    .supported_reasoning_levels
+                    .iter()
+                    .rev()
+                    .find(|level| level.effort != "ultra")
+                    .map(|level| level.effort.clone())
+            });
+        return candidate.ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "the requested model has no wire reasoning effort for ultra".to_string(),
+            )
+        });
+    }
+    if !model
+        .supported_reasoning_levels
+        .iter()
+        .any(|level| level.effort == requested)
+    {
+        return Err(ProviderError::InvalidRequest(
+            "reasoning effort is not supported for the requested model".to_string(),
+        ));
+    }
+    Ok(if requested == "persistent" {
+        "disabled".to_string()
+    } else {
+        requested.to_string()
     })
 }
 
 fn value_has_original_image_detail(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => items.iter().any(value_has_original_image_detail),
-        Value::Object(object) => {
-            (object.get("type").and_then(Value::as_str) == Some("input_image")
-                && object.get("detail").and_then(Value::as_str) == Some("original"))
-                || object.values().any(value_has_original_image_detail)
+    input_has_image_matching(value, |image| {
+        image.get("detail").and_then(Value::as_str) == Some("original")
+    })
+}
+
+fn value_has_image_detail(value: &Value) -> bool {
+    input_has_image_matching(value, |image| {
+        image.get("detail").is_some_and(|detail| !detail.is_null())
+    })
+}
+
+#[cfg(test)]
+fn value_has_input_image(value: &Value) -> bool {
+    input_has_image_matching(value, |_| true)
+}
+
+fn required_input_modalities(value: &Value) -> Vec<&'static str> {
+    fn collect_parts(parts: &[Value], text: &mut bool, image: &mut bool, audio: &mut bool) {
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("input_text" | "output_text") => *text = true,
+                Some("input_image") => *image = true,
+                Some("input_audio") => *audio = true,
+                _ => {}
+            }
         }
-        _ => false,
     }
+
+    let mut text = value
+        .get("instructions")
+        .and_then(Value::as_str)
+        .is_some_and(|instructions| !instructions.is_empty());
+    let mut image = false;
+    let mut audio = false;
+    if let Some(items) = value.get("input").and_then(Value::as_array) {
+        for item in items {
+            let Some(message) = item.as_object() else {
+                continue;
+            };
+            match message.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+                        collect_parts(parts, &mut text, &mut image, &mut audio);
+                    }
+                }
+                Some("function_call_output" | "custom_tool_call_output") => {
+                    match message.get("output") {
+                        Some(Value::String(_)) => text = true,
+                        Some(Value::Array(parts)) => {
+                            collect_parts(parts, &mut text, &mut image, &mut audio)
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut required = Vec::new();
+    if text {
+        required.push("text");
+    }
+    if image {
+        required.push("image");
+    }
+    if audio {
+        required.push("audio");
+    }
+    required
+}
+
+fn input_has_image_matching<F>(value: &Value, predicate: F) -> bool
+where
+    F: Fn(&serde_json::Map<String, Value>) -> bool,
+{
+    let input = value.get("input").unwrap_or(value);
+    let Some(items) = input.as_array() else {
+        return false;
+    };
+    for item in items {
+        let Some(message) = item.as_object() else {
+            continue;
+        };
+        if message.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        if content.iter().any(|part| {
+            part.as_object().is_some_and(|part| {
+                part.get("type").and_then(Value::as_str) == Some("input_image") && predicate(part)
+            })
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn responses_lite_headers(use_responses_lite: bool) -> HashMap<String, String> {
@@ -2202,7 +4015,11 @@ fn apply_responses_lite_payload(
         .get("tools")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            ProviderError::Request(
+                "internal Responses Lite payload requires a tools array".to_string(),
+            )
+        })?;
     if let Some(tool_type) = tools_payload.iter().find_map(|tool| {
         let tool_type = tool.get("type").and_then(|v| v.as_str())?;
         matches!(tool_type, "web_search" | "image_generation").then_some(tool_type)
@@ -2212,16 +4029,25 @@ fn apply_responses_lite_payload(
         )));
     }
 
-    let instructions = payload
-        .remove("instructions")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let instructions = match payload.remove("instructions") {
+        None => String::new(),
+        Some(Value::String(instructions)) => instructions,
+        Some(_) => {
+            return Err(ProviderError::Request(
+                "internal Responses Lite payload requires string instructions".to_string(),
+            ));
+        }
+    };
     payload.remove("tools");
     payload.insert("parallel_tool_calls".to_string(), Value::Bool(false));
     let input = payload
         .remove("input")
         .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            ProviderError::Request(
+                "internal Responses Lite payload requires an input array".to_string(),
+            )
+        })?;
     let mut items = vec![json!({
         "type": "additional_tools",
         "role": "developer",
@@ -2235,10 +4061,7 @@ fn apply_responses_lite_payload(
         }));
     }
     items.extend(input);
-    payload.insert(
-        "input".to_string(),
-        strip_image_detail_fields(Value::Array(items)),
-    );
+    payload.insert("input".to_string(), Value::Array(items));
     let reasoning = payload
         .entry("reasoning".to_string())
         .or_insert_with(|| json!({}))
@@ -2262,25 +4085,22 @@ fn apply_responses_lite_payload(
 }
 
 fn compact_raw_events(events: &[Value]) -> Vec<Value> {
-    let mut keep: Vec<Value> = events
-        .iter()
-        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("web_search_call"))
-        .cloned()
-        .collect();
     let start = events.len().saturating_sub(20);
-    for event in &events[start..] {
-        if !keep.iter().any(|kept| kept == event) {
-            keep.push(event.clone());
-        }
-    }
-    keep
+    events
+        .iter()
+        .enumerate()
+        .filter(|(index, event)| {
+            *index >= start || event.get("type").and_then(Value::as_str) == Some("web_search_call")
+        })
+        .map(|(_, event)| event.clone())
+        .collect()
 }
 
 fn filter_compacted_history_items(items: &[Value]) -> Result<Vec<Value>, ProviderError> {
     let mut compacted = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
-            ProviderError::Request(format!(
+            ProviderError::UpstreamProtocol(format!(
                 "remote compact output item {index} must be an object"
             ))
         })?;
@@ -2298,20 +4118,41 @@ fn validate_compacted_history_item(
     index: usize,
 ) -> Result<(), ProviderError> {
     let item_type = object.get("type").and_then(Value::as_str).ok_or_else(|| {
-        ProviderError::Request(format!(
+        ProviderError::UpstreamProtocol(format!(
             "remote compact output item {index} requires a string type"
         ))
     })?;
+    validate_response_item_optional_fields(&Value::Object(object.clone()), item_type)?;
     match item_type {
+        "additional_tools" => {
+            if object.get("role").and_then(Value::as_str) != Some("developer") {
+                return Err(ProviderError::UpstreamProtocol(format!(
+                    "remote compact output additional_tools item {index} requires developer role"
+                )));
+            }
+            let tools = object.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!(
+                    "remote compact output additional_tools item {index} requires a tools array"
+                ))
+            })?;
+            if tools.iter().any(|tool| !tool.is_object()) {
+                return Err(ProviderError::UpstreamProtocol(format!(
+                    "remote compact output additional_tools item {index} tools must be objects"
+                )));
+            }
+            Ok(())
+        }
         "message" => validate_compacted_message(object, index),
         "agent_message" => validate_compacted_agent_message(object, index),
+        "reasoning" => validate_compacted_reasoning(object, index),
+        "function_call" => validate_compacted_function_call(object, index),
         "compaction" | "compaction_summary" => {
             if object
                 .get("encrypted_content")
                 .and_then(Value::as_str)
                 .is_none()
             {
-                return Err(ProviderError::Request(format!(
+                return Err(ProviderError::UpstreamProtocol(format!(
                     "remote compact output {item_type} item {index} requires encrypted_content"
                 )));
             }
@@ -2319,11 +4160,13 @@ fn validate_compacted_history_item(
         }
         "context_compaction" => match object.get("encrypted_content") {
             None | Some(Value::Null | Value::String(_)) => Ok(()),
-            Some(_) => Err(ProviderError::Request(format!(
+            Some(_) => Err(ProviderError::UpstreamProtocol(format!(
                 "remote compact output context_compaction item {index} encrypted_content must be a string"
             ))),
         },
-        _ => Ok(()),
+        _ => Err(ProviderError::UpstreamProtocol(format!(
+            "remote compact output item {index} has an unsupported type"
+        ))),
     }
 }
 
@@ -2331,22 +4174,30 @@ fn validate_compacted_message(
     object: &serde_json::Map<String, Value>,
     index: usize,
 ) -> Result<(), ProviderError> {
-    if object.get("role").and_then(Value::as_str).is_none() {
-        return Err(ProviderError::Request(format!(
-            "remote compact output message {index} requires a string role"
-        )));
+    match object.get("role").and_then(Value::as_str) {
+        Some("user" | "assistant" | "developer") => {}
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "remote compact output message {index} has an unsupported role"
+            )));
+        }
+        None => {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "remote compact output message {index} requires a string role"
+            )));
+        }
     }
     let content = object
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            ProviderError::Request(format!(
+            ProviderError::UpstreamProtocol(format!(
                 "remote compact output message {index} requires a content array"
             ))
         })?;
     for (content_index, content_item) in content.iter().enumerate() {
         let content_object = content_item.as_object().ok_or_else(|| {
-            ProviderError::Request(format!(
+            ProviderError::UpstreamProtocol(format!(
                 "remote compact output message {index} content item {content_index} must be an object"
             ))
         })?;
@@ -2365,13 +4216,102 @@ fn validate_compacted_message(
                         }
                         Some(_) => false,
                     } => {}
+            Some("input_audio")
+                if content_object
+                    .get("audio_url")
+                    .and_then(Value::as_str)
+                    .is_some() => {}
             _ => {
-                return Err(ProviderError::Request(format!(
+                return Err(ProviderError::UpstreamProtocol(format!(
                     "remote compact output message {index} content item {content_index} is invalid"
                 )));
             }
         }
     }
+    Ok(())
+}
+
+fn validate_compacted_reasoning(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<(), ProviderError> {
+    if !matches!(
+        object.get("id"),
+        None | Some(Value::Null | Value::String(_))
+    ) {
+        return Err(ProviderError::UpstreamProtocol(format!(
+            "remote compact output reasoning item {index} id must be a string or null"
+        )));
+    }
+    match object.get("encrypted_content") {
+        None | Some(Value::Null | Value::String(_)) => {}
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "remote compact output reasoning item {index} encrypted_content must be a string or null"
+            )));
+        }
+    }
+    let summary = object
+        .get("summary")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!(
+                "remote compact output reasoning item {index} requires a summary array"
+            ))
+        })?;
+    for (summary_index, part) in summary.iter().enumerate() {
+        let valid = part.as_object().is_some_and(|part| {
+            part.get("type").and_then(Value::as_str) == Some("summary_text")
+                && part.get("text").is_some_and(Value::is_string)
+        });
+        if !valid {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "remote compact output reasoning item {index} summary item {summary_index} is invalid"
+            )));
+        }
+    }
+    if let Some(content) = object.get("content").filter(|value| !value.is_null()) {
+        let content = content.as_array().ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!(
+                "remote compact output reasoning item {index} content must be an array or null"
+            ))
+        })?;
+        for (content_index, part) in content.iter().enumerate() {
+            let valid = part.as_object().is_some_and(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("reasoning_text" | "text")
+                ) && part.get("text").is_some_and(Value::is_string)
+            });
+            if !valid {
+                return Err(ProviderError::UpstreamProtocol(format!(
+                    "remote compact output reasoning item {index} content item {content_index} is invalid"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_compacted_function_call(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<(), ProviderError> {
+    for field in ["call_id", "name"] {
+        if object.get(field).and_then(Value::as_str).is_none() {
+            return Err(ProviderError::UpstreamProtocol(format!(
+                "remote compact output function_call item {index} requires string {field}"
+            )));
+        }
+    }
+    object
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!(
+                "remote compact output function_call item {index} requires string arguments"
+            ))
+        })?;
     Ok(())
 }
 
@@ -2381,7 +4321,7 @@ fn validate_compacted_agent_message(
 ) -> Result<(), ProviderError> {
     for field in ["author", "recipient"] {
         if object.get(field).and_then(Value::as_str).is_none() {
-            return Err(ProviderError::Request(format!(
+            return Err(ProviderError::UpstreamProtocol(format!(
                 "remote compact output agent_message item {index} requires string {field}"
             )));
         }
@@ -2390,7 +4330,7 @@ fn validate_compacted_agent_message(
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            ProviderError::Request(format!(
+            ProviderError::UpstreamProtocol(format!(
                 "remote compact output agent_message item {index} requires a content array"
             ))
         })?;
@@ -2409,7 +4349,7 @@ fn validate_compacted_agent_message(
                     .is_some()
         });
         if !valid {
-            return Err(ProviderError::Request(format!(
+            return Err(ProviderError::UpstreamProtocol(format!(
                 "remote compact output agent_message item {index} content item {content_index} is invalid"
             )));
         }
@@ -2553,113 +4493,160 @@ fn is_external_context_wrapper(text: &str) -> bool {
     !key.is_empty() && text.ends_with(&format!("</external_{key}>"))
 }
 
-fn web_search_event_from_response_item(item: &Value, all_items: &[Value]) -> Option<Value> {
-    if item.get("type").and_then(|v| v.as_str()) != Some("web_search_call") {
-        return None;
+fn web_search_event_from_response_item(item: &Value) -> Result<Option<Value>, ProviderError> {
+    let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol("response output item requires a string type".to_string())
+    })?;
+    if item_type != "web_search_call" {
+        return Ok(None);
     }
-    let raw_id = item
-        .get("id")
-        .or_else(|| item.get("call_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-    let tool_id = if raw_id.starts_with("srvtoolu_") {
-        raw_id
-    } else {
-        format!(
-            "srvtoolu_{}",
-            raw_id
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect::<String>()
-        )
-    };
+    let tool_id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol("web_search_call requires a string id".to_string())
+    })?;
     let action = item
         .get("action")
-        .filter(|v| v.is_object())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let mut sources = web_search_sources_from_action(&action);
-    if sources.is_empty() && !all_items.is_empty() {
-        sources.extend(web_search_sources_from_annotations(all_items));
-    }
-    Some(json!({
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol("web_search_call requires an action object".to_string())
+        })?;
+    let query = web_search_query_from_action(action)?;
+    let sources = web_search_sources_from_action(action)?;
+    Ok(Some(json!({
         "type": "web_search_call",
         "id": tool_id,
-        "input": {"query": web_search_query_from_action(&action)},
+        "input": {"query": query},
         "content": sources,
-    }))
+    })))
 }
 
-fn web_search_query_from_action(action: &Value) -> String {
-    if let Some(query) = action.get("query").and_then(|v| v.as_str()) {
-        return query.to_string();
-    }
-    if let Some(queries) = action.get("queries").and_then(|v| v.as_array()) {
-        if let Some(first) = queries
-            .iter()
-            .filter_map(|q| q.as_str())
-            .find(|q| !q.is_empty())
-        {
-            return first.to_string();
+fn web_search_query_from_action(
+    action: &serde_json::Map<String, Value>,
+) -> Result<String, ProviderError> {
+    let action_type = match action.get("type") {
+        Some(Value::String(action_type)) => action_type.as_str(),
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(
+                "web search action type must be a string".to_string(),
+            ));
         }
-    }
-    action
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn web_search_sources_from_action(action: &Value) -> Vec<Value> {
-    normalize_web_search_sources(action.get("sources").unwrap_or(&Value::Null))
-}
-
-fn web_search_sources_from_annotations(items: &[Value]) -> Vec<Value> {
-    let mut raw = Vec::new();
-    for item in items {
-        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-            for part in content {
-                if let Some(annotations) = part.get("annotations").and_then(|v| v.as_array()) {
-                    for ann in annotations {
-                        if ann.get("type").and_then(|v| v.as_str()) == Some("url_citation") {
-                            raw.push(ann.clone());
-                        }
-                    }
-                }
-            }
+        None => {
+            return Err(ProviderError::UpstreamProtocol(
+                "web search action type must be a string".to_string(),
+            ));
         }
-    }
-    normalize_web_search_sources(&Value::Array(raw))
-}
-
-fn normalize_web_search_sources(value: &Value) -> Vec<Value> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let Some(sources) = value.as_array() else {
-        return out;
     };
-    for source in sources {
-        let Some(url) = source.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if url.is_empty() || seen.contains(url) {
-            continue;
+    if action_type != "search" {
+        return Err(ProviderError::UpstreamProtocol(format!(
+            "web search action type {action_type:?} cannot be represented by this facade"
+        )));
+    }
+
+    let query = match action.get("query") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(query)) => Some(query.as_str()),
+        Some(_) => {
+            return Err(ProviderError::UpstreamProtocol(
+                "web search action query must be a string".to_string(),
+            ));
         }
-        seen.insert(url.to_string());
+    };
+    let queries = if let Some(queries) = action.get("queries").filter(|value| !value.is_null()) {
+        let queries = queries.as_array().ok_or_else(|| {
+            ProviderError::UpstreamProtocol(
+                "web search action queries must be an array".to_string(),
+            )
+        })?;
+        if queries.iter().any(|query| query.as_str().is_none()) {
+            return Err(ProviderError::UpstreamProtocol(
+                "web search action queries must contain strings".to_string(),
+            ));
+        }
+        Some(queries)
+    } else {
+        None
+    };
+    if queries.is_some_and(|queries| queries.len() > 1) {
+        return Err(ProviderError::UpstreamProtocol(
+            "web search action contains multiple queries that cannot be represented by this facade"
+                .to_string(),
+        ));
+    }
+    if let Some(query) = query {
+        if queries
+            .and_then(|queries| queries.first())
+            .and_then(Value::as_str)
+            .is_some_and(|alternate| alternate != query)
+        {
+            return Err(ProviderError::UpstreamProtocol(
+                "web search action query conflicts with queries".to_string(),
+            ));
+        }
+        return Ok(query.to_string());
+    }
+    queries
+        .and_then(|queries| queries.first())
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol("web search action requires a query".to_string())
+        })
+}
+
+fn web_search_sources_from_action(
+    action: &serde_json::Map<String, Value>,
+) -> Result<Vec<Value>, ProviderError> {
+    let sources = action.get("sources").ok_or_else(|| {
+        ProviderError::UpstreamProtocol(
+            "web search action sources are required when sources were requested".to_string(),
+        )
+    })?;
+    normalize_web_search_sources(sources)
+}
+
+fn normalize_web_search_sources(value: &Value) -> Result<Vec<Value>, ProviderError> {
+    let mut out = Vec::new();
+    let sources = value.as_array().ok_or_else(|| {
+        ProviderError::UpstreamProtocol("web search sources must be an array".to_string())
+    })?;
+    for (index, source) in sources.iter().enumerate() {
+        let object = source.as_object().ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!("web search source {index} must be an object"))
+        })?;
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!(
+                    "web search source {index} requires a non-empty url"
+                ))
+            })?;
         let mut result = serde_json::Map::new();
         result.insert("type".to_string(), json!("web_search_result"));
         result.insert("url".to_string(), json!(url));
-        result.insert(
-            "title".to_string(),
-            json!(source.get("title").and_then(|v| v.as_str()).unwrap_or(url)),
-        );
-        if let Some(page_age) = source.get("page_age").and_then(|v| v.as_str()) {
-            result.insert("page_age".to_string(), json!(page_age));
+        if let Some(title) = object.get("title") {
+            if !title.is_null() {
+                let title = title.as_str().ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(format!(
+                        "web search source {index} title must be a string"
+                    ))
+                })?;
+                result.insert("title".to_string(), json!(title));
+            }
+        }
+        if let Some(page_age) = object.get("page_age") {
+            if !page_age.is_null() {
+                let page_age = page_age.as_str().ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(format!(
+                        "web search source {index} page_age must be a string"
+                    ))
+                })?;
+                result.insert("page_age".to_string(), json!(page_age));
+            }
         }
         out.push(Value::Object(result));
     }
-    out
+    Ok(out)
 }
 
 fn set_reasoning_payload(
@@ -2667,7 +4654,7 @@ fn set_reasoning_payload(
     reasoning_effort: Option<&str>,
 ) -> Result<(), ProviderError> {
     let effort = match reasoning_effort {
-        Some(e) if !e.is_empty() => e,
+        Some(e) if !e.is_empty() && e == e.trim() => e,
         Some(_) => {
             return Err(ProviderError::InvalidRequest(
                 "reasoning_effort must be a non-empty string when provided".to_string(),
@@ -2676,13 +4663,7 @@ fn set_reasoning_payload(
         None => return Ok(()),
     };
 
-    let wire_effort = match effort {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => effort.to_string(),
-        "ultra" => "max".to_string(),
-        _ => effort.to_string(),
-    };
-
-    payload.insert("reasoning".to_string(), json!({"effort": wire_effort}));
+    payload.insert("reasoning".to_string(), json!({"effort": effort}));
 
     Ok(())
 }
@@ -2692,14 +4673,23 @@ fn set_reasoning_payload_with_options(
     reasoning_effort: Option<&str>,
     reasoning: Option<&Value>,
 ) -> Result<(), ProviderError> {
-    let mut merged = payload
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut merged = match payload.get("reasoning") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(reasoning)) => reasoning.clone(),
+        Some(_) => {
+            return Err(ProviderError::InvalidRequest(
+                "request payload reasoning must be an object".to_string(),
+            ));
+        }
+    };
+    if merged.get("mode").is_some_and(|mode| !mode.is_null()) {
+        return Err(ProviderError::InvalidRequest(
+            "reasoning.mode is not supported by the Codex OAuth HTTP transport".to_string(),
+        ));
+    }
+    merged.remove("mode");
 
     let mut nested_effort: Option<&str> = None;
-    let mut standard_mode = false;
     if let Some(reasoning) = reasoning {
         let object = reasoning.as_object().ok_or_else(|| {
             ProviderError::InvalidRequest("reasoning must be an object".to_string())
@@ -2715,7 +4705,7 @@ fn set_reasoning_payload_with_options(
             if !value.is_null() {
                 let effort = value
                     .as_str()
-                    .filter(|value| !value.is_empty())
+                    .filter(|value| !value.is_empty() && *value == value.trim())
                     .ok_or_else(|| {
                         ProviderError::InvalidRequest(
                             "reasoning.effort must be a non-empty string when provided".to_string(),
@@ -2726,23 +4716,9 @@ fn set_reasoning_payload_with_options(
         }
         if let Some(value) = object.get("mode") {
             if !value.is_null() {
-                let mode = value.as_str().ok_or_else(|| {
-                    ProviderError::InvalidRequest(
-                        "reasoning.mode must be one of: standard, pro".to_string(),
-                    )
-                })?;
-                if !matches!(mode, "standard" | "pro") {
-                    return Err(ProviderError::InvalidRequest(
-                        "reasoning.mode must be one of: standard, pro".to_string(),
-                    ));
-                }
-                if mode == "pro" {
-                    return Err(ProviderError::InvalidRequest(
-                        "reasoning.mode pro is not supported by the Codex OAuth HTTP transport"
-                            .to_string(),
-                    ));
-                }
-                standard_mode = true;
+                return Err(ProviderError::InvalidRequest(
+                    "reasoning.mode is not supported by the Codex OAuth HTTP transport".to_string(),
+                ));
             }
         }
         if let Some(value) = object.get("context") {
@@ -2771,18 +4747,14 @@ fn set_reasoning_payload_with_options(
             ));
         }
     }
-    merged.remove("mode");
-    let effort = reasoning_effort
-        .or(nested_effort)
-        .or_else(|| standard_mode.then_some("medium"));
+    let effort = reasoning_effort.or(nested_effort);
     if let Some(effort) = effort {
-        if effort.is_empty() {
+        if effort.is_empty() || effort != effort.trim() {
             return Err(ProviderError::InvalidRequest(
                 "reasoning_effort must be a non-empty string when provided".to_string(),
             ));
         }
-        let wire_effort = if effort == "ultra" { "max" } else { effort };
-        merged.insert("effort".to_string(), Value::String(wire_effort.to_string()));
+        merged.insert("effort".to_string(), Value::String(effort.to_string()));
     }
 
     if !merged.is_empty() {
@@ -2791,21 +4763,9 @@ fn set_reasoning_payload_with_options(
     Ok(())
 }
 
-fn is_gpt_5_6_model(model: &str) -> bool {
-    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
-}
-
-fn wire_model_id(model: &str) -> &str {
-    if model == "gpt-5.6" {
-        "gpt-5.6-sol"
-    } else {
-        model
-    }
-}
-
 fn apply_generation_controls(
-    payload: &mut serde_json::Map<String, Value>,
-    model: &str,
+    _payload: &mut serde_json::Map<String, Value>,
+    _model: &str,
     controls: &GenerationControls,
 ) -> Result<(), ProviderError> {
     if controls
@@ -2814,10 +4774,9 @@ fn apply_generation_controls(
         .and_then(Value::as_object)
         .and_then(|reasoning| reasoning.get("mode"))
         .is_some_and(|mode| !mode.is_null())
-        && !is_gpt_5_6_model(model)
     {
         return Err(ProviderError::InvalidRequest(
-            "reasoning.mode is supported only for GPT-5.6 models".to_string(),
+            "reasoning.mode is not supported by the Codex OAuth HTTP transport".to_string(),
         ));
     }
     if controls.safety_identifier.is_some() {
@@ -2833,28 +4792,57 @@ fn apply_generation_controls(
             ));
         }
     }
-    if payload
-        .get("input")
-        .is_some_and(value_has_prompt_cache_breakpoint)
-    {
+    Ok(())
+}
+
+fn validate_private_request_controls(
+    temperature: Option<f64>,
+    max_tokens: Option<i64>,
+    stop: Option<&[String]>,
+) -> Result<(), ProviderError> {
+    if temperature.is_some() {
         return Err(ProviderError::InvalidRequest(
-            "prompt_cache_breakpoint is not supported by the Codex OAuth HTTP transport"
-                .to_string(),
+            "temperature is not supported by the private Codex OAuth HTTP transport".to_string(),
+        ));
+    }
+    if max_tokens.is_some() {
+        return Err(ProviderError::InvalidRequest(
+            "max_tokens is not supported by the private Codex OAuth HTTP transport".to_string(),
+        ));
+    }
+    if stop.is_some() {
+        return Err(ProviderError::InvalidRequest(
+            "stop is not supported by the private Codex OAuth HTTP transport".to_string(),
         ));
     }
     Ok(())
 }
 
-fn value_has_prompt_cache_breakpoint(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => {
-            object
-                .get("prompt_cache_breakpoint")
-                .is_some_and(|value| !value.is_null())
-                || object.values().any(value_has_prompt_cache_breakpoint)
+fn validate_normalized_tool_choice(tool_choice: Option<&Value>) -> Result<(), ProviderError> {
+    let Some(tool_choice) = tool_choice else {
+        return Ok(());
+    };
+    match tool_choice {
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "none" | "required") => Ok(()),
+        Value::Object(object)
+            if object.len() == 2
+                && object.get("type").and_then(Value::as_str) == Some("function")
+                && object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty()) =>
+        {
+            Ok(())
         }
-        Value::Array(items) => items.iter().any(value_has_prompt_cache_breakpoint),
-        _ => false,
+        Value::Object(object)
+            if object.len() == 1
+                && object.get("type").and_then(Value::as_str) == Some("web_search") =>
+        {
+            Ok(())
+        }
+        _ => Err(ProviderError::InvalidRequest(
+            "tool_choice is not a valid normalized private Responses tool choice".to_string(),
+        )),
     }
 }
 
@@ -2877,6 +4865,9 @@ fn merge_text_verbosity(
                 "text.verbosity must be one of: low, medium, high".to_string(),
             ));
         }
+    }
+    if object.get("verbosity").is_some_and(Value::is_null) {
+        object.remove("verbosity");
     }
     let Some(verbosity) = verbosity else {
         return Ok(text
@@ -2902,135 +4893,388 @@ fn merge_text_verbosity(
     Ok(Some(Value::Object(object)))
 }
 
-fn tool_call_from_response_item(item: &Value) -> Option<ToolCall> {
-    let typ = item.get("type").and_then(|v| v.as_str())?;
-    if typ != "function_call" && typ != "custom_tool_call" {
-        return None;
+fn tool_call_from_response_item(item: &Value) -> Result<Option<ToolCall>, ProviderError> {
+    let typ = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::UpstreamProtocol("response output item requires a string type".to_string())
+    })?;
+    if typ == "custom_tool_call" {
+        return Err(ProviderError::UpstreamProtocol(
+            "custom_tool_call is not supported by the public tool contract".to_string(),
+        ));
     }
-    let name = item.get("name").and_then(|v| v.as_str())?;
-    if name.is_empty() {
-        return None;
+    if typ != "function_call" {
+        return Ok(None);
     }
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::UpstreamProtocol(format!("{typ} requires a string name")))?;
+    let argument_field = "arguments";
     let raw_args = item
-        .get("arguments")
-        .or_else(|| item.get("input"))
-        .cloned()
-        .unwrap_or(Value::String("{}".to_string()));
-
-    let args: HashMap<String, Value> = match &raw_args {
-        Value::String(s) => {
-            if s.is_empty() {
-                HashMap::new()
-            } else {
-                serde_json::from_str(s).unwrap_or_else(|_| {
-                    let mut m = HashMap::new();
-                    m.insert("input".to_string(), Value::String(s.clone()));
-                    m
-                })
-            }
-        }
-        Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        _ => HashMap::new(),
-    };
+        .get(argument_field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProviderError::UpstreamProtocol(format!("{typ} {argument_field} must be a string"))
+        })?;
 
     let call_id = item
         .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::UpstreamProtocol(format!("{typ} requires a string call_id")))?
+        .to_string();
 
-    Some(ToolCall {
+    Ok(Some(ToolCall {
         id: call_id,
         name: name.to_string(),
-        arguments: args,
-    })
+        arguments: raw_args.to_string(),
+    }))
 }
 
-pub fn text_from_response_items(items: &[Value]) -> String {
+pub fn text_from_response_items(items: &[Value]) -> Result<String, ProviderError> {
     let mut parts: Vec<String> = Vec::new();
     for item in items {
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if item_type == "output_text" || item_type == "text" {
-            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                }
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::UpstreamProtocol(
+                "response output item requires a string type".to_string(),
+            )
+        })?;
+        if item_type != "message" {
+            if !matches!(
+                item_type,
+                "function_call" | "image_generation_call" | "reasoning" | "web_search_call"
+            ) {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response output item has an unsupported type".to_string(),
+                ));
             }
             continue;
         }
-        if item_type != "message" {
-            continue;
+        if item.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Err(ProviderError::UpstreamProtocol(
+                "response message item role must be 'assistant'".to_string(),
+            ));
         }
-        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-            for part in content {
-                match part {
-                    Value::String(s) if !s.is_empty() => {
-                        parts.push(s.clone());
-                    }
-                    Value::Object(map) => {
-                        let part_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if part_type == "output_text" || part_type == "text" {
-                            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    parts.push(text.to_string());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+        let content = item
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProviderError::UpstreamProtocol(
+                    "response message item requires a content array".to_string(),
+                )
+            })?;
+        for (index, part) in content.iter().enumerate() {
+            let map = part.as_object().ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!(
+                    "response message content[{index}] must be an object"
+                ))
+            })?;
+            let part_type = map.get("type").and_then(Value::as_str);
+            if part_type != Some("output_text") {
+                return Err(ProviderError::UpstreamProtocol(
+                    "response message content has an unsupported type".to_string(),
+                ));
+            }
+            let text = map.get("text").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::UpstreamProtocol(format!(
+                    "response message content[{index}] requires string text"
+                ))
+            })?;
+            if !text.is_empty() {
+                parts.push(text.to_string());
             }
         }
     }
-    parts.join("")
+    Ok(parts.join(""))
 }
 
-pub fn usage_from_response(value: &Value) -> Option<Usage> {
-    let obj = value.as_object()?;
-    let prompt = obj
-        .get("input_tokens")
-        .or_else(|| obj.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())?;
-    let completion = obj
-        .get("output_tokens")
-        .or_else(|| obj.get("completion_tokens"))
-        .and_then(|v| v.as_i64())?;
-    let total = obj.get("total_tokens").and_then(|v| v.as_i64());
-
-    let mut cached_tokens: i64 = 0;
-    let mut cache_write_tokens: i64 = 0;
-    let token_details = obj
-        .get("input_tokens_details")
-        .or_else(|| obj.get("prompt_tokens_details"));
-    if let Some(details) = token_details.and_then(|v| v.as_object()) {
-        if let Some(ct) = details.get("cached_tokens").and_then(|v| v.as_i64()) {
-            cached_tokens = ct;
-        }
-        if let Some(tokens) = details.get("cache_write_tokens").and_then(Value::as_i64) {
-            cache_write_tokens = tokens;
-        }
-    } else if let Some(ct) = obj.get("cached_input_tokens").and_then(|v| v.as_i64()) {
-        cached_tokens = ct;
-    } else if let Some(ct) = obj.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
-        cached_tokens = ct;
+pub(crate) fn parse_usage(value: &Value) -> Result<Usage, ProviderError> {
+    let invalid = |message: String| ProviderError::UpstreamProtocol(message);
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid("usage must be an object".to_string()))?;
+    if let Some(field) = [
+        "prompt_tokens",
+        "completion_tokens",
+        "prompt_tokens_details",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .into_iter()
+    .find(|field| obj.contains_key(*field))
+    {
+        return Err(invalid(format!(
+            "usage contains unsupported public alias field {field:?}"
+        )));
     }
-    if cache_write_tokens == 0 {
-        cache_write_tokens = obj
-            .get("cache_write_input_tokens")
+    let required_count = |key: &str| -> Result<i64, ProviderError> {
+        obj.get(key)
             .and_then(Value::as_i64)
-            .unwrap_or(0);
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| invalid(format!("usage requires non-negative {key}")))
+    };
+    let prompt = required_count("input_tokens")?;
+    let completion = required_count("output_tokens")?;
+    let total = required_count("total_tokens")?;
+    if prompt.checked_add(completion) != Some(total) {
+        return Err(invalid(
+            "usage total_tokens must equal input_tokens plus output_tokens".to_string(),
+        ));
     }
 
-    let mut usage = Usage::new(prompt, completion, total, cached_tokens);
-    usage.cache_write_tokens = cache_write_tokens;
-    Some(usage)
+    let (cached_tokens, cache_write_tokens) = match obj.get("input_tokens_details") {
+        None | Some(Value::Null) => (None, None),
+        Some(value) => {
+            let details = value.as_object().ok_or_else(|| {
+                invalid("usage input_tokens_details must be an object or null".to_string())
+            })?;
+            let cached_tokens = details
+                .get("cached_tokens")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| {
+                    invalid("usage cached_tokens must be a non-negative integer".to_string())
+                })?;
+            let cache_write_tokens = match details.get("cache_write_tokens") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    Some(value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
+                        invalid(
+                            "usage cache_write_tokens must be a non-negative integer".to_string(),
+                        )
+                    })?)
+                }
+            };
+            (Some(cached_tokens), cache_write_tokens)
+        }
+    };
+
+    Ok(Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cached_tokens,
+        cache_write_tokens,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    const CHATGPT_OAUTH_DEFAULT_MODEL: &str = "test-model";
+    const TEST_ACCOUNT_ID: &str = "test-account";
+
+    fn resolved_model_for_test(
+        slug: &str,
+        use_responses_lite: bool,
+        supports_image_detail_original: bool,
+    ) -> ResolvedModel {
+        resolved_model_from_row_for_test(live_model_row_for_test(
+            slug,
+            use_responses_lite,
+            supports_image_detail_original,
+        ))
+    }
+
+    fn live_model_row_for_test(
+        slug: &str,
+        use_responses_lite: bool,
+        supports_image_detail_original: bool,
+    ) -> Value {
+        json!({
+            "slug": slug,
+            "display_name": "Test Model",
+            "description": "live catalog fixture",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "low"},
+                {"effort": "medium", "description": "medium"},
+                {"effort": "high", "description": "high"},
+                {"effort": "xhigh", "description": "xhigh"},
+                {"effort": "max", "description": "max"}
+            ],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
+            "service_tiers": [{"id": "priority", "name": "Priority", "description": "Priority"}],
+            "default_service_tier": null,
+            "support_verbosity": true,
+            "default_verbosity": "medium",
+            "supports_image_detail_original": supports_image_detail_original,
+            "context_window": 100000,
+            "max_context_window": 120000,
+            "auto_compact_token_limit": null,
+            "input_modalities": ["text", "image"],
+            "use_responses_lite": use_responses_lite
+        })
+    }
+
+    fn resolved_model_from_row_for_test(row: Value) -> ResolvedModel {
+        let slug = row["slug"].as_str().unwrap().to_string();
+        let snapshot = snapshot_from_rows_for_test(vec![row]);
+        let model = snapshot.model(&slug).unwrap();
+        ResolvedModel { snapshot, model }
+    }
+
+    fn snapshot_from_rows_for_test(rows: Vec<Value>) -> Arc<ModelCatalogSnapshot> {
+        let cache = ModelCatalogCache::new(std::time::Duration::from_secs(60));
+        let key = CatalogKey {
+            account_id: TEST_ACCOUNT_ID.to_string(),
+            base_url: "https://example.invalid".to_string(),
+            client_version: pinned_codex_compatibility_version().to_string(),
+        };
+        let body = serde_json::to_vec(&json!({"models": rows})).unwrap();
+        cache
+            .snapshot(key, || Ok((body, Some("test-etag".to_string()))))
+            .unwrap()
+    }
+
+    #[test]
+    fn provider_rejects_unsafe_base_urls() {
+        for base_url in [
+            "not-a-url",
+            "ftp://example.com/codex",
+            "https://user:secret@example.com/codex",
+            "https://example.com/codex?mode=test",
+            "https://example.com/codex#fragment",
+            " https://example.com/codex",
+            "https://example.com/codex ",
+            "https:///codex",
+            "http://example.com\n.evil/codex",
+            "https://example.com/a path",
+            "https://example.com/%",
+            "https://example.com/%zz",
+            "https://example.com/%0G",
+        ] {
+            assert!(
+                ChatGPTOAuthProvider::new(String::new(), base_url.to_string(), None, None,)
+                    .is_err()
+            );
+        }
+        assert!(ChatGPTOAuthProvider::new(
+            String::new(),
+            "https://example.com/codex%20api".to_string(),
+            None,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn image_capability_scans_only_responses_message_content() {
+        let opaque_image_shape = json!({"type": "input_image", "detail": "original"});
+        let mut payload = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "tools": [{"type": "function", "parameters": {"example": opaque_image_shape}}],
+            "client_metadata": {"example": {"type": "input_image", "detail": "original"}}
+        });
+        assert!(!value_has_input_image(&payload));
+        assert!(!value_has_image_detail(&payload));
+        assert!(!value_has_original_image_detail(&payload));
+
+        payload["input"][0]["content"] = json!([{
+            "type": "input_image",
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "original"
+        }]);
+        assert!(value_has_input_image(&payload));
+        assert!(value_has_image_detail(&payload));
+        assert!(value_has_original_image_detail(&payload));
+    }
+
+    trait LegacyResponsesPayload {
+        #[allow(clippy::too_many_arguments)]
+        fn responses_payload(
+            &self,
+            messages: &[Message],
+            tools: Option<&[ToolSchema]>,
+            reasoning_effort: Option<&str>,
+            stop: Option<&[String]>,
+            prompt_cache_key: Option<&str>,
+            max_tokens: Option<i64>,
+            previous_response_id: Option<&str>,
+            model: Option<&str>,
+            tool_choice: Option<&Value>,
+            service_tier: Option<&str>,
+            text: Option<&Value>,
+            client_metadata: Option<&HashMap<String, String>>,
+            codex_metadata: Option<bool>,
+            responses_lite: Option<&Value>,
+            parallel_tool_calls: Option<bool>,
+        ) -> Result<FinalizedResponsesRequest, ProviderError>;
+    }
+
+    impl LegacyResponsesPayload for ChatGPTOAuthProvider {
+        fn responses_payload(
+            &self,
+            messages: &[Message],
+            tools: Option<&[ToolSchema]>,
+            reasoning_effort: Option<&str>,
+            stop: Option<&[String]>,
+            prompt_cache_key: Option<&str>,
+            max_tokens: Option<i64>,
+            previous_response_id: Option<&str>,
+            model: Option<&str>,
+            tool_choice: Option<&Value>,
+            service_tier: Option<&str>,
+            text: Option<&Value>,
+            client_metadata: Option<&HashMap<String, String>>,
+            codex_metadata: Option<bool>,
+            responses_lite: Option<&Value>,
+            parallel_tool_calls: Option<bool>,
+        ) -> Result<FinalizedResponsesRequest, ProviderError> {
+            let slug = model.unwrap_or("test-model");
+            let explicit_lite = responses_lite.and_then(Value::as_bool).unwrap_or(false);
+            let resolved = resolved_model_for_test(slug, explicit_lite, true);
+            self.responses_payload_with_controls(
+                messages,
+                tools,
+                reasoning_effort,
+                stop,
+                prompt_cache_key,
+                max_tokens,
+                previous_response_id,
+                &resolved,
+                tool_choice,
+                service_tier,
+                text,
+                client_metadata,
+                codex_metadata,
+                responses_lite,
+                parallel_tool_calls,
+                &GenerationControls::default(),
+            )
+        }
+    }
+
+    fn finalize_responses_request(
+        payload: Value,
+        model: &str,
+        responses_lite: Option<&Value>,
+        text: Option<&Value>,
+        service_tier: Option<&str>,
+        endpoint: ResponsesEndpointKind,
+    ) -> Result<FinalizedResponsesRequest, ProviderError> {
+        let resolved = resolved_model_for_test(model, false, true);
+        super::finalize_responses_request(
+            payload,
+            &resolved,
+            responses_lite,
+            text,
+            service_tier,
+            endpoint,
+        )
+    }
+
+    fn usage_from_response(value: &Value) -> Option<Usage> {
+        parse_usage(value).ok()
+    }
 
     #[test]
     fn provider_without_an_override_uses_a_finite_request_timeout() {
@@ -3039,8 +5283,285 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             None,
             None,
+        )
+        .unwrap();
+        assert_eq!(provider.timeout, CHATGPT_OAUTH_DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn provider_rejects_zero_model_catalog_ttl() {
+        let result = ChatGPTOAuthProvider::new_with_catalog_ttl(
+            "gpt-5.5".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            None,
+            None,
+            std::time::Duration::ZERO,
         );
-        assert_eq!(provider.timeout, Some(CHATGPT_OAUTH_DEFAULT_TIMEOUT));
+        assert!(
+            matches!(result, Err(ProviderError::InvalidRequest(message)) if message.contains("TTL"))
+        );
+    }
+
+    #[test]
+    fn optional_model_etag_headers_ignore_invalid_or_empty_metadata() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "etag",
+            reqwest::header::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(optional_header_text(&headers, "etag"), None);
+
+        headers.insert("etag", reqwest::header::HeaderValue::from_static("   "));
+        assert_eq!(optional_header_text(&headers, "etag"), None);
+
+        headers.insert(
+            "x-models-etag",
+            reqwest::header::HeaderValue::from_static("  live-etag  "),
+        );
+        assert_eq!(
+            optional_header_text(&headers, "x-models-etag"),
+            Some("live-etag")
+        );
+    }
+
+    #[test]
+    fn authenticated_sse_failure_events_redact_request_credentials_before_aggregation() {
+        use std::io::{Read, Write};
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-sse-redaction-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let secrets = [
+            "header.e30.signature",
+            "refresh-token",
+            "header.e30.id-signature",
+            TEST_ACCOUNT_ID,
+        ];
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": secrets[0],
+                    "refresh_token": secrets[1],
+                    "id_token": secrets[2],
+                    "account_id": secrets[3]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let failure_message = secrets.join(" ");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            let body = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "message": failure_message,
+                            "metadata": {"credential_echo": failure_message}
+                        }
+                    }
+                }))
+                .unwrap()
+            );
+            write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            format!("http://{address}"),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let error = provider
+            .collect_response_output_items(FinalizedResponsesRequest {
+                payload: json!({}),
+                use_responses_lite: false,
+                conversation_input: Vec::new(),
+                account_id: TEST_ACCOUNT_ID.to_string(),
+                comp_hash: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("***"));
+        for secret in secrets {
+            assert!(!error.contains(secret));
+        }
+
+        server.join().unwrap();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    fn response_events_error(events: Vec<Value>, nonstream: bool) -> ProviderError {
+        use std::io::{Read, Write};
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-response-error-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "header.e30.signature",
+                    "refresh_token": "refresh-token",
+                    "id_token": "header.e30.signature",
+                    "account_id": TEST_ACCOUNT_ID
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            let body = events
+                .into_iter()
+                .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).unwrap()))
+                .collect::<String>();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            format!("http://{address}"),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let prepared = PreparedChatStream {
+            request: FinalizedResponsesRequest {
+                payload: json!({}),
+                use_responses_lite: false,
+                conversation_input: Vec::new(),
+                account_id: TEST_ACCOUNT_ID.to_string(),
+                comp_hash: None,
+            },
+            extra_headers: HashMap::new(),
+            cancellation: None,
+        };
+        let result = if nonstream {
+            provider.chat_prepared(prepared).map(|_| ())
+        } else {
+            provider.stream_prepared_chat(prepared, |_| Ok(()))
+        };
+
+        server.join().unwrap();
+        std::fs::remove_file(auth_path).unwrap();
+        result.unwrap_err()
+    }
+
+    fn duplicate_tool_call_response_error(nonstream: bool) -> ProviderError {
+        response_events_error(
+            vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "duplicate-call",
+                        "name": "first",
+                        "arguments": "{}"
+                    }
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "duplicate-call",
+                        "name": "second",
+                        "arguments": "{}"
+                    }
+                }),
+            ],
+            nonstream,
+        )
+    }
+
+    #[test]
+    fn streaming_response_rejects_duplicate_function_call_ids() {
+        let error = duplicate_tool_call_response_error(false);
+        assert!(matches!(
+            error,
+            ProviderError::UpstreamProtocol(message) if message.contains("duplicate call_id")
+        ));
+    }
+
+    #[test]
+    fn nonstream_response_rejects_duplicate_function_call_ids() {
+        let error = duplicate_tool_call_response_error(true);
+        assert!(matches!(
+            error,
+            ProviderError::UpstreamProtocol(message) if message.contains("duplicate call_id")
+        ));
+    }
+
+    #[test]
+    fn streaming_response_rejects_custom_tool_calls() {
+        let error = response_events_error(
+            vec![json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "call_id": "custom-call",
+                    "name": "shell",
+                    "input": "{\"command\":\"pwd\"}"
+                }
+            })],
+            false,
+        );
+        assert!(matches!(
+            error,
+            ProviderError::UpstreamProtocol(message) if message.contains("custom_tool_call")
+        ));
+    }
+
+    #[test]
+    fn nonstream_response_rejects_custom_tool_calls() {
+        let error = response_events_error(
+            vec![json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "call_id": "custom-call",
+                    "name": "shell",
+                    "input": "{\"command\":\"pwd\"}"
+                }
+            })],
+            true,
+        );
+        assert!(matches!(
+            error,
+            ProviderError::UpstreamProtocol(message) if message.contains("custom_tool_call")
+        ));
     }
 
     #[test]
@@ -3054,7 +5575,12 @@ mod tests {
             "summary": []
         })];
         store
-            .commit("resp-root", &initial_input, &initial_output)
+            .commit(
+                TEST_ACCOUNT_ID,
+                "resp-root",
+                &initial_input,
+                &initial_output,
+            )
             .unwrap();
 
         let expected_root: Vec<Value> = initial_input
@@ -3062,9 +5588,12 @@ mod tests {
             .chain(initial_output.iter())
             .cloned()
             .collect();
-        let mut caller_copy = store.resolve("resp-root").unwrap();
+        let mut caller_copy = store.resolve(TEST_ACCOUNT_ID, "resp-root").unwrap();
         caller_copy[1]["encrypted_content"] = json!("mutated");
-        assert_eq!(store.resolve("resp-root").unwrap(), expected_root);
+        assert_eq!(
+            store.resolve(TEST_ACCOUNT_ID, "resp-root").unwrap(),
+            expected_root
+        );
 
         let mut branch_a_input = expected_root.clone();
         branch_a_input.push(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A"}]}));
@@ -3072,6 +5601,7 @@ mod tests {
         branch_b_input.push(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "B"}]}));
         store
             .commit(
+                TEST_ACCOUNT_ID,
                 "resp-a",
                 &branch_a_input,
                 &[json!({"type": "function_call", "call_id": "call-a", "name": "a", "arguments": "{}"})],
@@ -3079,14 +5609,120 @@ mod tests {
             .unwrap();
         store
             .commit(
+                TEST_ACCOUNT_ID,
                 "resp-b",
                 &branch_b_input,
                 &[json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "B"}]})],
             )
             .unwrap();
 
-        assert_eq!(store.resolve("resp-a").unwrap()[2], branch_a_input[2]);
-        assert_eq!(store.resolve("resp-b").unwrap()[2], branch_b_input[2]);
+        assert_eq!(
+            store.resolve(TEST_ACCOUNT_ID, "resp-a").unwrap()[2],
+            branch_a_input[2]
+        );
+        assert_eq!(
+            store.resolve(TEST_ACCOUNT_ID, "resp-b").unwrap()[2],
+            branch_b_input[2]
+        );
+    }
+
+    #[test]
+    fn response_chain_store_requires_compaction_only_for_known_hash_mismatches() {
+        let store = ResponseChainStore::new(4);
+        store
+            .commit_for_model(
+                TEST_ACCOUNT_ID,
+                "resp-hashed",
+                &[json!({"type": "message", "role": "user", "content": []})],
+                &[],
+                Some("family-a"),
+            )
+            .unwrap();
+
+        assert!(store
+            .resolve_for_model(TEST_ACCOUNT_ID, "resp-hashed", Some("family-a"))
+            .is_ok());
+        assert!(store
+            .resolve_for_model(TEST_ACCOUNT_ID, "resp-hashed", None)
+            .is_ok());
+        assert!(matches!(
+            store.resolve_for_model(TEST_ACCOUNT_ID, "resp-hashed", Some("family-b")),
+            Err(ProviderError::InvalidRequest(message)) if message.contains("requires compaction")
+        ));
+    }
+
+    #[test]
+    fn prepared_request_rejects_an_authenticated_account_switch_before_transport() {
+        fn write_auth(path: &std::path::Path, account_id: &str) {
+            std::fs::write(
+                path,
+                serde_json::to_vec(&json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "header.e30.signature",
+                        "refresh_token": "refresh-token",
+                        "id_token": "header.e30.signature",
+                        "account_id": account_id
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-account-switch-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        write_auth(&auth_path, TEST_ACCOUNT_ID);
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            "http://127.0.0.1:1".to_string(),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .unwrap();
+        let messages = vec![
+            Message::new(
+                MessageRole::System,
+                "Answer.".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .unwrap(),
+            Message::new(MessageRole::User, "Hello".to_string(), vec![], None, None).unwrap(),
+        ];
+        let prepared = provider
+            .prepare_chat_stream_for_resolved_model_with_controls(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                resolved_model_for_test("live-model", false, true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                &GenerationControls::default(),
+            )
+            .unwrap();
+
+        write_auth(&auth_path, "other-account");
+        let error = provider
+            .stream_prepared_chat(prepared, |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Auth(_)));
+        std::fs::remove_file(auth_path).unwrap();
     }
 
     #[test]
@@ -3094,17 +5730,23 @@ mod tests {
         assert_eq!(RESPONSE_CHAIN_CAPACITY, 256);
         let store = ResponseChainStore::new(2);
         let input = [json!({"type": "message", "role": "user", "content": []})];
-        store.commit("resp-a", &input, &[]).unwrap();
-        store.commit("resp-b", &input, &[]).unwrap();
-        store.resolve("resp-a").unwrap();
-        store.commit("resp-c", &input, &[]).unwrap();
+        store
+            .commit(TEST_ACCOUNT_ID, "resp-a", &input, &[])
+            .unwrap();
+        store
+            .commit(TEST_ACCOUNT_ID, "resp-b", &input, &[])
+            .unwrap();
+        store.resolve(TEST_ACCOUNT_ID, "resp-a").unwrap();
+        store
+            .commit(TEST_ACCOUNT_ID, "resp-c", &input, &[])
+            .unwrap();
 
         assert!(matches!(
-            store.resolve("resp-b"),
+            store.resolve(TEST_ACCOUNT_ID, "resp-b"),
             Err(ProviderError::InvalidRequest(_))
         ));
-        assert!(store.resolve("resp-a").is_ok());
-        assert!(store.resolve("resp-c").is_ok());
+        assert!(store.resolve(TEST_ACCOUNT_ID, "resp-a").is_ok());
+        assert!(store.resolve(TEST_ACCOUNT_ID, "resp-c").is_ok());
     }
 
     #[test]
@@ -3112,6 +5754,7 @@ mod tests {
         let store = Arc::new(ResponseChainStore::new(256));
         store
             .commit(
+                TEST_ACCOUNT_ID,
                 "resp-root",
                 &[json!({"type": "message", "role": "user", "content": []})],
                 &[json!({"type": "reasoning", "encrypted_content": "opaque"})],
@@ -3124,10 +5767,10 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    let mut input = store.resolve("resp-root").unwrap();
+                    let mut input = store.resolve(TEST_ACCOUNT_ID, "resp-root").unwrap();
                     input.push(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": index.to_string()}]}));
                     store
-                        .commit(&format!("resp-{index}"), &input, &[])
+                        .commit(TEST_ACCOUNT_ID, &format!("resp-{index}"), &input, &[])
                         .unwrap();
                 })
             })
@@ -3136,7 +5779,9 @@ mod tests {
             handle.join().unwrap();
         }
         for index in 0..8 {
-            let history = store.resolve(&format!("resp-{index}")).unwrap();
+            let history = store
+                .resolve(TEST_ACCOUNT_ID, &format!("resp-{index}"))
+                .unwrap();
             assert_eq!(history[2]["content"][0]["text"], index.to_string());
         }
     }
@@ -3148,7 +5793,8 @@ mod tests {
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let root_input = vec![json!({
             "type": "message",
             "role": "user",
@@ -3162,7 +5808,7 @@ mod tests {
         })];
         provider
             .response_chains
-            .commit("resp-root", &root_input, &root_output)
+            .commit(TEST_ACCOUNT_ID, "resp-root", &root_input, &root_output)
             .unwrap();
         let messages = vec![
             Message::new(
@@ -3220,13 +5866,14 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_payload_omits_max_output_tokens_when_max_tokens_is_set() {
+    fn test_responses_payload_rejects_max_tokens() {
         let provider = ChatGPTOAuthProvider::new(
             CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3250,7 +5897,7 @@ mod tests {
             },
         ];
 
-        let payload = provider
+        let error = provider
             .responses_payload(
                 &messages,
                 None,
@@ -3268,10 +5915,9 @@ mod tests {
                 Some(&json!(false)),
                 None,
             )
-            .unwrap()
-            .payload;
+            .unwrap_err();
 
-        assert!(payload.get("max_output_tokens").is_none());
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
 
         assert!(provider
             .responses_payload(
@@ -3295,13 +5941,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_stop_values_are_omitted_from_private_requests() {
+    fn present_empty_stop_values_are_rejected_by_private_requests() {
         let provider = ChatGPTOAuthProvider::new(
             CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message::new(
                 MessageRole::System,
@@ -3320,7 +5967,7 @@ mod tests {
         ];
 
         for stop in &empty_stops {
-            let request = provider
+            let error = provider
                 .responses_payload(
                     &messages,
                     None,
@@ -3338,8 +5985,11 @@ mod tests {
                     Some(&json!(false)),
                     None,
                 )
-                .unwrap();
-            assert!(request.payload.get("stop").is_none());
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ProviderError::InvalidRequest(message) if message.contains("stop is not supported")
+            ));
         }
 
         let omitted = provider
@@ -3365,53 +6015,50 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_stop_fails_before_auth_or_transport() {
-        let provider = ChatGPTOAuthProvider::new(
-            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
-            "http://127.0.0.1:9".to_string(),
-            Some("/definitely/missing/codex-as-api-auth.json".to_string()),
-            Some(std::time::Duration::from_millis(50)),
-        );
-        let messages = vec![
-            Message::new(
-                MessageRole::System,
-                "You are helpful.".to_string(),
-                vec![],
-                None,
-                None,
-            )
-            .unwrap(),
-            Message::new(MessageRole::User, "Hello".to_string(), vec![], None, None).unwrap(),
-        ];
+    fn non_empty_stop_is_rejected() {
         let stop = vec!["END".to_string()];
-
-        let error = provider
-            .chat_stream(
-                &messages,
-                None,
-                None,
-                None,
-                None,
-                Some(&stop),
-                None,
-                None,
-                None,
-                None,
-                Some("gpt-5.5"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&json!(false)),
-                None,
-            )
-            .unwrap_err();
+        let error = validate_private_request_controls(None, None, Some(&stop)).unwrap_err();
 
         assert!(matches!(
             error,
             ProviderError::InvalidRequest(message) if message.contains("stop is not supported")
         ));
+    }
+
+    #[test]
+    fn provider_rejects_non_normalized_tool_choices() {
+        for choice in [
+            json!(true),
+            json!(1),
+            json!("future"),
+            json!({}),
+            json!({"type": "function", "name": ""}),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+            json!({"type": "function", "name": "lookup", "extra": true}),
+        ] {
+            assert!(validate_normalized_tool_choice(Some(&choice)).is_err());
+        }
+        assert!(validate_normalized_tool_choice(Some(&json!({
+            "type": "function",
+            "name": "lookup"
+        })))
+        .is_ok());
+    }
+
+    #[test]
+    fn reserved_client_metadata_identity_must_not_be_blank() {
+        for key in [SESSION_ID_KEY, THREAD_ID_KEY] {
+            let metadata = HashMap::from([
+                (key.to_string(), "   ".to_string()),
+                ("opaque".to_string(), String::new()),
+            ]);
+            assert!(matches!(
+                validate_client_metadata_reserved_keys(Some(&metadata)),
+                Err(ProviderError::InvalidRequest(message)) if message.contains(key)
+            ));
+        }
+        let opaque = HashMap::from([("opaque".to_string(), String::new())]);
+        assert!(validate_client_metadata_reserved_keys(Some(&opaque)).is_ok());
     }
 
     #[test]
@@ -3421,7 +6068,8 @@ mod tests {
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3446,11 +6094,12 @@ mod tests {
         ];
         let tools = vec![ToolSchema {
             name: "web_search".to_string(),
-            description: "Web search".to_string(),
+            description: Some("Web search".to_string()),
             parameters: json!({
                 "__codex_as_api_tool_type": "web_search",
                 "openai_tool": {"type": "web_search", "external_web_access": true},
             }),
+            strict: false,
         }];
 
         let payload = provider
@@ -3495,7 +6144,8 @@ mod tests {
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3540,7 +6190,10 @@ mod tests {
             .unwrap()
             .payload;
 
-        assert_eq!(payload["reasoning"], json!({"effort": "high"}));
+        assert_eq!(
+            payload["reasoning"],
+            json!({"effort": "high", "summary": "auto"})
+        );
         assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
     }
 
@@ -3551,7 +6204,8 @@ mod tests {
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3576,8 +6230,9 @@ mod tests {
         ];
         let tools = vec![ToolSchema {
             name: "lookup".to_string(),
-            description: "Lookup".to_string(),
+            description: Some("Lookup".to_string()),
             parameters: json!({"type": "object"}),
+            strict: false,
         }];
 
         let payload = provider
@@ -3637,7 +6292,8 @@ mod tests {
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3661,8 +6317,9 @@ mod tests {
             },
         ];
 
-        let payload = provider
-            .responses_payload(
+        let resolved = resolved_model_for_test("live-lite-model", true, true);
+        let request = provider
+            .responses_payload_with_controls(
                 &messages,
                 None,
                 None,
@@ -3670,7 +6327,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("gpt-5.5"),
+                &resolved,
                 None,
                 Some("priority"),
                 None,
@@ -3678,43 +6335,128 @@ mod tests {
                 None,
                 Some(&json!("auto")),
                 None,
+                &GenerationControls::default(),
             )
-            .unwrap()
-            .payload;
-        let unknown_error = provider
-            .responses_payload(
-                &messages,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("unknown-model"),
-                None,
-                Some("priority"),
-                None,
-                None,
-                None,
-                Some(&json!("auto")),
-                None,
-            )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(payload.get("tools").is_some());
-        assert_eq!(payload["text"], json!({"verbosity": "low"}));
+        assert!(request.use_responses_lite);
+        let payload = request.payload;
+        assert!(payload.get("tools").is_none());
+        assert_eq!(payload["text"], json!({"verbosity": "medium"}));
         assert_eq!(payload["service_tier"], json!("priority"));
-        assert!(matches!(unknown_error, ProviderError::InvalidRequest(_)));
     }
 
     #[test]
-    fn test_responses_payload_parallel_tool_calls_uses_capability_table() {
+    fn responses_payload_accepts_user_input_without_system_instructions() {
         let provider = ChatGPTOAuthProvider::new(
             CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
             CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
             None,
             None,
-        );
+        )
+        .unwrap();
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: "Hello".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            images: vec![],
+            structured_content: None,
+        }];
+
+        for responses_lite in [json!(false), json!(true)] {
+            let resolved = resolved_model_for_test("live-model", false, true);
+            let request = provider
+                .responses_payload_with_controls(
+                    &messages,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &resolved,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&responses_lite),
+                    None,
+                    &GenerationControls::default(),
+                )
+                .unwrap();
+
+            assert!(request.payload.get("instructions").is_none());
+            assert!(request.payload["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.get("role") == Some(&json!("user"))));
+        }
+    }
+
+    #[test]
+    fn prepared_chat_rejects_header_unsafe_subagent_values() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: "Hello".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            images: vec![],
+            structured_content: None,
+        }];
+        for subagent in ["has space", "line\nbreak", "tab\tvalue", "nonascii-é"] {
+            let result = provider.prepare_chat_stream_for_resolved_model_with_controls(
+                &messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(subagent),
+                None,
+                None,
+                resolved_model_for_test("live-model", false, true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!(false)),
+                None,
+                &GenerationControls::default(),
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("unsafe subagent was accepted"),
+            };
+            assert!(error.to_string().contains("visible ASCII"));
+            assert!(!error.to_string().contains(subagent));
+        }
+    }
+
+    #[test]
+    fn test_responses_payload_parallel_tool_calls_respects_lite_mode() {
+        let provider = ChatGPTOAuthProvider::new(
+            CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
         let messages = vec![
             Message {
                 role: MessageRole::System,
@@ -3738,8 +6480,11 @@ mod tests {
             },
         ];
 
-        let payload = provider
-            .responses_payload(
+        let build = |resolved: &ResolvedModel,
+                     requested: Option<bool>,
+                     lite: Value|
+         -> Result<FinalizedResponsesRequest, ProviderError> {
+            provider.responses_payload_with_controls(
                 &messages,
                 None,
                 None,
@@ -3747,83 +6492,54 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("gpt-5.5"),
+                resolved,
                 None,
                 None,
                 None,
                 None,
                 None,
-                Some(&json!(false)),
-                Some(true),
+                Some(&lite),
+                requested,
+                &GenerationControls::default(),
             )
-            .unwrap()
-            .payload;
-        let spark_payload = provider
-            .responses_payload(
-                &messages,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("gpt-5.3-codex-spark"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&json!(false)),
-                Some(true),
-            )
-            .unwrap()
-            .payload;
-        let lite_payload = provider
-            .responses_payload(
-                &messages,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("gpt-5.5"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&json!(true)),
-                Some(true),
-            )
-            .unwrap()
-            .payload;
+        };
+        let classic = resolved_model_for_test("parallel-model", false, true);
+        let lite = resolved_model_for_test("lite-model", true, true);
 
-        assert_eq!(payload["parallel_tool_calls"], json!(true));
-        assert_eq!(spark_payload["parallel_tool_calls"], json!(false));
-        assert_eq!(lite_payload["parallel_tool_calls"], json!(false));
+        assert_eq!(
+            build(&classic, Some(true), json!(false)).unwrap().payload["parallel_tool_calls"],
+            json!(true)
+        );
+        assert!(matches!(
+            build(&lite, Some(true), json!("auto")),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            build(&classic, Some(false), json!(false)).unwrap().payload["parallel_tool_calls"],
+            json!(false)
+        );
     }
 
     #[test]
-    fn test_codex_cli_headers_include_official_originator_and_versioned_user_agent() {
-        let headers = codex_cli_headers_for_version(Some("1.2.3\n")).unwrap();
+    fn test_codex_cli_headers_include_official_originator_and_pinned_user_agent() {
+        let headers = codex_cli_headers();
 
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
-        assert!(user_agent.starts_with("codex_cli_rs/1.2.3 ("));
-        assert!(user_agent.ends_with(") codex-as-api/0.6.5"));
+        assert!(user_agent.starts_with("codex_cli_rs/0.153.3 ("));
+        assert!(user_agent.ends_with(") codex-as-api/0.7.0"));
     }
 
     #[test]
-    fn test_codex_cli_headers_reject_invalid_version() {
-        let error = codex_cli_headers_for_version(Some("not-a-version")).unwrap_err();
-
-        assert!(error.contains("semantic version"));
+    fn test_codex_cli_version_parser_rejects_invalid_version() {
+        assert!(normalize_codex_cli_version("not-a-version").is_none());
+        assert!(normalize_codex_cli_version(" 0.153.3").is_none());
+        assert!(normalize_codex_cli_version("0.153.3 ").is_none());
     }
 
     #[test]
     fn test_codex_cli_version_defaults_to_pinned_upstream_contract() {
-        assert_eq!(pinned_codex_compatibility_version(), "0.147.0");
+        assert_eq!(pinned_codex_compatibility_version(), "0.153.3");
     }
 
     #[test]
@@ -3922,7 +6638,10 @@ mod tests {
                 images: vec![],
                 structured_content: None,
             };
-            assert!(messages_to_response_items(&[marker]).is_err());
+            assert!(matches!(
+                messages_to_response_items(&[marker]),
+                Err(ProviderError::InvalidRequest(_))
+            ));
         }
     }
 
@@ -3939,8 +6658,12 @@ mod tests {
             json!({"type": "compaction"}),
             json!({"type": "compaction_summary", "encrypted_content": 42}),
             json!({"type": "context_compaction", "encrypted_content": 42}),
+            json!({"type": "message", "role": "system", "content": []}),
         ] {
-            assert!(filter_compacted_history_items(&[item]).is_err());
+            assert!(matches!(
+                filter_compacted_history_items(&[item]),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
         }
 
         let valid = json!([
@@ -3960,6 +6683,45 @@ mod tests {
             filter_compacted_history_items(valid.as_array().unwrap()).unwrap(),
             valid.as_array().unwrap().clone()
         );
+    }
+
+    #[test]
+    fn compact_variants_validate_common_response_item_fields() {
+        let valid = json!([
+            {
+                "type": "message",
+                "id": "",
+                "role": "assistant",
+                "content": [],
+                "phase": "commentary",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": null,
+                    "create_time": 1.5,
+                    "content_item_kinds": "default-on-error"
+                },
+                "future": true
+            },
+            {"type": "agent_message", "id": null, "author": "agent", "recipient": "parent", "content": []},
+            {"type": "compaction", "id": "", "encrypted_content": "opaque"},
+            {"type": "context_compaction", "id": null}
+        ]);
+        assert_eq!(
+            filter_compacted_history_items(valid.as_array().unwrap()).unwrap(),
+            valid.as_array().unwrap().clone()
+        );
+
+        for item in [
+            json!({"type": "message", "role": "assistant", "content": [], "phase": "future"}),
+            json!({"type": "agent_message", "id": 42, "author": "agent", "recipient": "parent", "content": []}),
+            json!({"type": "additional_tools", "role": "developer", "tools": [], "id": 42}),
+            json!({"type": "compaction", "encrypted_content": "opaque", "id": 42}),
+            json!({"type": "context_compaction", "internal_chat_message_metadata_passthrough": "bad"}),
+        ] {
+            assert!(matches!(
+                filter_compacted_history_items(&[item]),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
     }
 
     #[test]
@@ -4000,10 +6762,11 @@ mod tests {
     fn test_tool_schema_to_response_dict() {
         let schema = ToolSchema {
             name: "my_tool".to_string(),
-            description: "Does stuff".to_string(),
+            description: Some("Does stuff".to_string()),
             parameters: json!({"type": "object"}),
+            strict: false,
         };
-        let result = tool_schema_to_response_dict(&schema);
+        let result = tool_schema_to_response_dict(&schema).unwrap();
         assert_eq!(result["type"], "function");
         assert_eq!(result["name"], "my_tool");
         assert_eq!(result["strict"], false);
@@ -4025,11 +6788,11 @@ mod tests {
     }
 
     #[test]
-    fn test_set_reasoning_payload_maps_exact_ultra_and_preserves_custom_efforts() {
+    fn test_set_reasoning_payload_preserves_efforts_until_live_resolution() {
         let cases = [
             ("HIGH", "HIGH"),
             ("MaX", "MaX"),
-            ("ultra", "max"),
+            ("ultra", "ultra"),
             ("ULTRA", "ULTRA"),
             ("FutureEffort", "FutureEffort"),
         ];
@@ -4063,6 +6826,67 @@ mod tests {
             );
 
             assert!(matches!(result, Err(ProviderError::InvalidRequest(_))));
+        }
+    }
+
+    #[test]
+    fn catalog_default_persistent_reasoning_uses_disabled_wire_value() {
+        let mut row = live_model_row_for_test("persistent-model", false, true);
+        row["default_reasoning_level"] = json!("persistent");
+        row["supported_reasoning_levels"] = json!([
+            {"effort": "persistent", "description": "persistent"}
+        ]);
+        let resolved = resolved_model_from_row_for_test(row);
+
+        let request = super::finalize_responses_request(
+            json!({"input": [], "tools": []}),
+            &resolved,
+            None,
+            None,
+            None,
+            ResponsesEndpointKind::Standard,
+        )
+        .unwrap();
+
+        assert_eq!(request.payload["reasoning"]["effort"], json!("disabled"));
+        assert_eq!(request.payload["reasoning"]["summary"], json!("auto"));
+    }
+
+    #[test]
+    fn live_reasoning_summary_controls_determine_private_wire_payload() {
+        for (supported, summary, expected) in [
+            (true, "detailed", Some("detailed")),
+            (true, "none", None),
+            (false, "concise", None),
+        ] {
+            let mut row = live_model_row_for_test("summary-model", false, true);
+            row["default_reasoning_level"] = Value::Null;
+            row["supported_reasoning_levels"] = json!([]);
+            row["supports_reasoning_summary_parameter"] = json!(supported);
+            row["default_reasoning_summary"] = json!(summary);
+            let resolved = resolved_model_from_row_for_test(row);
+
+            let request = super::finalize_responses_request(
+                json!({"input": [], "tools": []}),
+                &resolved,
+                None,
+                None,
+                None,
+                ResponsesEndpointKind::Standard,
+            )
+            .unwrap();
+            assert_eq!(
+                request
+                    .payload
+                    .get("reasoning")
+                    .and_then(|reasoning| reasoning.get("summary")),
+                expected.map(Value::from).as_ref()
+            );
+            assert!(request.payload["include"]
+                .as_array()
+                .is_some_and(|include| include
+                    .iter()
+                    .any(|value| { value.as_str() == Some("reasoning.encrypted_content") })));
         }
     }
 
@@ -4137,7 +6961,7 @@ mod tests {
     }
 
     #[test]
-    fn original_image_detail_is_gated_by_the_effective_model() {
+    fn original_image_detail_is_gated_by_live_model_capability() {
         let payload = || {
             json!({
                 "model": "placeholder",
@@ -4157,56 +6981,42 @@ mod tests {
             })
         };
 
-        for model in [
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-        ] {
-            let request = finalize_responses_request(
+        let supported = resolved_model_for_test("image-model", false, true);
+        let unsupported = resolved_model_for_test("text-model", false, false);
+        let request = super::finalize_responses_request(
+            payload(),
+            &supported,
+            Some(&json!(false)),
+            None,
+            None,
+            ResponsesEndpointKind::Standard,
+        )
+        .unwrap();
+        assert_eq!(
+            request.payload["input"][0]["content"][0]["detail"],
+            "original"
+        );
+
+        assert!(matches!(
+            super::finalize_responses_request(
                 payload(),
-                model,
+                &unsupported,
                 Some(&json!(false)),
                 None,
                 None,
                 ResponsesEndpointKind::Standard,
-            )
-            .unwrap();
-            assert_eq!(
-                request.payload["input"][0]["content"][0]["detail"],
-                "original"
-            );
-        }
-
-        for model in [
-            "gpt-5.2",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            "future-model",
-        ] {
-            assert!(matches!(
-                finalize_responses_request(
-                    payload(),
-                    model,
-                    Some(&json!(false)),
-                    None,
-                    None,
-                    ResponsesEndpointKind::Standard,
-                ),
-                Err(ProviderError::InvalidRequest(_))
-            ));
-        }
+            ),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]
-    fn gpt_5_2_keeps_non_original_image_detail_modes() {
+    fn non_original_image_detail_modes_do_not_require_original_capability() {
+        let resolved = resolved_model_for_test("text-model", false, false);
         for detail in ["auto", "low", "high"] {
-            let request = finalize_responses_request(
+            let request = super::finalize_responses_request(
                 json!({
-                    "model": "gpt-5.2",
+                    "model": "placeholder",
                     "instructions": "Inspect the image.",
                     "input": [{
                         "type": "message",
@@ -4221,7 +7031,7 @@ mod tests {
                     "tool_choice": "auto",
                     "parallel_tool_calls": false,
                 }),
-                "gpt-5.2",
+                &resolved,
                 Some(&json!(false)),
                 None,
                 None,
@@ -4233,20 +7043,158 @@ mod tests {
     }
 
     #[test]
+    fn live_input_modalities_gate_only_present_content() {
+        let mut text_only_row = live_model_row_for_test("text-only", false, false);
+        text_only_row["input_modalities"] = json!(["text"]);
+        let text_only = resolved_model_from_row_for_test(text_only_row);
+        let image_payload = json!({
+            "model": "placeholder",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA"
+                }]
+            }],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        });
+        assert!(matches!(
+            super::finalize_responses_request(
+                image_payload.clone(),
+                &text_only,
+                Some(&json!(false)),
+                None,
+                None,
+                ResponsesEndpointKind::Standard,
+            ),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        let mut image_only_row = live_model_row_for_test("image-only", false, true);
+        image_only_row["input_modalities"] = json!(["image"]);
+        let image_only = resolved_model_from_row_for_test(image_only_row);
+        assert!(super::finalize_responses_request(
+            image_payload,
+            &image_only,
+            Some(&json!(false)),
+            None,
+            None,
+            ResponsesEndpointKind::Standard,
+        )
+        .is_ok());
+        assert!(matches!(
+            super::finalize_responses_request(
+                json!({
+                    "model": "placeholder",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}]
+                    }],
+                    "tools": [],
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": false
+                }),
+                &image_only,
+                Some(&json!(false)),
+                None,
+                None,
+                ResponsesEndpointKind::Standard,
+            ),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        let mut audio_only_row = live_model_row_for_test("audio-only", false, false);
+        audio_only_row["input_modalities"] = json!(["audio"]);
+        let audio_only = resolved_model_from_row_for_test(audio_only_row);
+        assert!(super::finalize_responses_request(
+            json!({
+                "model": "placeholder",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "audio_url": "data:audio/wav;base64,AAAA"
+                    }]
+                }],
+                "tools": [],
+                "tool_choice": "auto",
+                "parallel_tool_calls": false
+            }),
+            &audio_only,
+            Some(&json!(false)),
+            None,
+            None,
+            ResponsesEndpointKind::Standard,
+        )
+        .is_ok());
+
+        assert!(matches!(
+            super::finalize_responses_request(
+                json!({
+                    "model": "placeholder",
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": "result"
+                    }],
+                    "tools": [],
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": false
+                }),
+                &audio_only,
+                Some(&json!(false)),
+                None,
+                None,
+                ResponsesEndpointKind::Standard,
+            ),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn image_generation_requires_live_image_input_capability_before_transport() {
+        let provider = ChatGPTOAuthProvider::new(
+            "text-only".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut row = live_model_row_for_test("text-only", false, false);
+        row["input_modalities"] = json!(["text"]);
+        let result = provider.generate_image_for_resolved_model_with_controls(
+            "draw a square",
+            &[],
+            None,
+            None,
+            resolved_model_from_row_for_test(row),
+            Some(&json!(false)),
+            &GenerationControls::default(),
+        );
+        assert!(matches!(result, Err(ProviderError::InvalidRequest(_))));
+    }
+
+    #[test]
     fn test_finalizer_applies_catalog_reasoning_and_verbosity_defaults() {
+        let resolved = resolved_model_for_test("live-lite-model", true, true);
         let payload = json!({
-            "model": "gpt-5.6-terra",
+            "model": "placeholder",
             "instructions": "Use catalog defaults.",
             "input": [],
             "tools": [],
             "tool_choice": "auto",
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": false,
             "include": [],
         });
 
-        let request = finalize_responses_request(
+        let request = super::finalize_responses_request(
             payload,
-            "gpt-5.6-terra",
+            &resolved,
             Some(&json!("auto")),
             None,
             None,
@@ -4257,7 +7205,7 @@ mod tests {
         assert!(request.use_responses_lite);
         assert_eq!(request.payload["reasoning"]["effort"], json!("medium"));
         assert_eq!(request.payload["reasoning"]["context"], json!("all_turns"));
-        assert_eq!(request.payload["text"], json!({"verbosity": "low"}));
+        assert_eq!(request.payload["text"], json!({"verbosity": "medium"}));
         assert_eq!(
             request.payload["include"],
             json!(["reasoning.encrypted_content"])
@@ -4265,44 +7213,171 @@ mod tests {
     }
 
     #[test]
-    fn public_gpt_5_6_alias_uses_sol_on_the_wire() {
-        let request = finalize_responses_request(
-            json!({
-                "model": "gpt-5.6",
-                "instructions": "Resolve the public alias.",
-                "input": [],
-                "tools": [],
-                "tool_choice": "auto",
-                "parallel_tool_calls": true,
-                "include": [],
-            }),
-            "gpt-5.6",
-            Some(&json!(false)),
-            None,
-            None,
-            ResponsesEndpointKind::Standard,
-        )
-        .unwrap();
-
-        assert_eq!(request.payload["model"], json!("gpt-5.6-sol"));
-        assert_eq!(request.payload["reasoning"]["effort"], json!("low"));
+    fn requested_model_uses_the_exact_live_slug() {
+        let snapshot = snapshot_from_rows_for_test(vec![
+            live_model_row_for_test("gpt-5.6", false, true),
+            live_model_row_for_test("gpt-5.6-sol", false, true),
+        ]);
+        let resolved =
+            ChatGPTOAuthProvider::resolve_model_from_snapshot(snapshot, Some("gpt-5.6")).unwrap();
+        assert_eq!(resolved.model.slug, "gpt-5.6");
     }
 
     #[test]
-    fn test_forced_lite_unknown_model_does_not_invent_reasoning() {
+    fn opaque_live_slug_is_preserved_but_unusable_implicit_default_fails() {
+        let snapshot = snapshot_from_rows_for_test(vec![live_model_row_for_test(" ", false, true)]);
+
+        assert!(matches!(
+            ChatGPTOAuthProvider::resolve_model_from_snapshot(snapshot.clone(), None),
+            Err(ProviderError::CatalogUnavailable(_))
+        ));
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            provider.resolve_model(Some(" ")),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn implicit_hidden_only_and_removed_configured_models_are_catalog_unavailable() {
+        let mut hidden = live_model_row_for_test("hidden-model", false, true);
+        hidden["visibility"] = json!("hide");
+        let snapshot = snapshot_from_rows_for_test(vec![hidden]);
+        assert_eq!(
+            ChatGPTOAuthProvider::resolve_model_from_snapshot(
+                snapshot.clone(),
+                Some("hidden-model")
+            )
+            .unwrap()
+            .model
+            .slug,
+            "hidden-model"
+        );
+        assert!(matches!(
+            ChatGPTOAuthProvider::resolve_model_from_snapshot(snapshot.clone(), None),
+            Err(ProviderError::CatalogUnavailable(_))
+        ));
+
+        let provider = ChatGPTOAuthProvider::new(
+            "removed-model".to_string(),
+            CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            provider.configured_or_default_model_from_snapshot(snapshot.clone()),
+            Err(ProviderError::CatalogUnavailable(_))
+        ));
+        assert!(matches!(
+            ChatGPTOAuthProvider::resolve_model_from_snapshot(snapshot, Some("removed-model")),
+            Err(ProviderError::ModelNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_model_control_diagnostics_do_not_reflect_values() {
+        let secret = "access-token-sentinel";
+        let mut row = live_model_row_for_test(secret, false, false);
+        row["service_tiers"] = json!([]);
+        let resolved = resolved_model_from_row_for_test(row);
+
+        let errors = [
+            should_enable_parallel_tool_calls(Some(true), true).unwrap_err(),
+            apply_model_capability_fields(
+                &mut serde_json::Map::new(),
+                &resolved.model,
+                None,
+                Some(secret),
+            )
+            .unwrap_err(),
+            resolve_reasoning_effort(&resolved.model, secret)
+                .unwrap_err()
+                .to_string(),
+            ResponseChainStore::new(1)
+                .resolve(TEST_ACCOUNT_ID, secret)
+                .unwrap_err()
+                .to_string(),
+        ];
+        for error in errors {
+            assert!(!error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn catalog_refresh_account_switch_fails_before_snapshot_publication() {
+        let cache = ModelCatalogCache::new(std::time::Duration::from_secs(60));
+        let catalog_key = CatalogKey {
+            account_id: "account-a".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            client_version: "0.153.3".to_string(),
+        };
+        let result = cache.snapshot(catalog_key.clone(), || {
+            ensure_catalog_account_unchanged("account-a", "account-b")?;
+            Ok((
+                serde_json::to_vec(&json!({"models": [live_model_row_for_test(
+                    "model-b", false, true
+                )]}))
+                .unwrap(),
+                Some("etag-b".to_string()),
+            ))
+        });
+        assert!(matches!(result, Err(CatalogError::Auth(_))));
+        let recovered = cache
+            .snapshot(catalog_key, || {
+                Ok((
+                    serde_json::to_vec(&json!({"models": [live_model_row_for_test(
+                        "model-a", false, true
+                    )]}))
+                    .unwrap(),
+                    Some("etag-a".to_string()),
+                ))
+            })
+            .unwrap();
+        assert_eq!(recovered.models[0].slug, "model-a");
+    }
+
+    #[test]
+    fn test_forced_lite_live_model_without_reasoning_does_not_invent_reasoning() {
+        let resolved = resolved_model_from_row_for_test(json!({
+            "slug": "live-no-reasoning-model",
+            "display_name": "No reasoning model",
+            "description": null,
+            "default_reasoning_level": null,
+            "supported_reasoning_levels": [],
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
+            "service_tiers": [],
+            "default_service_tier": null,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "supports_image_detail_original": false,
+            "context_window": null,
+            "max_context_window": null,
+            "auto_compact_token_limit": null,
+            "input_modalities": ["text"],
+            "use_responses_lite": false
+        }));
         let payload = json!({
-            "model": "unknown-model",
+            "model": "placeholder",
             "instructions": "No reasoning metadata exists.",
             "input": [],
             "tools": [],
             "tool_choice": "auto",
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": false,
             "include": [],
         });
 
-        let request = finalize_responses_request(
+        let request = super::finalize_responses_request(
             payload,
-            "unknown-model",
+            &resolved,
             Some(&json!(true)),
             None,
             None,
@@ -4313,9 +7388,12 @@ mod tests {
         assert!(request.use_responses_lite);
         assert_eq!(
             request.payload["reasoning"],
-            json!({"context": "all_turns"})
+            json!({"summary": "auto", "context": "all_turns"})
         );
-        assert_eq!(request.payload["include"], json!([]));
+        assert_eq!(
+            request.payload["include"],
+            json!(["reasoning.encrypted_content"])
+        );
     }
 
     #[test]
@@ -4326,7 +7404,7 @@ mod tests {
             "input": [],
             "tools": [],
             "tool_choice": "required",
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": false,
         });
         set_reasoning_payload(payload.as_object_mut().unwrap(), Some("low")).unwrap();
 
@@ -4345,7 +7423,7 @@ mod tests {
         assert!(request.payload.get("tool_choice").is_none());
         assert_eq!(
             request.payload["reasoning"],
-            json!({"effort": "low", "context": "all_turns"})
+            json!({"effort": "low", "summary": "auto", "context": "all_turns"})
         );
         assert_eq!(
             request.payload["input"][0]["type"],
@@ -4362,17 +7440,31 @@ mod tests {
 
     #[test]
     fn test_text_from_response_items() {
-        let items = vec![
-            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello "}]}),
-            json!({"type": "output_text", "text": "world"}),
-        ];
-        assert_eq!(text_from_response_items(&items), "Hello world");
+        let items = vec![json!({"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "Hello "},
+            {"type": "output_text", "text": "world"}
+        ]})];
+        assert_eq!(text_from_response_items(&items).unwrap(), "Hello world");
     }
 
     #[test]
     fn test_text_from_response_items_empty() {
         let items: Vec<Value> = vec![];
-        assert_eq!(text_from_response_items(&items), "");
+        assert_eq!(text_from_response_items(&items).unwrap(), "");
+    }
+
+    #[test]
+    fn text_from_response_items_rejects_unrepresentable_message_content() {
+        for item in [
+            json!({"type": "message", "role": "user", "content": []}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text"}]}),
+        ] {
+            assert!(matches!(
+                text_from_response_items(&[item]),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
     }
 
     #[test]
@@ -4387,19 +7479,22 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
-        assert_eq!(usage.cached_tokens, 30);
+        assert_eq!(usage.cached_tokens, Some(30));
     }
 
     #[test]
-    fn test_usage_from_response_alternative_keys() {
+    fn test_usage_from_response_rejects_public_alias_keys() {
         let val = json!({
             "prompt_tokens": 200,
             "completion_tokens": 100,
-            "cached_input_tokens": 50
+            "total_tokens": 300,
+            "prompt_tokens_details": {"cached_tokens": 50}
         });
-        let usage = usage_from_response(&val).unwrap();
-        assert_eq!(usage.prompt_tokens, 200);
-        assert_eq!(usage.cached_tokens, 50);
+        assert!(usage_from_response(&val).is_none());
+        assert!(matches!(
+            parse_usage(&val),
+            Err(ProviderError::UpstreamProtocol(_))
+        ));
     }
 
     #[test]
@@ -4435,20 +7530,102 @@ mod tests {
     }
 
     #[test]
+    fn sse_line_decode_errors_are_protocol_failures_but_io_errors_are_transport_failures() {
+        let secret = "access-token-sentinel";
+        let invalid_text = classify_sse_line_read_error(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid UTF-8 near {secret}"),
+            ),
+            &[secret],
+        );
+        assert!(matches!(
+            invalid_text,
+            ProviderError::UpstreamProtocol(ref message)
+                if message.contains("***") && !message.contains(secret)
+        ));
+
+        let read_failure = classify_sse_line_read_error(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset"),
+            &[],
+        );
+        assert!(matches!(
+            read_failure,
+            ProviderError::UpstreamTransport(ref message)
+                if message.contains("connection reset")
+        ));
+    }
+
+    #[test]
+    fn upstream_protocol_diagnostics_do_not_reflect_unknown_values() {
+        let secret = "access-token-sentinel";
+        let errors = [
+            decode_sse_block(&[format!("data: {secret}")]).unwrap_err(),
+            validate_response_event(&json!({
+                "type": "response.output_item.done",
+                "item": {"type": secret}
+            }))
+            .unwrap_err(),
+            validate_response_event(&json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": secret, "text": "ignored"}]
+                }
+            }))
+            .unwrap_err(),
+            text_from_response_items(&[json!({"type": secret})]).unwrap_err(),
+            filter_compacted_history_items(&[json!({"type": secret})]).unwrap_err(),
+            filter_compacted_history_items(&[json!({
+                "type": "message",
+                "role": secret,
+                "content": []
+            })])
+            .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(!error.to_string().contains(secret));
+        }
+    }
+
+    #[test]
+    fn added_reasoning_items_accept_pinned_typed_content() {
+        let official = json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "summary"}],
+                "content": [{"type": "text", "text": "raw"}]
+            }
+        });
+        assert!(validate_response_event(&official).is_ok());
+
+        let mut text_variant = official.clone();
+        text_variant["item"]["content"][0]["type"] = json!("text");
+        assert!(validate_response_event(&text_variant).is_ok());
+
+        let mut unsupported = official;
+        unsupported["item"]["content"][0]["type"] = json!("future");
+        assert!(matches!(
+            validate_response_event(&unsupported),
+            Err(ProviderError::UpstreamProtocol(_))
+        ));
+    }
+
+    #[test]
     fn response_events_require_output_item_objects_and_completed_ids() {
         assert!(validate_response_event(&json!({
             "type": "response.completed",
-            "response": {"id": "resp-1"}
+            "response": {
+                "id": "resp-1",
+                "output": ["ignored by the private completed event contract"]
+            }
         }))
         .is_ok());
         assert!(validate_response_event(&json!({
             "type": "response.output_item.done",
             "item": {"type": "message", "role": "assistant", "content": []}
-        }))
-        .is_ok());
-        assert!(validate_response_event(&json!({
-            "type": "response.completed",
-            "response": {"id": "resp-1", "output": ["ignored-extra-field"]}
         }))
         .is_ok());
         for event in [
@@ -4465,6 +7642,103 @@ mod tests {
     }
 
     #[test]
+    fn consumed_lifecycle_events_require_the_official_fields() {
+        for event in [
+            json!({"type": "response.metadata", "metadata": {"trace": "ignored"}}),
+            json!({"type": "codex.response.metadata", "headers": {}}),
+            json!({"type": "responsesapi.websocket_timing", "elapsed_ms": 1}),
+            json!({"type": "response.created", "response": {}}),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "message", "role": "assistant", "content": []}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "apply_patch",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "web_search_call", "id": "search-1", "status": "searching"}
+            }),
+            json!({"type": "response.output_text.delta", "delta": ""}),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "",
+                "summary_index": 0
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": "",
+                "text": "",
+                "summary_index": 0
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "",
+                "content_index": 0
+            }),
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0
+            }),
+        ] {
+            assert!(validate_response_event(&event).is_ok(), "{event}");
+        }
+
+        for event in [
+            json!({"type": "response.created"}),
+            json!({"type": "response.output_item.added", "item": null}),
+            json!({"type": "response.custom_tool_call_input.delta", "delta": ""}),
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "custom_tool_call", "call_id": "call-1", "name": "apply_patch"}
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "summary"
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": "reasoning-1",
+                "text": "summary"
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "raw",
+                "summary_index": 0
+            }),
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "part_index": 0
+            }),
+        ] {
+            assert!(validate_response_event(&event).is_err(), "{event}");
+        }
+
+        assert!(validate_response_event(&json!({
+            "type": "response.completed",
+            "response": {"id": "response-1", "end_turn": "true"}
+        }))
+        .is_err());
+        for response in [
+            json!({"id": "response-1"}),
+            json!({"id": "response-1", "end_turn": false}),
+            json!({"id": "response-1", "end_turn": true}),
+        ] {
+            assert!(validate_response_event(&json!({
+                "type": "response.completed",
+                "response": response
+            }))
+            .is_ok());
+        }
+    }
+
+    #[test]
     fn test_tool_call_from_response_item_function() {
         let item = json!({
             "type": "function_call",
@@ -4472,16 +7746,43 @@ mod tests {
             "call_id": "call-1",
             "arguments": "{\"path\": \"/tmp/test\"}"
         });
-        let tc = tool_call_from_response_item(&item).unwrap();
+        let tc = tool_call_from_response_item(&item).unwrap().unwrap();
         assert_eq!(tc.name, "read_file");
         assert_eq!(tc.id, "call-1");
-        assert_eq!(tc.arguments["path"], "/tmp/test");
+        assert_eq!(tc.arguments, "{\"path\": \"/tmp/test\"}");
+    }
+
+    #[test]
+    fn function_calls_ignore_additive_input_fields_and_custom_calls_fail() {
+        let function = tool_call_from_response_item(&json!({
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"/tmp/test\"}",
+            "input": "additive"
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(function.arguments, "{\"path\":\"/tmp/test\"}");
+
+        let custom_error = tool_call_from_response_item(&json!({
+            "type": "custom_tool_call",
+            "call_id": "call-2",
+            "name": "apply_patch",
+            "input": "{\"patch\":\"content\"}",
+            "arguments": "additive"
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            custom_error,
+            ProviderError::UpstreamProtocol(message) if message.contains("custom_tool_call")
+        ));
     }
 
     #[test]
     fn test_tool_call_from_response_item_not_function() {
         let item = json!({"type": "message"});
-        assert!(tool_call_from_response_item(&item).is_none());
+        assert!(tool_call_from_response_item(&item).unwrap().is_none());
     }
 
     #[test]
@@ -4504,13 +7805,11 @@ mod tests {
 
     #[test]
     fn test_validate_image_content_items_valid() {
-        let mut img = HashMap::new();
-        img.insert(
-            "image_url".to_string(),
-            "data:image/png;base64,abc".to_string(),
-        );
-        img.insert("detail".to_string(), "high".to_string());
-        let result = validate_image_content_items(&[img]).unwrap();
+        let result = validate_image_content_values(&[json!({
+            "image_url": "data:image/png;base64,abc",
+            "detail": "high"
+        })])
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["type"], "input_image");
         assert_eq!(result[0]["detail"], "high");
@@ -4518,48 +7817,57 @@ mod tests {
 
     #[test]
     fn test_validate_image_content_items_missing_url() {
-        let img = HashMap::new();
-        let result = validate_image_content_items(&[img]);
+        let result = validate_image_content_values(&[json!({})]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_image_content_items_wrong_prefix() {
-        let mut img = HashMap::new();
-        img.insert(
-            "image_url".to_string(),
-            "https://example.com/img.png".to_string(),
-        );
-        let result = validate_image_content_items(&[img]);
+        let result = validate_image_content_values(&[json!({
+            "image_url": "https://example.com/img.png"
+        })]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn reasoning_standard_mode_supplies_medium_without_a_wire_mode() {
+    fn reasoning_modes_and_non_object_existing_payloads_fail_loudly() {
+        for mode in ["standard", "pro", "future"] {
+            let mut payload = json!({"reasoning": {"summary": "auto"}});
+            assert!(matches!(
+                set_reasoning_payload_with_options(
+                    payload.as_object_mut().unwrap(),
+                    None,
+                    Some(&json!({"mode": mode})),
+                ),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+
+        for existing in [json!(null), json!("medium"), json!(42)] {
+            let mut payload = json!({"reasoning": existing});
+            assert!(matches!(
+                set_reasoning_payload_with_options(payload.as_object_mut().unwrap(), None, None),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+
+        let mut payload = json!({"reasoning": {"mode": "standard"}});
+        assert!(matches!(
+            set_reasoning_payload_with_options(payload.as_object_mut().unwrap(), None, None),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
         let mut payload = json!({"reasoning": {"summary": "auto"}});
         set_reasoning_payload_with_options(
             payload.as_object_mut().unwrap(),
-            None,
-            Some(&json!({"mode": "standard", "context": "current_turn"})),
+            Some("high"),
+            Some(&json!({"mode": null, "context": "current_turn"})),
         )
         .unwrap();
         assert_eq!(
             payload["reasoning"],
-            json!({
-                "summary": "auto",
-                "effort": "medium",
-                "context": "current_turn"
-            })
+            json!({"summary": "auto", "effort": "high", "context": "current_turn"})
         );
-        let mut pro_payload = json!({});
-        assert!(matches!(
-            set_reasoning_payload_with_options(
-                pro_payload.as_object_mut().unwrap(),
-                None,
-                Some(&json!({"mode": "pro"})),
-            ),
-            Err(ProviderError::InvalidRequest(_))
-        ));
     }
 
     #[test]
@@ -4584,54 +7892,42 @@ mod tests {
     #[test]
     fn lite_rejects_explicit_non_all_turns_context() {
         let mut payload = json!({
+            "instructions": "test",
             "input": [],
             "tools": [],
             "reasoning": {"context": "current_turn"}
         });
         let error = apply_responses_lite_payload(payload.as_object_mut().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("must be all_turns"));
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
     }
 
     #[test]
-    fn lite_strips_image_detail_but_preserves_explicit_cache_breakpoint() {
-        let mut payload = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_image",
-                    "image_url": "data:image/png;base64,AAAA",
-                    "detail": "original",
-                    "prompt_cache_breakpoint": {"mode": "explicit"}
-                }]
-            }],
-            "tools": [],
-            "reasoning": {"context": "all_turns"}
-        });
-        apply_responses_lite_payload(payload.as_object_mut().unwrap()).unwrap();
-        let image = &payload["input"][1]["content"][0];
-        assert!(image.get("detail").is_none());
-        assert_eq!(
-            image["prompt_cache_breakpoint"],
-            json!({"mode": "explicit"})
-        );
+    fn explicit_cache_breakpoint_is_rejected_before_lite_rewrite() {
+        let images = vec![json!({
+            "image_url": "data:image/png;base64,AAAA",
+            "detail": "original",
+            "prompt_cache_breakpoint": {"mode": "explicit"}
+        })];
+        assert!(matches!(
+            validate_image_content_values(&images),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]
-    fn generation_controls_accept_standard_mode_only_for_gpt_5_6() {
+    fn generation_controls_reject_standard_mode_for_every_model() {
         let controls = GenerationControls {
             reasoning: Some(json!({"mode": "standard"})),
             verbosity: Some("high".to_string()),
             ..GenerationControls::default()
         };
-        let mut payload = json!({});
-        apply_generation_controls(payload.as_object_mut().unwrap(), "gpt-5.6-sol", &controls)
-            .unwrap();
-        let mut other = json!({});
-        assert!(matches!(
-            apply_generation_controls(other.as_object_mut().unwrap(), "gpt-5.5", &controls),
-            Err(ProviderError::InvalidRequest(_))
-        ));
+        for model in ["live-model-a", "live-model-b"] {
+            let mut payload = json!({});
+            assert!(matches!(
+                apply_generation_controls(payload.as_object_mut().unwrap(), model, &controls),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
     }
 
     #[test]
@@ -4676,51 +7972,23 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_are_always_rejected() {
-        let mut payload = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "cache here",
-                    "prompt_cache_breakpoint": {"mode": "explicit"}
-                }]
-            }]
-        });
-        let controls = GenerationControls {
-            prompt_cache_options: Some(json!({"mode": "implicit"})),
-            ..GenerationControls::default()
+        let message = Message {
+            role: MessageRole::User,
+            content: "cache here".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            images: vec![],
+            structured_content: Some(vec![json!({
+                "type": "input_text",
+                "text": "cache here",
+                "prompt_cache_breakpoint": {"mode": "explicit"}
+            })]),
         };
-        assert!(matches!(
-            apply_generation_controls(payload.as_object_mut().unwrap(), "gpt-5.6-sol", &controls,),
-            Err(ProviderError::InvalidRequest(_))
-        ));
 
-        let mut default_implicit = json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "cache here",
-                    "prompt_cache_breakpoint": {"mode": "explicit"}
-                }]
-            }]
-        });
         assert!(matches!(
-            apply_generation_controls(
-                default_implicit.as_object_mut().unwrap(),
-                "gpt-5.6-sol",
-                &GenerationControls::default(),
-            ),
-            Err(ProviderError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            apply_generation_controls(
-                default_implicit.as_object_mut().unwrap(),
-                "gpt-5.5",
-                &GenerationControls::default(),
-            ),
+            messages_to_response_items(&[message]),
             Err(ProviderError::InvalidRequest(_))
         ));
     }
@@ -4771,7 +8039,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_message_content_is_preserved() {
+    fn structured_message_cache_breakpoint_is_rejected() {
         let message = Message {
             role: MessageRole::User,
             content: "look".to_string(),
@@ -4793,12 +8061,10 @@ mod tests {
                 }),
             ]),
         };
-        let items = messages_to_response_items(&[message]).unwrap();
-        assert_eq!(
-            items[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
-            "explicit"
-        );
-        assert_eq!(items[0]["content"][1]["detail"], "original");
+        assert!(matches!(
+            messages_to_response_items(&[message]),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -4865,13 +8131,89 @@ mod tests {
         let usage = usage_from_response(&json!({
             "input_tokens": 10,
             "output_tokens": 2,
+            "total_tokens": 12,
             "input_tokens_details": {
                 "cached_tokens": 3,
                 "cache_write_tokens": 7
             }
         }))
         .unwrap();
-        assert_eq!(usage.cached_tokens, 3);
-        assert_eq!(usage.cache_write_tokens, 7);
+        assert_eq!(usage.cached_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, Some(7));
+    }
+
+    #[test]
+    fn usage_ignores_additive_telemetry_without_inventing_cache_counts() {
+        let usage = parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "codex_rollout_budget_units": 4.5,
+            "input_tokens_details": null
+        }))
+        .unwrap();
+        assert_eq!(usage.cached_tokens, None);
+        assert_eq!(usage.cache_write_tokens, None);
+
+        let usage = parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "input_tokens_details": {
+                "cached_tokens": 3,
+                "future_telemetry": {"value": 1}
+            }
+        }))
+        .unwrap();
+        assert_eq!(usage.cached_tokens, Some(3));
+        assert_eq!(usage.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn usage_rejects_public_alias_fields_in_private_upstream_payloads() {
+        for alias in [
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            let mut value = json!({
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(alias.to_string(), json!(0));
+            assert!(matches!(
+                parse_usage(&value),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compact_raw_events_preserves_identical_web_search_calls_by_position() {
+        let duplicate = json!({
+            "type": "web_search_call",
+            "id": "web-1",
+            "input": {"query": "same"},
+            "content": []
+        });
+        let mut events = vec![duplicate.clone(), duplicate];
+        events.extend((0..25).map(|index| json!({"type": "content", "text": index.to_string()})));
+
+        let compacted = compact_raw_events(&events);
+        assert_eq!(
+            compacted
+                .iter()
+                .filter(|event| event.get("type") == Some(&json!("web_search_call")))
+                .count(),
+            2
+        );
+        assert_eq!(compacted.len(), 22);
     }
 }

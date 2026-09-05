@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "codex-as-api"
-version = "0.6.5"
+version = "0.7.0"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -24,10 +24,15 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["regex", "tomli>=2; python_version < '3.11'"]
+dependencies = [
+    "fastapi>=0.100",
+    "pydantic>=2.0",
+    "regex",
+    "tomli>=2; python_version < '3.11'",
+    "uvicorn>=0.23",
+]
 
 [project.optional-dependencies]
-server = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2.0"]
 dev = ["pytest", "ruff", "mypy", "httpx", "types-regex"]
 
 [project.scripts]
@@ -41,24 +46,23 @@ Repository = "https://github.com/Eunho-J/codex-as-api"
 packages = ["src/codex_as_api"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"config/model-capabilities.json" = "codex_as_api/model-capabilities.json"
 "config/codex-upstream-contract.json" = "codex_as_api/codex-upstream-contract.json"
 "config/o200k_base.tiktoken" = "codex_as_api/o200k_base.tiktoken"
 "THIRD_PARTY_NOTICES.md" = "codex_as_api/THIRD_PARTY_NOTICES.md"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/config/model-capabilities.json",
     "/config/codex-upstream-contract.json",
     "/config/o200k_base.tiktoken",
     "/src/codex_as_api",
+    "/scripts",
+    "/rust/THIRD_PARTY_NOTICES.md",
     "/tests",
     "/LICENSE",
     "/THIRD_PARTY_NOTICES.md",
     "/README.md",
     "/RELEASES.md",
     "/pyproject.toml",
-    "/requirements-server.txt",
     "/requirements.txt",
 ]
 

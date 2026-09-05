@@ -5,6 +5,7 @@ import {
   responseFailureMessage,
   reasoningFromResponseItems,
 } from "../protocol.js";
+import { ChatGPTOAuthProtocolError } from "../auth.js";
 
 describe("normalizeStreamContent", () => {
   it("returns empty string for null", () => {
@@ -27,17 +28,23 @@ describe("normalizeStreamContent", () => {
     assert.equal(normalizeStreamContent(content), "hello world");
   });
 
-  it("skips non-text array items", () => {
+  it("rejects non-text array items", () => {
     const content = [
       { text: "hello" },
       { image: "data:..." },
       { text: " world" },
     ];
-    assert.equal(normalizeStreamContent(content), "hello world");
+    assert.throws(
+      () => normalizeStreamContent(content),
+      (error) => error instanceof ChatGPTOAuthProtocolError,
+    );
   });
 
-  it("stringifies other types", () => {
-    assert.equal(normalizeStreamContent(42), "42");
+  it("rejects other types", () => {
+    assert.throws(
+      () => normalizeStreamContent(42),
+      (error) => error instanceof ChatGPTOAuthProtocolError,
+    );
   });
 
   it("handles empty array", () => {
@@ -102,9 +109,12 @@ describe("reasoningFromResponseItems", () => {
     assert.equal(reasoningFromResponseItems(items), "");
   });
 
-  it("extracts summary string", () => {
+  it("extracts official tagged summary parts", () => {
     const items = [
-      { type: "reasoning", summary: "thought about it" },
+      {
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "thought about it" }],
+      },
     ];
     assert.equal(
       reasoningFromResponseItems(items),
@@ -112,14 +122,20 @@ describe("reasoningFromResponseItems", () => {
     );
   });
 
-  it("extracts content string", () => {
-    const items = [
-      { type: "reasoning", content: "deep thought" },
-    ];
-    assert.equal(
-      reasoningFromResponseItems(items),
-      "deep thought",
-    );
+  it("extracts both pinned tagged reasoning content variants", () => {
+    for (const type of ["reasoning_text", "text"]) {
+      const items = [
+        {
+          type: "reasoning",
+          summary: [],
+          content: [{ type, text: "deep thought" }],
+        },
+      ];
+      assert.equal(
+        reasoningFromResponseItems(items),
+        "deep thought",
+      );
+    }
   });
 
   it("extracts from summary array with text objects", () => {
@@ -127,8 +143,8 @@ describe("reasoningFromResponseItems", () => {
       {
         type: "reasoning",
         summary: [
-          { text: "step 1" },
-          { text: " step 2" },
+          { type: "summary_text", text: "step 1" },
+          { type: "summary_text", text: " step 2" },
         ],
       },
     ];
@@ -138,24 +154,18 @@ describe("reasoningFromResponseItems", () => {
     );
   });
 
-  it("extracts from summary array with strings", () => {
+  it("concatenates multiple reasoning items", () => {
     const items = [
       {
         type: "reasoning",
-        summary: ["part a", "part b"],
+        summary: [{ type: "summary_text", text: "first" }],
       },
-    ];
-    assert.equal(
-      reasoningFromResponseItems(items),
-      "part apart b",
-    );
-  });
-
-  it("concatenates multiple reasoning items", () => {
-    const items = [
-      { type: "reasoning", summary: "first" },
       { type: "message", content: "ignore" },
-      { type: "reasoning", content: "second" },
+      {
+        type: "reasoning",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "second" }],
+      },
     ];
     assert.equal(
       reasoningFromResponseItems(items),
@@ -165,9 +175,45 @@ describe("reasoningFromResponseItems", () => {
 
   it("skips empty values", () => {
     const items = [
-      { type: "reasoning", summary: "" },
-      { type: "reasoning", content: "real" },
+      {
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "" }],
+      },
+      {
+        type: "reasoning",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "real" }],
+      },
     ];
     assert.equal(reasoningFromResponseItems(items), "real");
+  });
+
+  it("rejects stale untagged reasoning shapes", () => {
+    for (const item of [
+      { type: "reasoning", summary: "direct" },
+      { type: "reasoning", content: "direct" },
+      { type: "reasoning", summary: ["bare"] },
+      { type: "reasoning", summary: [{ text: "untyped" }] },
+      { type: "reasoning", summary: [{ type: "reasoning_text", text: "wrong" }] },
+      { type: "reasoning", content: [{ type: "summary_text", text: "wrong" }] },
+    ]) {
+      assert.throws(
+        () => reasoningFromResponseItems([item]),
+        ChatGPTOAuthProtocolError,
+      );
+    }
+  });
+
+  it("requires the upstream reasoning summary array", () => {
+    for (const summary of [undefined, null, "", {}]) {
+      assert.throws(
+        () => reasoningFromResponseItems([{
+          type: "reasoning",
+          summary,
+          content: null,
+        }]),
+        (error) => error instanceof ChatGPTOAuthProtocolError,
+      );
+    }
   });
 });

@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "codex-as-api"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "axum",
  "base64",
@@ -198,6 +198,7 @@ dependencies = [
  "toml",
  "tower-http",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

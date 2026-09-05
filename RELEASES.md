@@ -1,5 +1,77 @@
 # Release Notes
 
+## v0.7.0
+
+### Live authenticated model catalog
+
+- Remove every bundled runtime model catalog and use the authenticated Codex
+  `/models` response as the sole authority for model membership and advertised
+  capabilities, including context bounds, reasoning levels, service tiers, and
+  Responses Lite behavior. Explicit Codex config context values remain local
+  settings and are clamped when the live row publishes a maximum.
+- Add `GET /v1/models` across Python, TypeScript, and Rust. Cache only fresh
+  account/base-URL/client-version snapshots for five minutes, coalesce refreshes,
+  and invalidate on a changed Responses `X-Models-Etag`.
+- Resolve the live Codex default when no model is configured, require exact live
+  slugs without public GPT aliases, and require an explicit live backend for
+  `claude-*` facade names. Unknown models now fail instead of receiving guessed
+  metadata or silently routing elsewhere.
+- Pin the private wire contract and request identity to Codex `0.153.3` commit
+  `b1a547b1f73ce86205d9222ac19cff334b3b7a2e`.
+
+### Fail-loud request and response semantics
+
+- Validate the catalog and effective model before streaming headers; make
+  `/health` a real readiness endpoint and return typed authentication, catalog,
+  model, request, upstream HTTP, and upstream protocol errors.
+- Reject unsupported controls and malformed request/upstream structures rather
+  than dropping values, coercing roles, or inventing objects or IDs. Derive
+  terminal status only from emitted tool calls and the authoritative
+  `response.completed` event: missing, null, or true `end_turn` is terminal in
+  pinned Codex, while explicit false remains nonterminal. Duplicate provider
+  function/custom call IDs now fail
+  as protocol errors instead of being merged or emitted ambiguously, and
+  unrepresentable provider custom-tool call events fail instead of being folded
+  into function calls.
+- Remove fabricated Anthropic thinking blocks and signature deltas. Real Codex
+  reasoning is exposed only as `codex_reasoning` or streamed
+  `codex_reasoning_delta` proxy extensions.
+- Reject hosted Anthropic WebSearch on Messages, token-counting, and compact
+  requests because OpenAI hosted results cannot provide the complete Anthropic
+  server-tool lifecycle. Unexpected provider web-search calls fail as upstream
+  protocol errors instead of being translated into incomplete result blocks.
+- Require authoritative final usage and completion semantics for Anthropic
+  responses. Emit required nullable response fields from provider data, while
+  retaining immediate Claude Code `message_start` delivery without guessed
+  token counts.
+- Scope process-local `previous_response_id` history to the authenticated account
+  and reject known `comp_hash` mismatches instead of replaying incompatible
+  history without Codex's automatic pre-turn compaction. Add finite provider
+  timeouts while retaining the narrow documented
+  managed-ChatGPT OAuth, Anthropic `max_tokens`, and validated `cache_control`
+  compatibility behavior.
+- Accept only the official nested `tokens` layout for managed ChatGPT auth.
+  Remove unofficial root-level token fields and noncanonical `auth_mode` aliases,
+  and reject external-host `chatgptAuthTokens` because the standalone proxy has
+  no host refresh callback.
+
+### Release integrity
+
+- Make FastAPI, Pydantic, and Uvicorn regular Python dependencies so the
+  advertised `pip install codex-as-api && codex-as-api` path installs a working
+  server instead of an optional-dependency error shim.
+- Build npmjs and scoped GitHub Packages tarballs in the tested TypeScript job,
+  then publish those exact artifacts instead of rebuilding after the release
+  gate. Require both tarballs to carry the repository Apache license and
+  third-party notices.
+- Package each platform Rust binary in a deterministic ZIP archive containing
+  the binary, repository `LICENSE`, and generated notices covering bundled
+  tokenizer data plus the actual shipped license files for the locked
+  cross-platform runtime dependency graph.
+- Reject catalog-like JSON assets and payloads from runtime source trees and
+  package artifacts, and run the complete Python, TypeScript, and Rust test,
+  lint, build, and package gates.
+
 ## v0.6.5
 
 ### Codex 0.147 compatibility

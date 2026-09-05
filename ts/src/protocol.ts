@@ -1,8 +1,11 @@
-function getValue(value: unknown, key: string, defaultValue: unknown = undefined): unknown {
-  if (value !== null && typeof value === "object" && key in (value as Record<string, unknown>)) {
-    return (value as Record<string, unknown>)[key];
-  }
-  return defaultValue;
+import { ChatGPTOAuthProtocolError } from "./auth.js";
+import type { FinishReason } from "./messages.js";
+
+export function normalizeFinishReason(value: unknown): FinishReason {
+  if (value === null || value === "stop" || value === "tool_calls") return value;
+  throw new ChatGPTOAuthProtocolError(
+    "finish_reason must be null, stop, or tool_calls",
+  );
 }
 
 export function normalizeStreamContent(content: unknown): string {
@@ -14,15 +17,19 @@ export function normalizeStreamContent(content: unknown): string {
   }
   if (Array.isArray(content)) {
     const parts: string[] = [];
-    for (const item of content) {
-      const text = getValue(item, "text");
-      if (text) {
-        parts.push(String(text));
+    for (const [index, item] of content.entries()) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        throw new ChatGPTOAuthProtocolError(`stream content item ${index} must be an object`);
       }
+      const text = (item as Record<string, unknown>).text;
+      if (typeof text !== "string") {
+        throw new ChatGPTOAuthProtocolError(`stream content item ${index} text must be a string`);
+      }
+      parts.push(text);
     }
     return parts.join("");
   }
-  return String(content);
+  throw new ChatGPTOAuthProtocolError("stream content must be a string, array, or null");
 }
 
 export function responseFailureMessage(event: Record<string, unknown>, status: string): string {
@@ -60,32 +67,52 @@ export function responseFailureMessage(event: Record<string, unknown>, status: s
   return `OpenAI protocol response ${status}: ${detail}`;
 }
 
-export function reasoningFromResponseItems(items: Record<string, unknown>[]): string {
-  const parts: string[] = [];
+export function reasoningPartsFromResponseItems(
+  items: Record<string, unknown>[],
+): { summary: string; content: string } {
+  const summaryParts: string[] = [];
+  const contentParts: string[] = [];
   for (const item of items) {
     if (item["type"] !== "reasoning") {
       continue;
     }
     for (const field of ["summary", "content"]) {
       const value = item[field];
-      if (typeof value === "string" && value) {
-        parts.push(value);
-        continue;
-      }
+      if (field === "content" && value == null) continue;
       if (!Array.isArray(value)) {
-        continue;
+        throw new ChatGPTOAuthProtocolError(`reasoning item ${field} must be an array`);
       }
-      for (const part of value) {
-        if (typeof part === "string" && part) {
-          parts.push(part);
-        } else if (part !== null && typeof part === "object") {
-          const text = (part as Record<string, unknown>)["text"];
-          if (typeof text === "string" && text) {
-            parts.push(text);
-          }
+      const expectedTypes = field === "summary"
+        ? new Set(["summary_text"])
+        : new Set(["reasoning_text", "text"]);
+      for (const [index, part] of value.entries()) {
+        if (part === null || typeof part !== "object" || Array.isArray(part)) {
+          throw new ChatGPTOAuthProtocolError(
+            `reasoning item ${field}[${index}] must be an object`,
+          );
+        }
+        const record = part as Record<string, unknown>;
+        if (typeof record.type !== "string" || !expectedTypes.has(record.type)) {
+          throw new ChatGPTOAuthProtocolError(
+            `reasoning item ${field}[${index}] has an unsupported type`,
+          );
+        }
+        const text = record.text;
+        if (typeof text !== "string") {
+          throw new ChatGPTOAuthProtocolError(
+            `reasoning item ${field}[${index}] text must be a string`,
+          );
+        }
+        if (text) {
+          (field === "summary" ? summaryParts : contentParts).push(text);
         }
       }
     }
   }
-  return parts.join("");
+  return { summary: summaryParts.join(""), content: contentParts.join("") };
+}
+
+export function reasoningFromResponseItems(items: Record<string, unknown>[]): string {
+  const { summary, content } = reasoningPartsFromResponseItems(items);
+  return summary + content;
 }

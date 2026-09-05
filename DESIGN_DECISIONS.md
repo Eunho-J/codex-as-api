@@ -4,7 +4,7 @@ This is the fixed repository-local agenda for design-affecting work.
 
 ## D-001: Identifier and cache semantics by facade
 
-Status: APPROVED
+Status: APPROVED; CONTINUATION SCOPE AMENDED BY D-003
 
 ### Evidence
 
@@ -53,7 +53,7 @@ User words, verbatim:
 
 ## D-002: Codex 0.147 compatibility and automated releases
 
-Status: APPROVED
+Status: APPROVED; MODEL-CATALOG CLAUSES SUPERSEDED AND AUTH SCOPE AMENDED BY D-003
 
 ### Evidence
 
@@ -101,3 +101,93 @@ User words, verbatim:
 - Cross-runtime tests and release metadata
 - GitHub Actions CI and release workflows
 - `README.md`, `ts/README.md`, and `RELEASES.md`
+
+## D-003: Live model authority and fail-loud proxy semantics
+
+Status: APPROVED
+
+### Evidence
+
+User words, verbatim:
+
+> 수동 업데이트 안하게 가능한가? 모델 카탈로그 받는 API도 제공해야하지 않아?
+
+> 정적 `model-capabilities.json`은 시작용 bootstrap과 보수적 fallback으로만 유지 이거 필요 한거야? 그냥 다 없애는게 낫지 않나?
+
+> 불필요한 fallback이 있지 않은지, 필요없는데 과하게 동작하는 예외처리가 있는건 아닌지.
+
+> 이거 다 고쳐야해. 앞선 내용 포함해서 모두 작업해줘. 배포까지
+
+### Decision
+
+- Treat the authenticated ChatGPT Codex `GET /models` response as the only
+  runtime authority for model membership and model capabilities.
+- Remove bundled model catalogs, hard-coded model and context defaults, unknown
+  model metadata, stale-cache recovery, and bootstrap catalog data from every
+  runtime package. Test-only fixtures are not runtime fallback data.
+- Cache only fresh in-memory catalog snapshots for five minutes. Scope each
+  snapshot to the authenticated account, backend base URL, and validated Codex
+  client version; coalesce concurrent refreshes and invalidate on a changed
+  `X-Models-Etag` response header.
+- Resolve and validate the effective model before opening streaming response
+  headers. Return explicit authentication, catalog-unavailable, model-not-found,
+  request-validation, and upstream-protocol errors without substituting data.
+- Expose every model in the authenticated fresh snapshot through `GET /v1/models`.
+  Preserve upstream visibility and API-support metadata instead of inferring an
+  additional local filter.
+- Do not maintain public GPT model aliases. Requests use exact slugs from the
+  fresh authenticated snapshot.
+  Recognized `claude-*` compatibility names require an explicitly configured
+  backend model from the same snapshot; arbitrary unknown names and missing
+  configured models fail.
+- Namespace process-local `previous_response_id` history by authenticated account
+  so one account's content cannot be replayed under another account.
+- Accept only the official nested `tokens` layout for managed ChatGPT auth.
+  Reject root-level token aliases, noncanonical `auth_mode` aliases, and
+  external-host `chatgptAuthTokens`; the standalone proxy has no host callback
+  that can resolve or refresh externally owned credentials.
+- Reject unsupported or malformed caller controls before transport and reject
+  malformed upstream protocol data instead of dropping fields, inventing IDs,
+  synthesizing values, or emitting placeholder signatures.
+- For Anthropic JSON schema output, use pinned Codex's deterministic
+  `codex_output_schema` transport label when the official Anthropic shape omits
+  a name. This required wire label is not model data, an alias, or a recovery
+  fallback; caller-supplied names are validated and never rewritten.
+- Preserve the Anthropic typed distinction between an omitted field and
+  explicit `null`. Accept `null` only for fields whose supported Anthropic type
+  is nullable or for a separately documented private-transport no-op; reject
+  it for non-nullable optional fields before transport.
+- Keep the narrowly documented Claude Code compatibility handling for Anthropic
+  `max_tokens` and validated `cache_control`, managed-ChatGPT OAuth refresh-once
+  behavior, and protocol-correct in-stream error events after response headers
+  have begun.
+- Reject Anthropic hosted WebSearch instead of fabricating its server-tool
+  provenance from OpenAI hosted-search output. Require authoritative final
+  usage and a real `response.completed`; derive terminal status from emitted
+  tool calls and pinned Codex's `end_turn` semantics, where only explicit
+  `false` is nonterminal. Preserve immediate Claude Code `message_start`
+  delivery without guessing token counts.
+- Implement and verify the same behavior in Python, TypeScript, and Rust, then
+  publish one versioned release to every configured registry and GitHub target.
+
+### Rejected Alternatives
+
+- Bundled or stale model data as a fallback when the authenticated catalog is
+  unavailable.
+- Routing arbitrary unknown model IDs to a configured default model.
+- Reporting healthy readiness without valid authentication, a fresh catalog, and
+  a valid effective model.
+- Accepting unsupported controls as no-ops outside the explicitly approved
+  Anthropic compatibility surface.
+- Treating externally hosted ChatGPT auth tokens as locally refreshable OAuth
+  credentials without the required external-host callback.
+- Recovering malformed request or upstream data with fabricated IDs, empty
+  objects, default roles, default completion reasons, or placeholder signatures.
+
+### Affected Components
+
+- Python, TypeScript, and Rust authentication, catalog, provider, and HTTP server
+  modules
+- Cross-runtime integration, error, package-content, and account-isolation tests
+- `README.md`, `ts/README.md`, `RELEASES.md`, package metadata, and release
+  workflows

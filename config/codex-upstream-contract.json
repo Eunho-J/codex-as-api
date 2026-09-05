@@ -1,60 +1,22 @@
 {
   "upstream": {
     "repository": "openai/codex",
-    "version": "0.147.0",
-    "tag": "rust-v0.147.0",
-    "commit": "be6e8eac029b183056b7e4402879f15d2c85f61b"
+    "version": "0.153.3",
+    "tag": "rust-v0.153.3",
+    "commit": "b1a547b1f73ce86205d9222ac19cff334b3b7a2e"
   },
-  "models": [
-    {
-      "slug": "gpt-5.6",
-      "context_window": 272000,
-      "max_context_window": 272000,
-      "default_reasoning_effort": "low",
-      "use_responses_lite": true,
-      "support_verbosity": true,
-      "default_verbosity": "low",
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": true,
-      "service_tiers": ["priority"]
-    },
-    {
-      "slug": "gpt-5.6-sol",
-      "context_window": 272000,
-      "max_context_window": 272000,
-      "default_reasoning_effort": "low",
-      "use_responses_lite": true,
-      "support_verbosity": true,
-      "default_verbosity": "low",
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": true,
-      "service_tiers": ["priority"]
-    },
-    {
-      "slug": "gpt-5.6-terra",
-      "context_window": 272000,
-      "max_context_window": 272000,
-      "default_reasoning_effort": "medium",
-      "use_responses_lite": true,
-      "support_verbosity": true,
-      "default_verbosity": "low",
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": true,
-      "service_tiers": ["priority"]
-    },
-    {
-      "slug": "gpt-5.6-luna",
-      "context_window": 272000,
-      "max_context_window": 272000,
-      "default_reasoning_effort": "medium",
-      "use_responses_lite": true,
-      "support_verbosity": true,
-      "default_verbosity": "low",
-      "supports_parallel_tool_calls": true,
-      "supports_image_detail_original": true,
-      "service_tiers": ["priority"]
-    }
-  ],
+  "models_request": {
+    "path": "/models",
+    "method": "GET",
+    "client_version_query": "client_version",
+    "response_models_path": ["models"],
+    "etag_header": "ETag",
+    "responses_etag_header": "X-Models-Etag",
+    "cache_ttl_seconds": 300,
+    "request_timeout_seconds": 5,
+    "cache_scope": ["account_id", "base_url", "client_version"],
+    "allow_stale_on_refresh_error": false
+  },
   "responses_request": {
     "path": "/responses",
     "method": "POST",

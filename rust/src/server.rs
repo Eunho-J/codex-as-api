@@ -1,4 +1,5 @@
-use axum::extract::{OriginalUri, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
@@ -10,49 +11,97 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::task;
 
 use crate::anthropic_adapter::{
     anthropic_request_to_internal, format_anthropic_error, internal_response_to_anthropic,
-    AnthropicStreamAdapter,
+    validate_anthropic_cache_controls, AnthropicStreamAdapter,
 };
-use crate::auth::{self, AuthError};
+use crate::auth;
 use crate::codex_config::CodexConfig;
 use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
-use crate::model_capabilities::capability_for_model;
+use crate::model_catalog::ModelInfo;
 use crate::o200k_tokenizer::count_ordinary;
-use crate::provider::{ChatGPTOAuthProvider, CompactControls, GenerationControls, ProviderError};
+use crate::provider::{
+    parse_usage, resolve_reasoning_effort, validate_image_content_values, ChatGPTOAuthProvider,
+    CompactControls, GenerationControls, ProviderError, ResolvedModel,
+};
+use crate::strict_json;
 
-const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
+pub const REQUEST_BODY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub model: String,
     pub auth_path: Option<String>,
     pub codex_config: CodexConfig,
     pub provider: Arc<ChatGPTOAuthProvider>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<Value>,
     pub name: Option<String>,
     pub tool_calls: Option<Vec<Value>>,
     pub tool_call_id: Option<String>,
+    pub audio: Option<Value>,
+    pub function_call: Option<Value>,
+    pub refusal: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default)]
+pub struct PresentJsonValue {
+    present: bool,
+    value: Option<Value>,
+}
+
+impl Serialize for PresentJsonValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PresentJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self {
+            present: true,
+            value: (!value.is_null()).then_some(value),
+        })
+    }
+}
+
+impl PresentJsonValue {
+    fn reject_explicit_null(&self, field: &str) -> Result<(), ProviderError> {
+        if self.present && self.value.is_none() {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{field} must not be null"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
-    pub model: String,
+    pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub stream: bool,
+    pub stream: Option<bool>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i64>,
     pub max_completion_tokens: Option<i64>,
-    pub stop: Option<StopValue>,
+    pub stop: Option<Value>,
     pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
     pub reasoning_effort: Option<String>,
@@ -74,30 +123,33 @@ pub struct ChatCompletionRequest {
     pub text: Option<Value>,
     pub client_metadata: Option<HashMap<String, String>>,
     pub codex_metadata: Option<bool>,
-    pub responses_lite: Option<Value>,
+    #[serde(default)]
+    pub responses_lite: PresentJsonValue,
     pub parallel_tool_calls: Option<bool>,
+    pub n: Option<Value>,
+    pub logprobs: Option<Value>,
+    pub top_logprobs: Option<Value>,
+    pub logit_bias: Option<Value>,
+    pub seed: Option<Value>,
+    pub response_format: Option<Value>,
+    pub stream_options: Option<Value>,
+    pub modalities: Option<Value>,
+    pub audio: Option<Value>,
+    pub store: Option<Value>,
+    pub metadata: Option<Value>,
+    pub prediction: Option<Value>,
+    pub function_call: Option<Value>,
+    pub functions: Option<Value>,
+    pub prompt_cache_retention: Option<Value>,
+    pub web_search_options: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum StopValue {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl StopValue {
-    fn to_vec(&self) -> Vec<String> {
-        match self {
-            StopValue::Single(s) => vec![s.clone()],
-            StopValue::Multiple(v) => v.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
-    pub model: String,
+    pub model: Option<String>,
     pub prompt: String,
+    pub reference_images: Option<Vec<Value>>,
     pub size: Option<String>,
     pub tools: Option<Vec<Value>>,
     pub programmatic_tool_calling: Option<Value>,
@@ -107,11 +159,25 @@ pub struct ImageGenerationRequest {
     pub safety_identifier: Option<String>,
     pub verbosity: Option<String>,
     pub multi_agent: Option<Value>,
-    pub responses_lite: Option<Value>,
+    #[serde(default)]
+    pub responses_lite: PresentJsonValue,
+    pub background: Option<Value>,
+    pub moderation: Option<Value>,
+    pub n: Option<Value>,
+    pub output_compression: Option<Value>,
+    pub output_format: Option<Value>,
+    pub partial_images: Option<Value>,
+    pub quality: Option<Value>,
+    pub response_format: Option<Value>,
+    pub stream: Option<Value>,
+    pub style: Option<Value>,
+    pub user: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InspectRequest {
+    pub model: Option<String>,
     pub prompt: Option<String>,
     pub images: Option<Vec<Value>>,
     pub tools: Option<Vec<Value>>,
@@ -122,7 +188,8 @@ pub struct InspectRequest {
     pub safety_identifier: Option<String>,
     pub verbosity: Option<String>,
     pub multi_agent: Option<Value>,
-    pub responses_lite: Option<Value>,
+    #[serde(default)]
+    pub responses_lite: PresentJsonValue,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,49 +201,734 @@ struct ErrorResponse {
 struct ErrorDetail {
     message: String,
     r#type: String,
+    code: String,
 }
 
-fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
+fn error_response_with_type(
+    status: StatusCode,
+    message: String,
+    error_type: &str,
+) -> impl IntoResponse {
     (
         status,
         Json(ErrorResponse {
             error: ErrorDetail {
                 message,
-                r#type: "chatgpt_oauth_error".to_string(),
+                r#type: error_type.to_string(),
+                code: error_type.to_string(),
             },
         }),
     )
 }
+
+fn provider_error_response(error: &ProviderError) -> axum::response::Response {
+    let status = map_error_status(error);
+    error_response_with_type(
+        status,
+        public_error_message(error),
+        provider_error_type(error),
+    )
+    .into_response()
+}
+
+fn public_error_message(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Auth(_) => {
+            "ChatGPT OAuth credentials are unavailable; rerun codex login".to_string()
+        }
+        ProviderError::CatalogUnavailable(_) => {
+            "authenticated model catalog is unavailable".to_string()
+        }
+        ProviderError::UpstreamProtocol(_) => "upstream protocol validation failed".to_string(),
+        ProviderError::UpstreamHttp { .. } | ProviderError::UpstreamTransport(_) => {
+            "upstream request failed".to_string()
+        }
+        ProviderError::Request(_) => "internal server error".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+fn provider_error_type(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Auth(_) => "authentication_error",
+        ProviderError::InvalidRequest(_) => "invalid_request_error",
+        ProviderError::ModelNotFound(_) => "model_not_found",
+        ProviderError::CatalogUnavailable(_) => "catalog_unavailable",
+        ProviderError::UpstreamProtocol(_) => "upstream_protocol_error",
+        ProviderError::UpstreamHttp { .. } | ProviderError::UpstreamTransport(_) => {
+            "upstream_error"
+        }
+        _ => "server_error",
+    }
+}
+
+fn health_error_message(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Auth(_) => "ChatGPT OAuth credentials are unavailable",
+        ProviderError::CatalogUnavailable(_) => "authenticated model catalog is unavailable",
+        ProviderError::ModelNotFound(_) => {
+            "configured model is unavailable in the authenticated catalog"
+        }
+        ProviderError::UpstreamHttp { .. } | ProviderError::UpstreamTransport(_) => {
+            "upstream request failed"
+        }
+        ProviderError::UpstreamProtocol(_) => "upstream protocol validation failed",
+        ProviderError::InvalidRequest(_) => "health configuration is invalid",
+        ProviderError::Request(_) => "health preflight failed",
+    }
+}
+
+fn anthropic_provider_error_response(error: &ProviderError) -> axum::response::Response {
+    let status = map_error_status(error);
+    (
+        status,
+        Json(format_anthropic_error(
+            status.as_u16(),
+            &public_error_message(error),
+        )),
+    )
+        .into_response()
+}
+
+fn join_error_response(_error: tokio::task::JoinError) -> axum::response::Response {
+    error_response_with_type(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+        "server_error",
+    )
+    .into_response()
+}
+
+fn openai_usage_value(usage: &crate::messages::Usage) -> Value {
+    let mut details = serde_json::Map::new();
+    if let Some(cached_tokens) = usage.cached_tokens {
+        details.insert("cached_tokens".to_string(), json!(cached_tokens));
+    }
+    if let Some(cache_write_tokens) = usage.cache_write_tokens {
+        details.insert("cache_write_tokens".to_string(), json!(cache_write_tokens));
+    }
+    let mut value = json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    });
+    if !details.is_empty() {
+        value
+            .as_object_mut()
+            .expect("usage literal must be an object")
+            .insert("prompt_tokens_details".to_string(), Value::Object(details));
+    }
+    value
+}
+
+#[allow(clippy::result_large_err)]
+fn openai_json<T: Serialize>(
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, axum::response::Response> {
+    let value = payload.map(|Json(value)| value).map_err(|error| {
+        let status = error.status();
+        if matches!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ) {
+            let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "request body exceeds 50 MiB"
+            } else {
+                "request Content-Type must be application/json or application/*+json"
+            };
+            return (
+                status,
+                Json(json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        provider_error_response(&ProviderError::InvalidRequest(format!(
+            "invalid JSON request: {error}"
+        )))
+    })?;
+    let parsed = serde_json::to_value(&value).map_err(|_| {
+        provider_error_response(&ProviderError::InvalidRequest(
+            "invalid JSON request".to_string(),
+        ))
+    })?;
+    strict_json::validate_value(&parsed).map_err(|_| {
+        provider_error_response(&ProviderError::InvalidRequest(
+            "invalid JSON request".to_string(),
+        ))
+    })?;
+    Ok(value)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_openai_request<T: serde::de::DeserializeOwned>(
+    value: Value,
+) -> Result<T, axum::response::Response> {
+    serde_json::from_value(value).map_err(|error| {
+        provider_error_response(&ProviderError::InvalidRequest(format!(
+            "invalid JSON request: {error}"
+        )))
+    })
+}
+
+fn reject_explicit_null_fields(body: &Value, fields: &[&str]) -> Result<(), ProviderError> {
+    let object = body.as_object().ok_or_else(|| {
+        ProviderError::InvalidRequest("request body must be a JSON object".to_string())
+    })?;
+    if let Some(field) = fields
+        .iter()
+        .find(|field| object.contains_key(**field) && object.get(**field) == Some(&Value::Null))
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "{field} must not be null"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_openai_chat_message_fields(body: &Value) -> Result<(), ProviderError> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, message) in messages.iter().enumerate() {
+        let Some(object) = message.as_object() else {
+            continue;
+        };
+        let Some(role) = object.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let allowed: &[&str] = match role {
+            "assistant" => &[
+                "role",
+                "content",
+                "tool_calls",
+                "audio",
+                "function_call",
+                "refusal",
+            ],
+            "tool" => &["role", "content", "tool_call_id"],
+            "system" | "developer" | "user" => &["role", "content"],
+            _ => continue,
+        };
+        reject_unknown_object_fields(object, &format!("messages[{index}]"), allowed)?;
+        if role == "assistant" {
+            if !object.contains_key("content") && !object.contains_key("tool_calls") {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "messages[{index}] requires content or tool_calls"
+                )));
+            }
+            if object.get("tool_calls") == Some(&Value::Null) {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "messages[{index}].tool_calls must not be null"
+                )));
+            }
+            for field in ["audio", "function_call", "refusal"] {
+                if object.get(field).is_some_and(|value| !value.is_null()) {
+                    return Err(ProviderError::InvalidRequest(format!(
+                        "messages[{index}].{field} is not supported by the Codex OAuth HTTP transport"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_assistant_optional_content(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) == Some("assistant")
+            && (object.get("content") == Some(&Value::Null)
+                || (!object.contains_key("content") && object.contains_key("tool_calls")))
+        {
+            object.insert("content".to_string(), Value::Array(Vec::new()));
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn anthropic_json<T: Serialize>(
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, axum::response::Response> {
+    let value = payload.map(|Json(value)| value).map_err(|error| {
+        let status = error.status();
+        if matches!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ) {
+            let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "request body exceeds 50 MiB"
+            } else {
+                "request Content-Type must be application/json or application/*+json"
+            };
+            return (
+                status,
+                Json(format_anthropic_error(status.as_u16(), message)),
+            )
+                .into_response();
+        }
+        anthropic_provider_error_response(&ProviderError::InvalidRequest(format!(
+            "invalid JSON request: {error}"
+        )))
+    })?;
+    let parsed = serde_json::to_value(&value).map_err(|_| {
+        anthropic_provider_error_response(&ProviderError::InvalidRequest(
+            "invalid JSON request".to_string(),
+        ))
+    })?;
+    strict_json::validate_value(&parsed).map_err(|_| {
+        anthropic_provider_error_response(&ProviderError::InvalidRequest(
+            "invalid JSON request".to_string(),
+        ))
+    })?;
+    Ok(value)
+}
+
+fn reject_unknown_top_level_fields(body: &Value, allowed: &[&str]) -> Result<(), ProviderError> {
+    let object = body.as_object().ok_or_else(|| {
+        ProviderError::InvalidRequest("request body must be a JSON object".to_string())
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "unknown request field {field:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_unknown_object_fields(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), ProviderError> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "{path} contains unknown field {field:?}"
+        )));
+    }
+    Ok(())
+}
+
+const OPENAI_COMPACT_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "programmatic_tool_calling",
+    "safety_identifier",
+    "include",
+    "prompt_cache_retention",
+    "reasoning",
+    "multi_agent",
+    "reasoning_effort",
+    "responses_lite",
+    "previous_response_id",
+    "service_tier",
+    "text",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "verbosity",
+];
+
+const ANTHROPIC_COMPACT_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "tool_choice",
+    "stop_sequences",
+    "thinking",
+    "output_config",
+    "output_format",
+    "cache_control",
+    "context_management",
+    "max_tokens",
+    "programmatic_tool_calling",
+    "safety_identifier",
+    "include",
+    "prompt_cache_retention",
+    "reasoning",
+    "multi_agent",
+    "reasoning_effort",
+    "responses_lite",
+    "previous_response_id",
+    "service_tier",
+    "speed",
+    "text",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "verbosity",
+];
+
+fn positive_js_safe_integer(value: &Value) -> Option<i64> {
+    value
+        .as_number()
+        .and_then(crate::strict_json::as_js_safe_integer)
+        .filter(|value| *value > 0)
+}
+
+fn reject_explicit_null_anthropic_fields(body: &Value) -> Result<(), ProviderError> {
+    for field in [
+        "system",
+        "tools",
+        "tool_choice",
+        "stop_sequences",
+        "thinking",
+        "output_config",
+        "stream",
+        "service_tier",
+    ] {
+        if body.get(field).is_some_and(Value::is_null) {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{field} must not be null"
+            )));
+        }
+    }
+    Ok(())
+}
+
+const ANTHROPIC_COUNT_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "output_config",
+    "output_format",
+    "cache_control",
+    "context_management",
+    "multi_agent",
+    "programmatic_tool_calling",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "parallel_tool_calls",
+    "max_tokens",
+];
+
+const ANTHROPIC_MESSAGE_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "max_tokens",
+    "stream",
+    "tools",
+    "tool_choice",
+    "stop_sequences",
+    "temperature",
+    "top_p",
+    "top_k",
+    "parallel_tool_calls",
+    "thinking",
+    "output_config",
+    "output_format",
+    "cache_control",
+    "reasoning_effort",
+    "reasoning",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "safety_identifier",
+    "verbosity",
+    "multi_agent",
+    "programmatic_tool_calling",
+    "responses_lite",
+    "service_tier",
+    "speed",
+    "subagent",
+    "memgen_request",
+    "context_management",
+    "previous_response_id",
+];
 
 fn anthropic_sse_event(chunk: &str) -> Event {
     let mut lines = chunk.trim_end_matches('\n').splitn(2, '\n');
     let event_type = lines
         .next()
         .and_then(|line| line.strip_prefix("event: "))
-        .unwrap_or("message");
+        .expect("Anthropic adapter SSE must contain an event line");
     let data = lines
         .next()
         .and_then(|line| line.strip_prefix("data: "))
-        .unwrap_or("");
+        .expect("Anthropic adapter SSE must contain a data line");
     Event::default().event(event_type).data(data)
 }
 
 fn anthropic_stream_error_event(status: u16, message: &str) -> Event {
     Event::default().event("error").data(
         serde_json::to_string(&format_anthropic_error(status, message))
-            .unwrap_or_else(|_| "{\"type\":\"error\"}".to_string()),
+            .expect("Anthropic error JSON value must serialize"),
     )
+}
+
+fn openai_sse_json(payload: &Value) -> Result<Event, ProviderError> {
+    serde_json::to_string(payload)
+        .map(|data| Event::default().data(data))
+        .map_err(|error| {
+            ProviderError::Request(format!("failed to serialize OpenAI SSE event: {error}"))
+        })
+}
+
+fn openai_stream_error_event(error: &ProviderError) -> Event {
+    Event::default().data(
+        json!({
+            "error": {
+                "message": public_error_message(error),
+                "type": provider_error_type(error),
+                "code": provider_error_type(error),
+            }
+        })
+        .to_string(),
+    )
+}
+
+struct DownstreamEventReceiver {
+    receiver: tokio::sync::mpsc::Receiver<Event>,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl Drop for DownstreamEventReceiver {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
+}
+
+fn send_sse_event_with_backpressure(
+    sender: &tokio::sync::mpsc::Sender<Event>,
+    mut event: Event,
+    cancellation: &AtomicBool,
+    disconnected_message: &str,
+) -> Result<(), ProviderError> {
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(ProviderError::Request(disconnected_message.to_string()));
+        }
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                event = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ProviderError::Request(disconnected_message.to_string()));
+            }
+        }
+    }
+}
+
+struct OpenAiStreamState {
+    request_id: String,
+    created: i64,
+    model: String,
+    tool_call_index: usize,
+    finished: bool,
+}
+
+impl OpenAiStreamState {
+    fn chunk(&self, delta: Value, finish_reason: Value, response_id: Option<&str>) -> Value {
+        let mut chunk = json!({
+            "id": self.request_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        });
+        if let Some(response_id) = response_id {
+            chunk
+                .as_object_mut()
+                .expect("OpenAI stream chunk is an object")
+                .insert(
+                    "response_id".to_string(),
+                    Value::String(response_id.to_string()),
+                );
+        }
+        chunk
+    }
+
+    fn preamble(&self) -> Result<Event, ProviderError> {
+        openai_sse_json(&self.chunk(json!({"role": "assistant"}), Value::Null, None))
+    }
+
+    fn push(&mut self, event: &Value) -> Result<Vec<Event>, ProviderError> {
+        let event_type = event.get("type").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::UpstreamProtocol(
+                "normalized response event requires a string type".to_string(),
+            )
+        })?;
+        let chunks = match event_type {
+            "content" => {
+                let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "normalized content event requires string text".to_string(),
+                    )
+                })?;
+                vec![openai_sse_json(&self.chunk(
+                    json!({"content": text}),
+                    Value::Null,
+                    None,
+                ))?]
+            }
+            "reasoning_delta" => {
+                let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "normalized reasoning_delta event requires string text".to_string(),
+                    )
+                })?;
+                vec![openai_sse_json(&self.chunk(
+                    json!({"reasoning_content": text}),
+                    Value::Null,
+                    None,
+                ))?]
+            }
+            "reasoning_raw_delta" => {
+                let text = event.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "normalized reasoning_raw_delta event requires string text".to_string(),
+                    )
+                })?;
+                vec![openai_sse_json(&self.chunk(
+                    json!({"reasoning": text}),
+                    Value::Null,
+                    None,
+                ))?]
+            }
+            "tool_call" => {
+                let id = event.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "normalized tool_call event requires a string id".to_string(),
+                    )
+                })?;
+                let name = event.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::UpstreamProtocol(
+                        "normalized tool_call event requires a string name".to_string(),
+                    )
+                })?;
+                let arguments =
+                    event
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "normalized tool_call event requires string arguments".to_string(),
+                            )
+                        })?;
+                let tool_call = json!({
+                    "index": self.tool_call_index,
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                });
+                self.tool_call_index += 1;
+                vec![openai_sse_json(&self.chunk(
+                    json!({"tool_calls": [tool_call]}),
+                    Value::Null,
+                    None,
+                ))?]
+            }
+            "finish" => {
+                if self.finished {
+                    return Err(ProviderError::UpstreamProtocol(
+                        "normalized response stream contains more than one finish event"
+                            .to_string(),
+                    ));
+                }
+                let response_id = event
+                    .get("response_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ProviderError::UpstreamProtocol(
+                            "normalized finish event requires a non-empty response_id".to_string(),
+                        )
+                    })?;
+                let finish_reason = match event.get("finish_reason") {
+                    Some(Value::String(value))
+                        if matches!(value.as_str(), "stop" | "tool_calls") =>
+                    {
+                        Value::String(value.clone())
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::UpstreamProtocol(
+                            "normalized finish event requires a final finish_reason".to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(ProviderError::UpstreamProtocol(
+                            "normalized finish event requires a final finish_reason".to_string(),
+                        ));
+                    }
+                };
+                self.finished = true;
+                let mut chunks = vec![openai_sse_json(&self.chunk(
+                    json!({}),
+                    finish_reason,
+                    Some(response_id),
+                ))?];
+                if let Some(usage_value) = event.get("usage").filter(|usage| !usage.is_null()) {
+                    let usage = parse_usage(usage_value)?;
+                    chunks.push(openai_sse_json(&json!({
+                        "id": self.request_id,
+                        "response_id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": self.created,
+                        "model": self.model,
+                        "choices": [],
+                        "usage": openai_usage_value(&usage),
+                    }))?);
+                }
+                chunks
+            }
+            "reasoning_section_break" => Vec::new(),
+            "web_search_call" => {
+                return Err(ProviderError::UpstreamProtocol(
+                    "provider web_search_call event cannot be represented by /v1/chat/completions"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                return Err(ProviderError::UpstreamProtocol(format!(
+                    "normalized response stream has unsupported event type {event_type:?}"
+                )));
+            }
+        };
+        Ok(chunks)
+    }
 }
 
 fn map_error_status(e: &ProviderError) -> StatusCode {
     match e {
-        ProviderError::Auth(AuthError::Missing(_)) => StatusCode::UNAUTHORIZED,
-        ProviderError::Auth(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ProviderError::Auth(_) => StatusCode::UNAUTHORIZED,
         ProviderError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        ProviderError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+        ProviderError::CatalogUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ProviderError::UpstreamProtocol(_) => StatusCode::BAD_GATEWAY,
+        ProviderError::UpstreamTransport(_) => StatusCode::BAD_GATEWAY,
         ProviderError::UpstreamHttp { status, .. } => {
             StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        _ if e.to_string().to_lowercase().contains("context window") => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -184,6 +936,7 @@ fn map_error_status(e: &ProviderError) -> StatusCode {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/inspect", post(inspect))
@@ -191,52 +944,49 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/messages/compact", post(compact))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/messages", post(anthropic_messages))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
-fn openai_model_id(model: &str) -> String {
-    format!("codex-oauth:{}", model)
-}
-
-fn is_known_codex_model(model: &str) -> bool {
-    static CATALOG: OnceLock<Value> = OnceLock::new();
-    CATALOG
-        .get_or_init(|| {
-            serde_json::from_str(include_str!("model-capabilities.json"))
-                .expect("embedded model-capabilities.json must be valid")
-        })
-        .get("models")
-        .and_then(Value::as_object)
-        .is_some_and(|models| models.contains_key(model))
-}
-
 fn request_messages_to_internal(messages: &[ChatMessage]) -> Result<Vec<Message>, ProviderError> {
+    if messages.is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "messages must be a non-empty array".to_string(),
+        ));
+    }
     let mut result = Vec::new();
     for (message_index, msg) in messages.iter().enumerate() {
-        let role = map_role(&msg.role);
+        let role = map_role(&msg.role)?;
+        if msg.name.is_some() {
+            return Err(ProviderError::InvalidRequest(format!(
+                "messages item {message_index} name is not supported"
+            )));
+        }
         let (content, structured_content) = normalize_content(&msg.content, role, message_index)?;
-        let tool_calls = parse_tool_calls(&msg.tool_calls);
-        let m = Message {
-            role,
-            content,
-            tool_calls,
-            tool_call_id: msg.tool_call_id.clone(),
-            name: msg.name.clone(),
-            reasoning_content: None,
-            images: vec![],
-            structured_content,
-        };
+        let tool_calls = parse_tool_calls(&msg.tool_calls, message_index)?;
+        if msg.content.is_none() && role != MessageRole::Assistant {
+            return Err(ProviderError::InvalidRequest(format!(
+                "messages item {message_index} requires content"
+            )));
+        }
+        let mut m = Message::new(role, content, tool_calls, msg.tool_call_id.clone(), None)
+            .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+        m.structured_content = structured_content;
         result.push(m);
     }
     Ok(result)
 }
 
-fn map_role(role: &str) -> MessageRole {
-    match role.to_lowercase().as_str() {
-        "system" => MessageRole::System,
-        "assistant" => MessageRole::Assistant,
-        "tool" => MessageRole::Tool,
-        _ => MessageRole::User,
+fn map_role(role: &str) -> Result<MessageRole, ProviderError> {
+    match role {
+        "system" => Ok(MessageRole::System),
+        "developer" => Ok(MessageRole::Developer),
+        "user" => Ok(MessageRole::User),
+        "assistant" => Ok(MessageRole::Assistant),
+        "tool" => Ok(MessageRole::Tool),
+        _ => Err(ProviderError::InvalidRequest(format!(
+            "unsupported message role {role:?}"
+        ))),
     }
 }
 
@@ -280,6 +1030,18 @@ fn normalize_content(
                 }
                 match block_type {
                     "text" | "input_text" | "output_text" => {
+                        if (block_type == "output_text" && role != MessageRole::Assistant)
+                            || (block_type == "input_text" && role == MessageRole::Assistant)
+                        {
+                            return Err(ProviderError::InvalidRequest(format!(
+                                "messages item {message_index} content item {block_index} type {block_type:?} is not valid for role {role:?}"
+                            )));
+                        }
+                        reject_unknown_object_fields(
+                            object,
+                            &format!("messages item {message_index} content item {block_index}"),
+                            &["type", "text", "prompt_cache_breakpoint"],
+                        )?;
                         let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
                             ProviderError::InvalidRequest(format!(
                                 "messages item {message_index} content item {block_index} requires string text"
@@ -307,6 +1069,11 @@ fn normalize_content(
                         }
                     }
                     "image_url" | "input_image" => {
+                        reject_unknown_object_fields(
+                            object,
+                            &format!("messages item {message_index} content item {block_index}"),
+                            &["type", "image_url", "detail", "prompt_cache_breakpoint"],
+                        )?;
                         if role != MessageRole::User {
                             return Err(ProviderError::InvalidRequest(
                                 "image_url content is supported only on user messages".to_string(),
@@ -325,7 +1092,62 @@ fn normalize_content(
                         }
                         blocks.push(Value::Object(normalized));
                     }
-                    "file" | "input_file" | "audio" | "input_audio" => {
+                    "input_audio" => {
+                        reject_unknown_object_fields(
+                            object,
+                            &format!("messages item {message_index} content item {block_index}"),
+                            &["type", "input_audio", "prompt_cache_breakpoint"],
+                        )?;
+                        if role != MessageRole::User {
+                            return Err(ProviderError::InvalidRequest(
+                                "input_audio content is supported only on user messages"
+                                    .to_string(),
+                            ));
+                        }
+                        let input_audio = object
+                            .get("input_audio")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                ProviderError::InvalidRequest(format!(
+                                    "messages item {message_index} content item {block_index} input_audio must be an object"
+                                ))
+                            })?;
+                        reject_unknown_object_fields(
+                            input_audio,
+                            &format!(
+                                "messages item {message_index} content item {block_index} input_audio"
+                            ),
+                            &["data", "format"],
+                        )?;
+                        let data = input_audio
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ProviderError::InvalidRequest(format!(
+                                    "messages item {message_index} content item {block_index} input_audio.data must be a string"
+                                ))
+                            })?;
+                        let audio_format = input_audio
+                            .get("format")
+                            .and_then(Value::as_str)
+                            .filter(|value| matches!(*value, "wav" | "mp3"))
+                            .ok_or_else(|| {
+                                ProviderError::InvalidRequest(format!(
+                                    "messages item {message_index} content item {block_index} input_audio.format must be wav or mp3"
+                                ))
+                            })?;
+                        let mut normalized = serde_json::Map::new();
+                        normalized.insert("type".to_string(), json!("input_audio"));
+                        normalized.insert(
+                            "audio_url".to_string(),
+                            Value::String(format!("data:audio/{audio_format};base64,{data}")),
+                        );
+                        if let Some(value) = breakpoint {
+                            normalized.insert("prompt_cache_breakpoint".to_string(), value);
+                        }
+                        blocks.push(Value::Object(normalized));
+                    }
+                    "file" | "input_file" | "audio" => {
                         return Err(ProviderError::InvalidRequest(format!(
                             "messages content type {block_type} is not supported"
                         )));
@@ -337,7 +1159,7 @@ fn normalize_content(
                     }
                 }
             }
-            Ok((text_parts.join(""), (!blocks.is_empty()).then_some(blocks)))
+            Ok((text_parts.join(""), Some(blocks)))
         }
         Some(_) => Err(ProviderError::InvalidRequest(
             "message content must be a string or an array".to_string(),
@@ -379,15 +1201,40 @@ fn parse_image_url_block(
     })?;
     let (url, detail_value) = match image_url {
         Value::String(url) => (url.clone(), object.get("detail")),
-        Value::Object(image) => (
-            image
+        Value::Object(image) => {
+            reject_unknown_object_fields(
+                image,
+                &format!("messages item {message_index} content item {block_index} image_url"),
+                &["url", "detail"],
+            )?;
+            if image.get("detail") == Some(&Value::Null) {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "messages item {message_index} content item {block_index} image_url.detail must not be null"
+                )));
+            }
+            let url = image
                 .get("url")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            image.get("detail").or_else(|| object.get("detail")),
-        ),
-        _ => (String::new(), None),
+                .ok_or_else(|| {
+                    ProviderError::InvalidRequest(format!(
+                        "messages item {message_index} content item {block_index} image_url.url must be a string"
+                    ))
+                })?
+                .to_string();
+            let nested_detail = image.get("detail").filter(|value| !value.is_null());
+            let outer_detail = object.get("detail").filter(|value| !value.is_null());
+            if nested_detail.is_some() && outer_detail.is_some() && nested_detail != outer_detail {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "messages item {message_index} content item {block_index} image detail fields conflict"
+                )));
+            }
+            (url, nested_detail.or(outer_detail))
+        }
+        _ => {
+            return Err(ProviderError::InvalidRequest(format!(
+                "messages item {message_index} content item {block_index} image_url must be a string or object"
+            )));
+        }
     };
     let detail = match detail_value {
         None | Some(Value::Null) => None,
@@ -414,58 +1261,53 @@ fn parse_image_url_block(
     Ok((url, detail))
 }
 
-fn parse_tool_calls(raw: &Option<Vec<Value>>) -> Vec<ToolCall> {
+fn parse_tool_calls(
+    raw: &Option<Vec<Value>>,
+    message_index: usize,
+) -> Result<Vec<ToolCall>, ProviderError> {
     let items = match raw {
         Some(v) => v,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
     let mut calls = Vec::new();
-    for item in items {
-        let obj = match item.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
+    for (call_index, item) in items.iter().enumerate() {
+        let path = format!("messages item {message_index} tool_calls item {call_index}");
+        let obj = item
+            .as_object()
+            .ok_or_else(|| ProviderError::InvalidRequest(format!("{path} must be an object")))?;
+        reject_unknown_object_fields(obj, &path, &["type", "id", "function"])?;
+        if obj.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{path}.type must be function"
+            )));
+        }
         let call_id = obj
             .get("id")
-            .or_else(|| obj.get("call_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-
-        let func = obj.get("function").and_then(|v| v.as_object());
-        let name = func
-            .and_then(|f| f.get("name"))
-            .or_else(|| obj.get("name"))
-            .and_then(|v| v.as_str());
-        let args_raw = func
-            .and_then(|f| f.get("arguments"))
-            .or_else(|| obj.get("arguments"));
-
-        let parsed: HashMap<String, Value> = match args_raw {
-            Some(Value::String(s)) => {
-                if s.is_empty() {
-                    HashMap::new()
-                } else {
-                    serde_json::from_str(s).unwrap_or_else(|_| {
-                        let mut m = HashMap::new();
-                        m.insert("input".to_string(), Value::String(s.clone()));
-                        m
-                    })
-                }
-            }
-            Some(Value::Object(map)) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            _ => HashMap::new(),
-        };
-
-        if let Some(n) = name {
-            calls.push(ToolCall {
-                id: call_id,
-                name: n.to_string(),
-                arguments: parsed,
-            });
-        }
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::InvalidRequest(format!("{path}.id is required")))?
+            .to_string();
+        let func = obj
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| ProviderError::InvalidRequest(format!("{path}.function is required")))?;
+        reject_unknown_object_fields(func, &format!("{path}.function"), &["name", "arguments"])?;
+        let name = func.get("name").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::InvalidRequest(format!("{path}.function.name must be a string"))
+        })?;
+        let arguments = func
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest(format!("{path}.function.arguments must be a string"))
+            })?
+            .to_string();
+        calls.push(ToolCall {
+            id: call_id,
+            name: name.to_string(),
+            arguments,
+        });
     }
-    calls
+    Ok(calls)
 }
 
 fn parse_tools(raw: &Option<Vec<Value>>) -> Result<Option<Vec<ToolSchema>>, ProviderError> {
@@ -489,37 +1331,94 @@ fn parse_tools(raw: &Option<Vec<Value>>) -> Result<Option<Vec<ToolSchema>>, Prov
                     .to_string(),
             ));
         }
+        if obj.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(ProviderError::InvalidRequest(
+                "tools entries must have type function".to_string(),
+            ));
+        }
+        if let Some(field) = obj.keys().find(|field| {
+            !matches!(
+                field.as_str(),
+                "type"
+                    | "function"
+                    | "allowed_callers"
+                    | "output_schema"
+                    | "defer_loading"
+                    | "eager_input_streaming"
+            )
+        }) {
+            return Err(ProviderError::InvalidRequest(format!(
+                "unsupported tool field {field:?}"
+            )));
+        }
         let func = obj
             .get("function")
-            .and_then(|v| v.as_object())
-            .unwrap_or(obj);
-        if obj.contains_key("allowed_callers") || func.contains_key("allowed_callers") {
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest("tools entries require a function object".to_string())
+            })?;
+        if let Some(field) = func.keys().find(|field| {
+            !matches!(
+                field.as_str(),
+                "name"
+                    | "description"
+                    | "parameters"
+                    | "strict"
+                    | "allowed_callers"
+                    | "output_schema"
+                    | "defer_loading"
+                    | "eager_input_streaming"
+            )
+        }) {
+            return Err(ProviderError::InvalidRequest(format!(
+                "unsupported tool function field {field:?}"
+            )));
+        }
+        let name = func
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ProviderError::InvalidRequest("tool function name is required".to_string())
+            })?;
+        let description = match func.get("description") {
+            None => None,
+            Some(Value::Null) => {
+                return Err(ProviderError::InvalidRequest(
+                    "tool function description must not be null".to_string(),
+                ));
+            }
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(ProviderError::InvalidRequest(
+                    "tool function description must be a string when provided".to_string(),
+                ));
+            }
+        };
+        let params = func
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if !params.is_object() {
             return Err(ProviderError::InvalidRequest(
-                "tool allowed_callers is not supported by the Chat Completions facade".to_string(),
+                "tool function parameters must be an object".to_string(),
             ));
         }
-        if obj.contains_key("output_schema") || func.contains_key("output_schema") {
-            return Err(ProviderError::InvalidRequest(
-                "tool output_schema is not supported by the Chat Completions facade".to_string(),
-            ));
-        }
-        let name = func.get("name").and_then(|v| v.as_str());
-        let desc = func
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let params = func.get("parameters").cloned().unwrap_or(json!({}));
-        if let Some(n) = name {
-            schemas.push(ToolSchema {
-                name: n.to_string(),
-                description: desc.to_string(),
-                parameters: if params.is_object() {
-                    params
-                } else {
-                    json!({})
-                },
-            });
-        }
+        let strict = match func.get("strict") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(ProviderError::InvalidRequest(
+                    "tool function strict must be a boolean when provided".to_string(),
+                ));
+            }
+        };
+        schemas.push(ToolSchema {
+            name: name.to_string(),
+            description,
+            parameters: params,
+            strict,
+        });
     }
     Ok(if schemas.is_empty() {
         None
@@ -528,66 +1427,253 @@ fn parse_tools(raw: &Option<Vec<Value>>) -> Result<Option<Vec<ToolSchema>>, Prov
     })
 }
 
-fn max_tokens_from_request(req: &ChatCompletionRequest) -> Option<i64> {
-    req.max_completion_tokens.or(req.max_tokens)
-}
-
-fn context_window_for_model(state: &AppState, model: &str) -> i64 {
-    let capability = capability_for_model(model);
-    if let Some(configured) = state.codex_config.model_context_window {
-        return capability
-            .max_context_window
-            .map_or(configured, |maximum| configured.min(maximum));
+fn reject_unsupported_openai_controls(req: &ChatCompletionRequest) -> Result<(), ProviderError> {
+    for (name, present) in [
+        ("temperature", req.temperature.is_some()),
+        ("max_tokens", req.max_tokens.is_some()),
+        ("max_completion_tokens", req.max_completion_tokens.is_some()),
+        (
+            "stop",
+            req.stop.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        ("top_p", req.top_p.is_some()),
+        ("frequency_penalty", req.frequency_penalty.is_some()),
+        ("presence_penalty", req.presence_penalty.is_some()),
+        ("user", req.user.is_some()),
+        ("n", req.n.as_ref().is_some_and(|value| !value.is_null())),
+        (
+            "logprobs",
+            req.logprobs.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "top_logprobs",
+            req.top_logprobs
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "logit_bias",
+            req.logit_bias
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "seed",
+            req.seed.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "response_format",
+            req.response_format
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "stream_options",
+            req.stream_options
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "modalities",
+            req.modalities
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "audio",
+            req.audio.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "store",
+            req.store.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "metadata",
+            req.metadata.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "prediction",
+            req.prediction
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "function_call",
+            req.function_call
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "functions",
+            req.functions.as_ref().is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "prompt_cache_retention",
+            req.prompt_cache_retention
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+        (
+            "web_search_options",
+            req.web_search_options
+                .as_ref()
+                .is_some_and(|value| !value.is_null()),
+        ),
+    ] {
+        if present {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{name} is not supported by the Codex OAuth HTTP transport"
+            )));
+        }
     }
-    capability.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)
+    Ok(())
 }
 
-fn context_window(state: &AppState) -> i64 {
-    context_window_for_model(state, &state.model)
-}
-
-fn auto_compact_token_limit_for_model(state: &AppState, model: &str) -> i64 {
-    let context_window = context_window_for_model(state, model);
-    if let Some(limit) = state.codex_config.model_auto_compact_token_limit {
-        return limit.min((context_window * 9) / 10);
+fn parse_openai_tool_choice(value: Option<&Value>) -> Result<Option<Value>, ProviderError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if let Some(choice) = value.as_str() {
+        if matches!(choice, "auto" | "none" | "required") {
+            return Ok(Some(Value::String(choice.to_string())));
+        }
+        return Err(ProviderError::InvalidRequest(
+            "tool_choice must be one of: auto, none, required, or a function choice object"
+                .to_string(),
+        ));
     }
-
-    let catalog_context = capability_for_model(model).context_window;
-    if state.codex_config.model_context_window.is_some() || catalog_context.is_some() {
-        (context_window * 9) / 10
-    } else {
-        (DEFAULT_CONTEXT_WINDOW * 8) / 10
+    let object = value.as_object().ok_or_else(|| {
+        ProviderError::InvalidRequest("tool_choice must be a string or object".to_string())
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !matches!(field.as_str(), "type" | "function"))
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "tool_choice.{field} is not supported"
+        )));
     }
+    if object.get("type").and_then(Value::as_str) != Some("function") {
+        return Err(ProviderError::InvalidRequest(
+            "tool_choice.type must be function".to_string(),
+        ));
+    }
+    let function = object
+        .get("function")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ProviderError::InvalidRequest("tool_choice.function must be an object".to_string())
+        })?;
+    if let Some(field) = function.keys().find(|field| field.as_str() != "name") {
+        return Err(ProviderError::InvalidRequest(format!(
+            "tool_choice.function.{field} is not supported"
+        )));
+    }
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            ProviderError::InvalidRequest(
+                "tool_choice.function.name must be a non-empty string".to_string(),
+            )
+        })?;
+    Ok(Some(json!({"type": "function", "name": name})))
 }
 
-fn auto_compact_token_limit(state: &AppState) -> i64 {
-    auto_compact_token_limit_for_model(state, &state.model)
+fn reject_unsupported_anthropic_controls(body: &Value) -> Result<(), ProviderError> {
+    for field in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop_sequences",
+        "parallel_tool_calls",
+    ] {
+        if body.get(field).is_some() {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{field} is not supported by the Codex OAuth HTTP transport"
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn effective_reasoning_effort(
+fn raw_context_window_for_model(
     state: &AppState,
-    requested: Option<&str>,
-    model: &str,
-) -> Option<String> {
-    requested
-        .map(|effort| effort.to_string())
-        .or_else(|| state.codex_config.model_reasoning_effort.clone())
-        .or_else(|| capability_for_model(model).default_reasoning_effort)
+    model: &ModelInfo,
+) -> Result<Option<i64>, ProviderError> {
+    let resolved = if let Some(configured) = state.codex_config.model_context_window {
+        if model.max_context_window.is_some_and(|maximum| maximum <= 0) {
+            return Err(ProviderError::CatalogUnavailable(format!(
+                "model {} reports a non-positive max context window",
+                model.slug
+            )));
+        }
+        Some(
+            model
+                .max_context_window
+                .map(|maximum| configured.min(maximum))
+                .unwrap_or(configured),
+        )
+    } else {
+        model.resolved_context_window()
+    };
+    if resolved.is_some_and(|value| value <= 0) {
+        return Err(ProviderError::CatalogUnavailable(format!(
+            "model {} reports a non-positive context window",
+            model.slug
+        )));
+    }
+    Ok(resolved)
+}
+
+fn context_window_for_model(
+    state: &AppState,
+    model: &ModelInfo,
+) -> Result<Option<i64>, ProviderError> {
+    let Some(resolved) = raw_context_window_for_model(state, model)? else {
+        return Ok(None);
+    };
+    let effective = resolved.saturating_mul(model.effective_context_window_percent) / 100;
+    if effective <= 0 || effective > 9_007_199_254_740_991 {
+        return Err(ProviderError::CatalogUnavailable(format!(
+            "model {} reports an unusable effective context window",
+            model.slug
+        )));
+    }
+    Ok(Some(effective))
+}
+
+fn auto_compact_token_limit_for_model(
+    state: &AppState,
+    model: &ModelInfo,
+) -> Result<Option<i64>, ProviderError> {
+    let context_window = raw_context_window_for_model(state, model)?;
+    let maximum = context_window.map(|value| value.saturating_mul(9) / 10);
+    if let Some(limit) = state.codex_config.model_auto_compact_token_limit {
+        return Ok(Some(
+            maximum.map(|maximum| limit.min(maximum)).unwrap_or(limit),
+        ));
+    }
+    Ok(match (model.auto_compact_token_limit, maximum) {
+        (Some(limit), Some(maximum)) => Some(limit.min(maximum)),
+        (Some(limit), None) => Some(limit),
+        (None, maximum) => maximum,
+    })
 }
 
 fn effective_reasoning_effort_with_options(
     state: &AppState,
     requested: Option<&str>,
     reasoning: Option<&Value>,
-    model: &str,
+    model: &ModelInfo,
 ) -> Result<Option<String>, ProviderError> {
-    if requested.is_some_and(str::is_empty) {
+    if requested.is_some_and(|value| value.is_empty() || value != value.trim()) {
         return Err(ProviderError::InvalidRequest(
             "reasoning_effort must be a non-empty string when provided".to_string(),
         ));
     }
     let mut nested_effort: Option<&str> = None;
-    let mut explicit_mode = false;
     if let Some(reasoning) = reasoning {
         let object = reasoning.as_object().ok_or_else(|| {
             ProviderError::InvalidRequest("reasoning must be an object".to_string())
@@ -597,7 +1683,7 @@ fn effective_reasoning_effort_with_options(
                 nested_effort = Some(
                     value
                         .as_str()
-                        .filter(|value| !value.is_empty())
+                        .filter(|value| !value.is_empty() && *value == value.trim())
                         .ok_or_else(|| {
                             ProviderError::InvalidRequest(
                                 "reasoning.effort must be a non-empty string when provided"
@@ -607,21 +1693,10 @@ fn effective_reasoning_effort_with_options(
                 );
             }
         }
-        if let Some(value) = object.get("mode").filter(|value| !value.is_null()) {
-            match value.as_str() {
-                Some("standard") => explicit_mode = true,
-                Some("pro") => {
-                    return Err(ProviderError::InvalidRequest(
-                        "reasoning.mode pro is not supported by the Codex OAuth HTTP transport"
-                            .to_string(),
-                    ));
-                }
-                _ => {
-                    return Err(ProviderError::InvalidRequest(
-                        "reasoning.mode must be one of: standard, pro".to_string(),
-                    ));
-                }
-            }
+        if object.get("mode").is_some_and(|value| !value.is_null()) {
+            return Err(ProviderError::InvalidRequest(
+                "reasoning.mode is not supported by the Codex OAuth HTTP transport".to_string(),
+            ));
         }
     }
     if let (Some(top_level), Some(nested)) = (requested, nested_effort) {
@@ -631,12 +1706,30 @@ fn effective_reasoning_effort_with_options(
             ));
         }
     }
-    Ok(requested
+    let configured = (requested.is_none() && nested_effort.is_none())
+        .then_some(state.codex_config.model_reasoning_effort.as_deref())
+        .flatten();
+    if configured.is_some_and(|value| value.is_empty() || value != value.trim()) {
+        return Err(ProviderError::Request(
+            "configured reasoning_effort is invalid".to_string(),
+        ));
+    }
+    let selected = requested
         .or(nested_effort)
         .map(str::to_string)
-        .or_else(|| state.codex_config.model_reasoning_effort.clone())
-        .or_else(|| explicit_mode.then(|| "medium".to_string()))
-        .or_else(|| capability_for_model(model).default_reasoning_effort))
+        .or_else(|| configured.map(str::to_string))
+        .or_else(|| model.default_reasoning_level.clone());
+    let explicit = requested.is_some() || nested_effort.is_some();
+    match selected.map(|effort| resolve_reasoning_effort(model, &effort)) {
+        Some(Err(_)) if configured.is_some() => Err(ProviderError::Request(
+            "configured reasoning_effort is not supported by the live model".to_string(),
+        )),
+        Some(Err(_)) if !explicit => Err(ProviderError::CatalogUnavailable(
+            "selected model publishes an unsupported default reasoning effort".to_string(),
+        )),
+        Some(result) => result.map(Some),
+        None => Ok(None),
+    }
 }
 
 fn generation_controls(
@@ -665,7 +1758,7 @@ fn generation_controls(
         ));
     }
     Ok(GenerationControls {
-        reasoning,
+        reasoning: reasoning.clone(),
         safety_identifier: None,
         prompt_cache_options: None,
         verbosity,
@@ -682,6 +1775,72 @@ fn optional_string_field(body: &Value, field: &str) -> Result<Option<String>, Pr
     }
 }
 
+fn optional_header_string(
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<Option<String>, ProviderError> {
+    headers
+        .get(name)
+        .map(|value| {
+            let value = value.to_str().map_err(|_| {
+                ProviderError::InvalidRequest(format!("{name} must be valid UTF-8"))
+            })?;
+            if value.trim().is_empty() {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "{name} must be non-empty when provided"
+                )));
+            }
+            Ok(value.to_string())
+        })
+        .transpose()
+}
+
+fn merge_optional_nonempty_string(
+    body_value: Option<String>,
+    header_value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, ProviderError> {
+    if body_value
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ProviderError::InvalidRequest(format!(
+            "{field} must be non-empty when provided"
+        )));
+    }
+    if matches!((&body_value, &header_value), (Some(body), Some(header)) if body != header) {
+        return Err(ProviderError::InvalidRequest(format!(
+            "{field} conflicts with its request header"
+        )));
+    }
+    Ok(body_value.or(header_value))
+}
+
+fn merge_optional_bool(
+    body_value: Option<bool>,
+    header_value: Option<bool>,
+    field: &str,
+) -> Result<Option<bool>, ProviderError> {
+    if matches!((body_value, header_value), (Some(body), Some(header)) if body != header) {
+        return Err(ProviderError::InvalidRequest(format!(
+            "{field} conflicts with its request header"
+        )));
+    }
+    Ok(body_value.or(header_value))
+}
+
+fn optional_header_bool(headers: &HeaderMap, name: &str) -> Result<Option<bool>, ProviderError> {
+    optional_header_string(headers, name)?
+        .map(|value| match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ProviderError::InvalidRequest(format!(
+                "{name} must be exactly true or false"
+            ))),
+        })
+        .transpose()
+}
+
 fn anthropic_prompt_cache_key(
     body: &Value,
     headers: &HeaderMap,
@@ -695,17 +1854,9 @@ fn anthropic_prompt_cache_key(
         return Ok(Some(explicit));
     }
 
-    let Some(header) = headers.get("x-claude-code-session-id") else {
+    let Some(session_id) = claude_code_session_id(headers)? else {
         return Ok(None);
     };
-    let session_id = header.to_str().map_err(|_| {
-        ProviderError::InvalidRequest("x-claude-code-session-id must be valid UTF-8".to_string())
-    })?;
-    if session_id.trim().is_empty() {
-        return Err(ProviderError::InvalidRequest(
-            "x-claude-code-session-id must be a non-empty string".to_string(),
-        ));
-    }
 
     let digest =
         Sha256::digest(format!("codex-as-api:claude-code-session:{session_id}").as_bytes());
@@ -714,6 +1865,42 @@ fn anthropic_prompt_cache_key(
         write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(Some(key))
+}
+
+fn claude_code_session_id(headers: &HeaderMap) -> Result<Option<String>, ProviderError> {
+    let mut values = headers.get_all("x-claude-code-session-id").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ProviderError::InvalidRequest(
+            "x-claude-code-session-id must be provided at most once".to_string(),
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        ProviderError::InvalidRequest("x-claude-code-session-id must be valid UTF-8".to_string())
+    })?;
+    if value.trim().is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "x-claude-code-session-id must be a non-empty string".to_string(),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validate_anthropic_compatibility_scope(
+    body: &Value,
+    headers: &HeaderMap,
+) -> Result<bool, ProviderError> {
+    let is_claude_code = claude_code_session_id(headers)?.is_some();
+    validate_anthropic_cache_controls(body, is_claude_code)
+        .map_err(ProviderError::InvalidRequest)?;
+    if body.get("max_tokens").is_some_and(|value| !value.is_null()) && !is_claude_code {
+        return Err(ProviderError::InvalidRequest(
+            "max_tokens is accepted without forwarding only for Claude Code requests".to_string(),
+        ));
+    }
+    Ok(is_claude_code)
 }
 
 fn validate_anthropic_context_management(body: &Value) -> Result<(), ProviderError> {
@@ -768,20 +1955,40 @@ fn anthropic_service_tier(body: &Value) -> Result<Option<String>, ProviderError>
     Ok(Some(speed_tier.to_string()))
 }
 
-fn reject_unsupported_tool_features(body: &Value) -> Result<(), ProviderError> {
+fn reject_unsupported_proxy_extension_presence(
+    body: &Value,
+    _anthropic: bool,
+) -> Result<(), ProviderError> {
+    for field in [
+        "multi_agent",
+        "programmatic_tool_calling",
+        "safety_identifier",
+    ] {
+        if body.get(field).is_some() {
+            return Err(ProviderError::InvalidRequest(format!(
+                "{field} is not supported by this compatibility API"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_unsupported_tool_features(body: &Value, anthropic: bool) -> Result<(), ProviderError> {
     reject_unsupported_generation_tool_features(
         body.get("tools")
             .and_then(Value::as_array)
             .map(Vec::as_slice),
         body.get("programmatic_tool_calling"),
+        anthropic,
     )
 }
 
 fn reject_unsupported_generation_tool_features(
     tools: Option<&[Value]>,
     programmatic_tool_calling: Option<&Value>,
+    anthropic: bool,
 ) -> Result<(), ProviderError> {
-    if programmatic_tool_calling.is_some_and(|value| !value.is_null()) {
+    if programmatic_tool_calling.is_some() {
         return Err(ProviderError::InvalidRequest(
             "programmatic_tool_calling is not supported by this compatibility API".to_string(),
         ));
@@ -790,9 +1997,9 @@ fn reject_unsupported_generation_tool_features(
         return Ok(());
     };
     for tool in tools {
-        let Some(object) = tool.as_object() else {
-            continue;
-        };
+        let object = tool.as_object().ok_or_else(|| {
+            ProviderError::InvalidRequest("tools entries must be objects".to_string())
+        })?;
         let function = object
             .get("function")
             .and_then(Value::as_object)
@@ -812,6 +2019,24 @@ fn reject_unsupported_generation_tool_features(
             return Err(ProviderError::InvalidRequest(
                 "programmatic tool output_schema is not supported".to_string(),
             ));
+        }
+        for field in ["defer_loading", "eager_input_streaming"] {
+            for container in [object, function] {
+                match container.get(field) {
+                    None => {}
+                    Some(Value::Null) if anthropic && field == "eager_input_streaming" => {}
+                    Some(Value::Bool(_)) => {
+                        return Err(ProviderError::InvalidRequest(format!(
+                            "tool {field} is not supported by the Codex OAuth backend"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::InvalidRequest(format!(
+                            "tool {field} must be a boolean when provided"
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -833,6 +2058,7 @@ fn estimate_input_tokens(messages: &[Message], tools: Option<&[ToolSchema]>) -> 
     for message in messages {
         let role = match message.role {
             MessageRole::System => "system",
+            MessageRole::Developer => "developer",
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::Tool => "tool",
@@ -871,31 +2097,43 @@ fn estimate_input_tokens(messages: &[Message], tools: Option<&[ToolSchema]>) -> 
     std::cmp::max(1, (text_tokens + image_tokens) as i64)
 }
 
+type CompactRequestParts = (
+    Vec<Message>,
+    Option<Vec<ToolSchema>>,
+    Option<String>,
+    Option<Value>,
+    Option<bool>,
+);
+
 fn messages_from_compact_body(
     body: &Value,
     force_anthropic: bool,
-) -> Result<
-    (
-        Vec<Message>,
-        Option<Vec<ToolSchema>>,
-        Option<String>,
-        Option<Value>,
-    ),
-    ProviderError,
-> {
+) -> Result<CompactRequestParts, ProviderError> {
     if force_anthropic
         || body.get("system").is_some()
         || body.get("thinking").is_some()
         || body.get("tool_choice").is_some()
         || body.get("stop_sequences").is_some()
     {
-        let (messages, tools, _tool_choice, _stop, reasoning_effort, text) =
+        let (messages, tools, tool_choice, _stop, reasoning_effort, text, parallel_tool_calls) =
             anthropic_request_to_internal(body).map_err(ProviderError::InvalidRequest)?;
-        return Ok((messages, tools, reasoning_effort, text));
+        if tool_choice
+            .as_ref()
+            .is_some_and(|choice| choice != &json!("auto"))
+        {
+            return Err(ProviderError::InvalidRequest(
+                "compact supports only Anthropic tool_choice.type=auto".to_string(),
+            ));
+        }
+        return Ok((messages, tools, reasoning_effort, text, parallel_tool_calls));
     }
 
     let raw_items = match body.get("messages") {
-        None | Some(Value::Null) => &[][..],
+        None | Some(Value::Null) => {
+            return Err(ProviderError::InvalidRequest(
+                "messages must be a non-empty array".to_string(),
+            ));
+        }
         Some(Value::Array(items)) => items.as_slice(),
         Some(_) => {
             return Err(ProviderError::InvalidRequest(
@@ -903,6 +2141,11 @@ fn messages_from_compact_body(
             ));
         }
     };
+    if raw_items.is_empty() {
+        return Err(ProviderError::InvalidRequest(
+            "messages must be a non-empty array".to_string(),
+        ));
+    }
     let raw_messages: Vec<ChatMessage> = raw_items
         .iter()
         .enumerate()
@@ -924,6 +2167,7 @@ fn messages_from_compact_body(
     Ok((
         request_messages_to_internal(&raw_messages)?,
         parse_tools(&raw_tools)?,
+        None,
         None,
         None,
     ))
@@ -966,69 +2210,350 @@ fn merge_anthropic_compact_text(
     Ok((direct_present || !merged.is_empty()).then_some(Value::Object(merged)))
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<Value>, axum::response::Response> {
-    let auth_available = auth::is_auth_locally_available(state.auth_path.as_deref());
-    let reasoning_effort = effective_reasoning_effort(&state, None, &state.model);
-    if reasoning_effort.as_deref() == Some("") {
-        let error = ProviderError::Request(
-            "reasoning_effort must be a non-empty string when provided".to_string(),
-        );
-        return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+async fn resolve_route_model(
+    state: &AppState,
+    requested: Option<String>,
+) -> Result<ResolvedModel, axum::response::Response> {
+    resolve_route_model_typed(state, requested)
+        .await
+        .map_err(|error| provider_error_response(&error))
+}
+
+async fn resolve_route_model_typed(
+    state: &AppState,
+    requested: Option<String>,
+) -> Result<ResolvedModel, ProviderError> {
+    let provider = state.provider.clone();
+    task::spawn_blocking(move || match requested {
+        Some(model) => provider.resolve_model(Some(&model)),
+        None => provider.configured_or_default_model(),
+    })
+    .await
+    .map_err(|error| ProviderError::Request(format!("blocking provider task failed: {error}")))?
+}
+
+async fn resolve_anthropic_route_model(
+    state: &AppState,
+    requested: &str,
+) -> Result<ResolvedModel, ProviderError> {
+    if requested.trim().is_empty() || requested != requested.trim() {
+        return Err(ProviderError::InvalidRequest(
+            "model must be a non-empty string without surrounding whitespace".to_string(),
+        ));
     }
-    Ok(Json(json!({
+    let provider = state.provider.clone();
+    let requested = requested.to_string();
+    task::spawn_blocking(move || {
+        if requested.starts_with("claude-") {
+            if provider.model.trim().is_empty() {
+                return Err(ProviderError::InvalidRequest(
+                    "claude-* model facades require CODEX_AS_API_MODEL or config.toml model"
+                        .to_string(),
+                ));
+            }
+            let snapshot = provider.model_catalog_snapshot()?;
+            provider.configured_or_default_model_from_snapshot(snapshot)
+        } else {
+            provider.resolve_model(Some(&requested))
+        }
+    })
+    .await
+    .map_err(|error| ProviderError::Request(format!("blocking provider task failed: {error}")))?
+}
+
+async fn models(State(state): State<AppState>) -> axum::response::Response {
+    let provider = state.provider.clone();
+    let snapshot = match task::spawn_blocking(move || provider.model_catalog_snapshot()).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => return provider_error_response(&error),
+        Err(error) => return join_error_response(error),
+    };
+    let data: Vec<Value> = snapshot
+        .models
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model.slug,
+                "object": "model",
+                "owned_by": "openai",
+                "display_name": model.display_name,
+                "description": model.description,
+                "priority": model.priority,
+                "visibility": model.visibility,
+                "supported_in_api": model.supported_in_api,
+                "default_reasoning_level": model.default_reasoning_level,
+                "supported_reasoning_levels": model.supported_reasoning_levels,
+                "multi_agent_reasoning_effort": model.multi_agent_reasoning_effort,
+                "supports_reasoning_summary_parameter": model.supports_reasoning_summary_parameter,
+                "default_reasoning_summary": model.default_reasoning_summary,
+                "comp_hash": model.comp_hash,
+                "service_tiers": model.service_tiers,
+                "default_service_tier": model.default_service_tier,
+                "support_verbosity": model.support_verbosity,
+                "default_verbosity": model.default_verbosity,
+                "supports_image_detail_original": model.supports_image_detail_original,
+                "context_window": model.context_window,
+                "max_context_window": model.max_context_window,
+                "auto_compact_token_limit": model.auto_compact_token_limit,
+                "effective_context_window_percent": model.effective_context_window_percent,
+                "input_modalities": model.input_modalities,
+                "use_responses_lite": model.use_responses_lite,
+            })
+        })
+        .collect();
+    Json(json!({"object": "list", "data": data})).into_response()
+}
+
+async fn health(State(state): State<AppState>) -> axum::response::Response {
+    let auth_available = auth::is_auth_locally_available(state.auth_path.as_deref());
+    let provider = state.provider.clone();
+    let snapshot = match task::spawn_blocking(move || provider.model_catalog_snapshot()).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            let auth_available = auth_available && !matches!(error, ProviderError::Auth(_));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "unavailable",
+                    "catalog_fetched_at": null,
+                    "catalog_expires_at": null,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": provider_error_type(&error),
+                        "message": health_error_message(&error),
+                    },
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "unavailable",
+                    "catalog_fetched_at": null,
+                    "catalog_expires_at": null,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": "server_error",
+                        "message": "health preflight failed",
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+    let provider = state.provider.clone();
+    let diagnostic_snapshot = snapshot.clone();
+    let resolved = match task::spawn_blocking(move || {
+        provider.configured_or_default_model_from_snapshot(snapshot)
+    })
+    .await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "fresh",
+                    "catalog_fetched_at": diagnostic_snapshot.fetched_at,
+                    "catalog_expires_at": diagnostic_snapshot.expires_at,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": provider_error_type(&error),
+                        "message": health_error_message(&error),
+                    },
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "fresh",
+                    "catalog_fetched_at": diagnostic_snapshot.fetched_at,
+                    "catalog_expires_at": diagnostic_snapshot.expires_at,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": "server_error",
+                        "message": "health preflight failed",
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+    let context_window = match context_window_for_model(&state, &resolved.model) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "fresh",
+                    "catalog_fetched_at": resolved.snapshot.fetched_at,
+                    "catalog_expires_at": resolved.snapshot.expires_at,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": provider_error_type(&error),
+                        "message": health_error_message(&error),
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+    let auto_compact_token_limit = match auto_compact_token_limit_for_model(&state, &resolved.model)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "error",
+                    "auth_available": auth_available,
+                    "catalog_status": "fresh",
+                    "catalog_fetched_at": resolved.snapshot.fetched_at,
+                    "catalog_expires_at": resolved.snapshot.expires_at,
+                    "model": null,
+                    "reasoning_effort": null,
+                    "context_window": null,
+                    "auto_compact_token_limit": null,
+                    "error": {
+                        "type": provider_error_type(&error),
+                        "message": health_error_message(&error),
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+    let reasoning_effort =
+        match effective_reasoning_effort_with_options(&state, None, None, &resolved.model) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "error",
+                        "auth_available": auth_available,
+                        "catalog_status": "fresh",
+                        "catalog_fetched_at": resolved.snapshot.fetched_at,
+                        "catalog_expires_at": resolved.snapshot.expires_at,
+                        "model": null,
+                        "reasoning_effort": null,
+                        "context_window": null,
+                        "auto_compact_token_limit": null,
+                        "error": {
+                            "type": provider_error_type(&error),
+                            "message": health_error_message(&error),
+                        },
+                    })),
+                )
+                    .into_response()
+            }
+        };
+    Json(json!({
         "status": "ok",
         "auth_available": auth_available,
-        "model": state.model,
-        "codex_home": state.codex_config.codex_home,
-        "codex_config_path": state.codex_config.config_path,
+        "model": resolved.model.slug,
         "reasoning_effort": reasoning_effort,
-        "context_window": context_window(&state),
-        "auto_compact_token_limit": auto_compact_token_limit(&state),
-    })))
+        "context_window": context_window,
+        "auto_compact_token_limit": auto_compact_token_limit,
+        "catalog_status": "fresh",
+        "catalog_fetched_at": resolved.snapshot.fetched_at,
+        "catalog_expires_at": resolved.snapshot.expires_at,
+    }))
+    .into_response()
 }
 
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<axum::response::Response, axum::response::Response> {
+    let mut body = openai_json(payload)?;
+    reject_unsupported_proxy_extension_presence(&body, false)
+        .map_err(|error| provider_error_response(&error))?;
+    reject_explicit_null_fields(
+        &body,
+        &[
+            "messages",
+            "model",
+            "function_call",
+            "functions",
+            "parallel_tool_calls",
+            "prompt_cache_key",
+            "response_format",
+            "safety_identifier",
+            "tool_choice",
+            "tools",
+            "user",
+            "web_search_options",
+        ],
+    )
+    .map_err(|error| provider_error_response(&error))?;
+    validate_openai_chat_message_fields(&body).map_err(|error| provider_error_response(&error))?;
+    normalize_assistant_optional_content(&mut body);
+    let request: ChatCompletionRequest = parse_openai_request(body)?;
+    request
+        .responses_lite
+        .reject_explicit_null("responses_lite")
+        .map_err(|error| provider_error_response(&error))?;
+    let responses_lite = request.responses_lite.value.clone();
+    reject_unsupported_openai_controls(&request)
+        .map_err(|error| provider_error_response(&error))?;
     reject_unsupported_generation_tool_features(
         request.tools.as_deref(),
         request.programmatic_tool_calling.as_ref(),
+        false,
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
-    let messages = request_messages_to_internal(&request.messages).map_err(|error| {
-        error_response(map_error_status(&error), error.to_string()).into_response()
-    })?;
-    let tools = parse_tools(&request.tools).map_err(|error| {
-        error_response(map_error_status(&error), error.to_string()).into_response()
-    })?;
-    let stop = request.stop.as_ref().map(|s| s.to_vec());
-    let max_tokens = max_tokens_from_request(&request);
+    .map_err(|error| provider_error_response(&error))?;
+    let tool_choice = parse_openai_tool_choice(request.tool_choice.as_ref())
+        .map_err(|error| provider_error_response(&error))?;
+    let messages = request_messages_to_internal(&request.messages)
+        .map_err(|error| provider_error_response(&error))?;
+    let tools = parse_tools(&request.tools).map_err(|error| provider_error_response(&error))?;
+    let stop: Option<Vec<String>> = None;
+    let max_tokens = None;
 
-    let subagent = request.subagent.clone().or_else(|| {
-        headers
-            .get("x-openai-subagent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    });
-
-    let memgen_header = headers
-        .get("x-openai-memgen-request")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let memgen_request = request.memgen_request.or_else(|| {
-        memgen_header.map(|h| !matches!(h.to_lowercase().as_str(), "false" | "0" | ""))
-    });
+    let header_subagent = optional_header_string(&headers, "x-openai-subagent")
+        .map_err(|error| provider_error_response(&error))?;
+    let subagent =
+        merge_optional_nonempty_string(request.subagent.clone(), header_subagent, "subagent")
+            .map_err(|error| provider_error_response(&error))?;
+    let header_memgen = optional_header_bool(&headers, "x-openai-memgen-request")
+        .map_err(|error| provider_error_response(&error))?;
+    let memgen_request =
+        merge_optional_bool(request.memgen_request, header_memgen, "memgen_request")
+            .map_err(|error| provider_error_response(&error))?;
 
     let previous_response_id = request.previous_response_id.clone();
-    let reasoning_effort = effective_reasoning_effort_with_options(
-        &state,
-        request.reasoning_effort.as_deref(),
-        request.reasoning.as_ref(),
-        &request.model,
-    )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
     let controls = generation_controls(
         request.reasoning.clone(),
         request.safety_identifier.clone(),
@@ -1036,11 +2561,20 @@ async fn chat_completions(
         request.verbosity.clone(),
         request.multi_agent.as_ref(),
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    .map_err(|error| provider_error_response(&error))?;
+    let resolved = resolve_route_model(&state, request.model.clone()).await?;
+    let request_model = resolved.model.slug.clone();
+    let reasoning_effort = effective_reasoning_effort_with_options(
+        &state,
+        request.reasoning_effort.as_deref(),
+        request.reasoning.as_ref(),
+        &resolved.model,
+    )
+    .map_err(|error| provider_error_response(&error))?;
 
-    if request.stream {
+    if request.stream.unwrap_or(false) {
         let provider = state.provider.clone();
-        let model_id = openai_model_id(&request.model);
+        let model_id = request_model;
         let request_id = format!(
             "chatcmpl-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..24]
@@ -1048,33 +2582,28 @@ async fn chat_completions(
         let created = chrono::Utc::now().timestamp();
         let temperature = request.temperature;
         let prompt_cache_key = request.prompt_cache_key.clone();
-        let request_model = request.model.clone();
-        let tool_choice = request.tool_choice.clone();
-
+        let tool_choice = tool_choice.clone();
         let service_tier = request.service_tier.clone();
         let text = request.text.clone();
         let client_metadata = request.client_metadata.clone();
         let codex_metadata = request.codex_metadata;
-        let responses_lite = request.responses_lite.clone();
+        let responses_lite = responses_lite.clone();
         let parallel_tool_calls = request.parallel_tool_calls;
 
-        let result = task::spawn_blocking(move || {
-            let tools_ref = tools.as_deref();
-            let stop_ref: Option<Vec<String>> = stop;
-            let stop_slice = stop_ref.as_deref();
-
-            provider.chat_stream_with_controls(
+        let provider_for_prepare = provider.clone();
+        let prepared = task::spawn_blocking(move || {
+            provider_for_prepare.prepare_chat_stream_for_resolved_model_with_controls(
                 &messages,
-                tools_ref,
+                tools.as_deref(),
                 temperature,
                 reasoning_effort.as_deref(),
                 max_tokens,
-                stop_slice,
+                stop.as_deref(),
                 prompt_cache_key.as_deref(),
                 subagent.as_deref(),
                 memgen_request,
                 previous_response_id.as_deref(),
-                Some(request_model.as_str()),
+                resolved,
                 tool_choice.as_ref(),
                 service_tier.as_deref(),
                 text.as_ref(),
@@ -1086,202 +2615,96 @@ async fn chat_completions(
             )
         })
         .await
-        .unwrap();
+        .map_err(join_error_response)?;
+        let prepared = prepared.map_err(|error| provider_error_response(&error))?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let prepared = prepared.cancel_when(cancellation.clone());
 
-        let events = match result {
-            Ok(evts) => evts,
-            Err(e) => {
-                let status = map_error_status(&e);
-                return Err(error_response(status, e.to_string()).into_response());
-            }
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Event>(32);
+        let mut stream_state = OpenAiStreamState {
+            request_id,
+            created,
+            model: model_id,
+            tool_call_index: 0,
+            finished: false,
         };
+        sender
+            .send(
+                stream_state
+                    .preamble()
+                    .map_err(|error| provider_error_response(&error))?,
+            )
+            .await
+            .map_err(|error| {
+                provider_error_response(&ProviderError::Request(format!(
+                    "failed to initialize OpenAI SSE stream: {error}"
+                )))
+            })?;
 
-        let mut sse_events: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
-
-        let preamble = json!({
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_id,
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant"},
-                "finish_reason": null,
-            }],
-        });
-        sse_events.push(Ok(
-            Event::default().data(serde_json::to_string(&preamble).unwrap())
-        ));
-
-        let mut usage_dict: Option<Value> = None;
-        let mut final_response_id: Option<Value> = None;
-        let mut tool_call_index: usize = 0;
-
-        for event in &events {
-            let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match typ {
-                "content" => {
-                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let chunk = json!({
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": text},
-                            "finish_reason": null,
-                        }],
-                    });
-                    sse_events.push(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ));
+        let worker_sender = sender.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = task::spawn_blocking(move || {
+            provider.stream_prepared_chat(prepared, |event| {
+                for chunk in stream_state.push(&event)? {
+                    send_sse_event_with_backpressure(
+                        &worker_sender,
+                        chunk,
+                        &worker_cancellation,
+                        "OpenAI SSE client disconnected",
+                    )?;
                 }
-                "reasoning_delta" => {
-                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let chunk = json!({
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"reasoning_content": text},
-                            "finish_reason": null,
-                        }],
-                    });
-                    sse_events.push(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ));
-                }
-                "reasoning_raw_delta" => {
-                    let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let chunk = json!({
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"reasoning": text},
-                            "finish_reason": null,
-                        }],
-                    });
-                    sse_events.push(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ));
-                }
-                "tool_call" => {
-                    let tc = json!({
-                        "index": tool_call_index,
-                        "id": event.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": event.get("name"),
-                            "arguments": serde_json::to_string(
-                                event.get("arguments").unwrap_or(&json!({}))
-                            ).unwrap_or_else(|_| "{}".to_string()),
-                        },
-                    });
-                    let chunk = json!({
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"tool_calls": [tc]},
-                            "finish_reason": null,
-                        }],
-                    });
-                    sse_events.push(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ));
-                    tool_call_index += 1;
-                }
-                "finish" => {
-                    final_response_id = event.get("response_id").cloned();
-                    if let Some(usage) = event.get("usage") {
-                        if usage.is_object() {
-                            usage_dict = Some(usage.clone());
-                        }
-                    }
-                    let finish_reason = event
-                        .get("finish_reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("stop");
-                    let chunk = json!({
-                        "id": request_id,
-                        "response_id": event.get("response_id"),
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }],
-                    });
-                    sse_events.push(Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap())
-                    ));
-                }
-                _ => {}
+                Ok(())
+            })?;
+            if !stream_state.finished {
+                return Err(ProviderError::UpstreamProtocol(
+                    "normalized response stream ended without a finish event".to_string(),
+                ));
             }
-        }
+            send_sse_event_with_backpressure(
+                &worker_sender,
+                Event::default().data("[DONE]"),
+                &worker_cancellation,
+                "OpenAI SSE client disconnected",
+            )
+        });
 
-        if let Some(u) = &usage_dict {
-            let input_details = u
-                .get("input_tokens_details")
-                .or_else(|| u.get("prompt_tokens_details"));
-            let cached_tokens = input_details
-                .and_then(|value| value.get("cached_tokens"))
-                .or_else(|| u.get("cached_input_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let cache_write_tokens = input_details
-                .and_then(|value| value.get("cache_write_tokens"))
-                .or_else(|| u.get("cache_write_input_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let finish_chunk = json!({
-                "id": request_id,
-                "response_id": final_response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_id,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0),
-                    "completion_tokens": u.get("completion_tokens").or_else(|| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0),
-                    "total_tokens": u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                    "prompt_tokens_details": {
-                        "cached_tokens": cached_tokens,
-                        "cache_write_tokens": cache_write_tokens,
-                    },
-                },
-            });
-            sse_events.push(Ok(
-                Event::default().data(serde_json::to_string(&finish_chunk).unwrap())
-            ));
-        }
+        tokio::spawn(async move {
+            let error = match worker.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(ProviderError::Request(format!(
+                    "OpenAI SSE worker failed: {error}"
+                ))),
+            };
+            if let Some(error) = error {
+                let _ = sender.send(openai_stream_error_event(&error)).await;
+            }
+        });
 
-        sse_events.push(Ok(Event::default().data("[DONE]")));
-
-        let sse = Sse::new(stream::iter(sse_events));
-        Ok(sse.into_response())
+        let event_stream = stream::unfold(
+            DownstreamEventReceiver {
+                receiver,
+                cancellation,
+            },
+            |mut downstream| async move {
+                downstream
+                    .receiver
+                    .recv()
+                    .await
+                    .map(|event| (Ok::<Event, std::convert::Infallible>(event), downstream))
+            },
+        );
+        Ok(Sse::new(event_stream).into_response())
     } else {
         let provider = state.provider.clone();
-        let model_id = openai_model_id(&request.model);
+        let model_id = request_model.clone();
         let temperature = request.temperature;
         let prompt_cache_key = request.prompt_cache_key.clone();
-        let request_model = request.model.clone();
-        let tool_choice = request.tool_choice.clone();
         let service_tier = request.service_tier.clone();
         let text = request.text.clone();
         let client_metadata = request.client_metadata.clone();
         let codex_metadata = request.codex_metadata;
-        let responses_lite = request.responses_lite.clone();
+        let responses_lite = responses_lite.clone();
         let parallel_tool_calls = request.parallel_tool_calls;
 
         let result = task::spawn_blocking(move || {
@@ -1289,7 +2712,7 @@ async fn chat_completions(
             let stop_ref: Option<Vec<String>> = stop;
             let stop_slice = stop_ref.as_deref();
 
-            provider.chat_with_controls(
+            let prepared = provider.prepare_chat_stream_for_resolved_model_with_controls(
                 &messages,
                 tools_ref,
                 temperature,
@@ -1300,7 +2723,7 @@ async fn chat_completions(
                 subagent.as_deref(),
                 memgen_request,
                 previous_response_id.as_deref(),
-                Some(request_model.as_str()),
+                resolved,
                 tool_choice.as_ref(),
                 service_tier.as_deref(),
                 text.as_ref(),
@@ -1309,22 +2732,39 @@ async fn chat_completions(
                 responses_lite.as_ref(),
                 parallel_tool_calls,
                 &controls,
-            )
+            )?;
+            provider.chat_prepared(prepared)
         })
         .await
-        .unwrap();
+        .map_err(join_error_response)?;
 
         let response = match result {
             Ok(resp) => resp,
             Err(e) => {
-                let status = map_error_status(&e);
-                return Err(error_response(status, e.to_string()).into_response());
+                return Err(provider_error_response(&e));
             }
         };
+        if response
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("events"))
+            .and_then(Value::as_array)
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event.get("type").and_then(Value::as_str) == Some("web_search_call")
+                })
+            })
+        {
+            return Err(provider_error_response(&ProviderError::UpstreamProtocol(
+                "provider web_search_call event cannot be represented by /v1/chat/completions"
+                    .to_string(),
+            )));
+        }
 
         let mut message_obj = json!({
             "role": "assistant",
             "content": response.content,
+            "refusal": null,
         });
 
         if !response.tool_calls.is_empty() {
@@ -1337,7 +2777,7 @@ async fn chat_completions(
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+                            "arguments": tc.arguments,
                         },
                     })
                 })
@@ -1355,32 +2795,38 @@ async fn chat_completions(
                 .insert("reasoning_content".to_string(), Value::String(rc.clone()));
         }
 
+        let response_id = response.response_id.as_deref().ok_or_else(|| {
+            provider_error_response(&ProviderError::UpstreamProtocol(
+                "normalized completion response requires response_id".to_string(),
+            ))
+        })?;
+        if !matches!(
+            response.finish_reason.as_deref(),
+            Some("stop" | "tool_calls")
+        ) {
+            return Err(provider_error_response(&ProviderError::UpstreamProtocol(
+                "normalized completion requires a final finish_reason".to_string(),
+            )));
+        }
         let mut result_obj = json!({
             "id": format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]),
             "object": "chat.completion",
             "created": chrono::Utc::now().timestamp(),
             "model": model_id,
-            "response_id": response.response_id,
+            "response_id": response_id,
             "choices": [{
                 "index": 0,
                 "message": message_obj,
                 "finish_reason": response.finish_reason,
+                "logprobs": null,
             }],
         });
 
-        if let Some(usage) = &response.usage {
-            result_obj.as_object_mut().unwrap().insert(
-                "usage".to_string(),
-                json!({
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                    "prompt_tokens_details": {
-                        "cached_tokens": usage.cached_tokens,
-                        "cache_write_tokens": usage.cache_write_tokens,
-                    },
-                }),
-            );
+        if let Some(usage) = response.usage.as_ref() {
+            result_obj
+                .as_object_mut()
+                .expect("completion response literal must be an object")
+                .insert("usage".to_string(), openai_usage_value(usage));
         }
 
         Ok(Json(result_obj).into_response())
@@ -1389,24 +2835,65 @@ async fn chat_completions(
 
 async fn images_generations(
     State(state): State<AppState>,
-    Json(request): Json<ImageGenerationRequest>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    let body = openai_json(payload)?;
+    reject_unsupported_proxy_extension_presence(&body, false)
+        .map_err(|error| provider_error_response(&error))?;
+    reject_explicit_null_fields(&body, &["prompt", "user"])
+        .map_err(|error| provider_error_response(&error))?;
+    if body
+        .as_object()
+        .is_some_and(|object| object.contains_key("tools"))
+    {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "tools are not supported by the image generation endpoint".to_string(),
+        )));
+    }
+    let request: ImageGenerationRequest = parse_openai_request(body)?;
+    request
+        .responses_lite
+        .reject_explicit_null("responses_lite")
+        .map_err(|error| provider_error_response(&error))?;
+    for (name, present) in [
+        ("background", request.background.is_some()),
+        ("moderation", request.moderation.is_some()),
+        ("n", request.n.is_some()),
+        ("output_compression", request.output_compression.is_some()),
+        ("output_format", request.output_format.is_some()),
+        ("partial_images", request.partial_images.is_some()),
+        ("quality", request.quality.is_some()),
+        ("response_format", request.response_format.is_some()),
+        ("stream", request.stream.is_some()),
+        ("style", request.style.is_some()),
+        ("user", request.user.is_some()),
+    ] {
+        if present {
+            return Err(provider_error_response(&ProviderError::InvalidRequest(
+                format!("{name} is not supported by the Codex OAuth HTTP transport"),
+            )));
+        }
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "prompt must be a non-empty string".to_string(),
+        )));
+    }
+    if request.size.as_deref().is_some_and(|size| size != "auto") {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "size and tools are not supported by the image generation facade".to_string(),
+        )));
+    }
     reject_unsupported_generation_tool_features(
         request.tools.as_deref(),
         request.programmatic_tool_calling.as_ref(),
+        false,
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
-    let provider = state.provider.clone();
+    .map_err(|error| provider_error_response(&error))?;
+    let reference_images = request.reference_images.clone().unwrap_or_default();
+    validate_image_content_values(&reference_images)
+        .map_err(|error| provider_error_response(&error))?;
     let prompt = request.prompt.clone();
-    let size = request.size.clone();
-    let request_model = request.model.clone();
-    let reasoning_effort = effective_reasoning_effort_with_options(
-        &state,
-        request.reasoning_effort.as_deref(),
-        request.reasoning.as_ref(),
-        &request_model,
-    )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
     let controls = generation_controls(
         request.reasoning.clone(),
         request.safety_identifier.clone(),
@@ -1414,38 +2901,59 @@ async fn images_generations(
         request.verbosity.clone(),
         request.multi_agent.as_ref(),
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
-    let responses_lite = request.responses_lite.clone();
+    .map_err(|error| provider_error_response(&error))?;
+    let resolved = resolve_route_model(&state, request.model.clone()).await?;
+    let reasoning_effort = effective_reasoning_effort_with_options(
+        &state,
+        request.reasoning_effort.as_deref(),
+        request.reasoning.as_ref(),
+        &resolved.model,
+    )
+    .map_err(|error| provider_error_response(&error))?;
+    let provider = state.provider.clone();
+    let responses_lite = request.responses_lite.value.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.generate_image_with_controls(
+        provider.generate_image_for_resolved_model_with_controls(
             &prompt,
-            &[],
-            size.as_deref(),
+            &reference_images,
+            None,
             reasoning_effort.as_deref(),
-            Some(request_model.as_str()),
+            resolved,
             responses_lite.as_ref(),
             &controls,
         )
     })
     .await
-    .unwrap();
+    .map_err(join_error_response)?;
 
-    let images = result.map_err(|e| {
-        let status = map_error_status(&e);
-        error_response(status, e.to_string()).into_response()
-    })?;
+    let images = result.map_err(|error| provider_error_response(&error))?;
 
-    let data: Vec<Value> = images
-        .iter()
-        .filter_map(|img| {
-            let result_url = img.get("result").and_then(|v| v.as_str())?;
-            Some(json!({
-                "url": result_url,
-                "revised_prompt": img.get("revised_prompt").and_then(|v| v.as_str()).unwrap_or(&request.prompt),
-            }))
-        })
-        .collect();
+    let mut data = Vec::with_capacity(images.len());
+    for image in &images {
+        let result_url = image.get("result").and_then(Value::as_str).ok_or_else(|| {
+            provider_error_response(&ProviderError::UpstreamProtocol(
+                "image generation output requires a string result".to_string(),
+            ))
+        })?;
+        let mut generated = serde_json::Map::from_iter([(
+            "url".to_string(),
+            Value::String(result_url.to_string()),
+        )]);
+        if let Some(revised_prompt) = image.get("revised_prompt") {
+            let revised_prompt = revised_prompt.as_str().ok_or_else(|| {
+                provider_error_response(&ProviderError::UpstreamProtocol(
+                    "image generation output revised_prompt must be a string when present"
+                        .to_string(),
+                ))
+            })?;
+            generated.insert(
+                "revised_prompt".to_string(),
+                Value::String(revised_prompt.to_string()),
+            );
+        }
+        data.push(Value::Object(generated));
+    }
 
     Ok(Json(json!({
         "created": chrono::Utc::now().timestamp(),
@@ -1455,23 +2963,52 @@ async fn images_generations(
 
 async fn inspect(
     State(state): State<AppState>,
-    Json(request): Json<InspectRequest>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    let body = openai_json(payload)?;
+    reject_unsupported_proxy_extension_presence(&body, false)
+        .map_err(|error| provider_error_response(&error))?;
+    let request: InspectRequest = parse_openai_request(body)?;
+    request
+        .responses_lite
+        .reject_explicit_null("responses_lite")
+        .map_err(|error| provider_error_response(&error))?;
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "tools are not supported by the image inspection facade".to_string(),
+        )));
+    }
     reject_unsupported_generation_tool_features(
         request.tools.as_deref(),
         request.programmatic_tool_calling.as_ref(),
+        false,
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
-    let provider = state.provider.clone();
-    let prompt = request.prompt.clone().unwrap_or_default();
-    let images = request.images.clone().unwrap_or_default();
-    let reasoning_effort = effective_reasoning_effort_with_options(
-        &state,
-        request.reasoning_effort.as_deref(),
-        request.reasoning.as_ref(),
-        &state.model,
-    )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    .map_err(|error| provider_error_response(&error))?;
+    let prompt = request.prompt.clone().ok_or_else(|| {
+        provider_error_response(&ProviderError::InvalidRequest(
+            "inspect requires prompt".to_string(),
+        ))
+    })?;
+    if prompt.trim().is_empty() {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "inspect prompt must be a non-empty string".to_string(),
+        )));
+    }
+    let images = request.images.clone().ok_or_else(|| {
+        provider_error_response(&ProviderError::InvalidRequest(
+            "inspect requires images".to_string(),
+        ))
+    })?;
+    if images.is_empty() {
+        return Err(provider_error_response(&ProviderError::InvalidRequest(
+            "inspect images must be a non-empty array".to_string(),
+        )));
+    }
+    validate_image_content_values(&images).map_err(|error| provider_error_response(&error))?;
     let controls = generation_controls(
         request.reasoning.clone(),
         request.safety_identifier.clone(),
@@ -1479,26 +3016,32 @@ async fn inspect(
         request.verbosity.clone(),
         request.multi_agent.as_ref(),
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
-    let responses_lite = request.responses_lite.clone();
+    .map_err(|error| provider_error_response(&error))?;
+    let resolved = resolve_route_model(&state, request.model.clone()).await?;
+    let reasoning_effort = effective_reasoning_effort_with_options(
+        &state,
+        request.reasoning_effort.as_deref(),
+        request.reasoning.as_ref(),
+        &resolved.model,
+    )
+    .map_err(|error| provider_error_response(&error))?;
+    let provider = state.provider.clone();
+    let responses_lite = request.responses_lite.value.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.inspect_image_values_with_controls(
+        provider.inspect_image_values_for_resolved_model_with_controls(
             &prompt,
             &images,
             reasoning_effort.as_deref(),
-            None,
+            resolved,
             responses_lite.as_ref(),
             &controls,
         )
     })
     .await
-    .unwrap();
+    .map_err(join_error_response)?;
 
-    let content = result.map_err(|e| {
-        let status = map_error_status(&e);
-        error_response(status, e.to_string()).into_response()
-    })?;
+    let content = result.map_err(|error| provider_error_response(&error))?;
 
     Ok(Json(json!({"content": content})))
 }
@@ -1506,17 +3049,63 @@ async fn inspect(
 async fn compact(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Json(body): Json<Value>,
+    headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    reject_unsupported_tool_features(&body).map_err(|error| {
-        error_response(map_error_status(&error), error.to_string()).into_response()
-    })?;
+    let force_anthropic = uri.path() == "/v1/messages/compact";
+    let body = if force_anthropic {
+        anthropic_json(payload)?
+    } else {
+        openai_json(payload)?
+    };
+    let respond = |error: &ProviderError| {
+        if force_anthropic {
+            anthropic_provider_error_response(error)
+        } else {
+            provider_error_response(error)
+        }
+    };
+    reject_unsupported_proxy_extension_presence(&body, force_anthropic)
+        .map_err(|error| respond(&error))?;
+    reject_unknown_top_level_fields(
+        &body,
+        if force_anthropic {
+            ANTHROPIC_COMPACT_FIELDS
+        } else {
+            OPENAI_COMPACT_FIELDS
+        },
+    )
+    .map_err(|error| respond(&error))?;
+    if force_anthropic {
+        reject_explicit_null_anthropic_fields(&body).map_err(|error| respond(&error))?;
+        if body
+            .get("max_tokens")
+            .and_then(positive_js_safe_integer)
+            .is_none()
+        {
+            return Err(respond(&ProviderError::InvalidRequest(
+                "max_tokens must be a positive integer".to_string(),
+            )));
+        }
+        validate_anthropic_compatibility_scope(&body, &headers).map_err(|error| respond(&error))?;
+        validate_anthropic_context_management(&body).map_err(|error| respond(&error))?;
+        if body
+            .get("stop_sequences")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(respond(&ProviderError::InvalidRequest(
+                "stop_sequences is not supported by the private Codex OAuth compact transport"
+                    .to_string(),
+            )));
+        }
+    }
+    reject_unsupported_tool_features(&body, force_anthropic).map_err(|error| respond(&error))?;
     for field in ["safety_identifier", "include", "prompt_cache_retention"] {
         if body.get(field).is_some_and(|value| !value.is_null()) {
             let error = ProviderError::InvalidRequest(format!(
                 "{field} is not supported by the compact facade"
             ));
-            return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+            return Err(respond(&error));
         }
     }
     let nested_reasoning_effort = match body.get("reasoning") {
@@ -1526,17 +3115,13 @@ async fn compact(
                 let error = ProviderError::InvalidRequest(
                     "reasoning.mode and reasoning.context are not supported by compact".to_string(),
                 );
-                return Err(
-                    error_response(map_error_status(&error), error.to_string()).into_response()
-                );
+                return Err(respond(&error));
             }
             if reasoning.keys().any(|key| key != "effort") {
                 let error = ProviderError::InvalidRequest(
                     "compact reasoning supports only effort".to_string(),
                 );
-                return Err(
-                    error_response(map_error_status(&error), error.to_string()).into_response()
-                );
+                return Err(respond(&error));
             }
             match reasoning.get("effort") {
                 None | Some(Value::Null) => None,
@@ -1545,15 +3130,13 @@ async fn compact(
                     let error = ProviderError::InvalidRequest(
                         "reasoning.effort must be a non-empty string when provided".to_string(),
                     );
-                    return Err(
-                        error_response(map_error_status(&error), error.to_string()).into_response()
-                    );
+                    return Err(respond(&error));
                 }
             }
         }
         Some(_) => {
             let error = ProviderError::InvalidRequest("reasoning must be an object".to_string());
-            return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+            return Err(respond(&error));
         }
     };
     if body
@@ -1563,22 +3146,27 @@ async fn compact(
         let error = ProviderError::InvalidRequest(
             "multi_agent is not supported by the compact facade".to_string(),
         );
-        return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+        return Err(respond(&error));
     }
-    let provider = state.provider.clone();
-    let force_anthropic = uri.path() == "/v1/messages/compact";
-    let (messages, tools, converted_reasoning_effort, converted_text) =
-        messages_from_compact_body(&body, force_anthropic).map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?;
+    let (messages, tools, converted_reasoning_effort, converted_text, parallel_tool_calls) =
+        messages_from_compact_body(&body, force_anthropic).map_err(|error| respond(&error))?;
+    if force_anthropic && parallel_tool_calls == Some(true) {
+        let error = ProviderError::InvalidRequest(
+            "tool_choice.disable_parallel_tool_use=false cannot be represented by the compact endpoint"
+                .to_string(),
+        );
+        return Err(respond(&error));
+    }
     let top_level_reasoning_effort = match body.get("reasoning_effort") {
         None | Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+        Some(Value::String(value)) if !value.is_empty() && value == value.trim() => {
+            Some(value.clone())
+        }
         Some(_) => {
             let error = ProviderError::InvalidRequest(
                 "reasoning_effort must be a non-empty string when provided".to_string(),
             );
-            return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+            return Err(respond(&error));
         }
     };
     let requested_efforts = [
@@ -1596,88 +3184,112 @@ async fn compact(
         let error = ProviderError::InvalidRequest(
             "reasoning effort fields conflict in compact request".to_string(),
         );
-        return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+        return Err(respond(&error));
     }
     let requested_reasoning_effort = first_effort.map(str::to_string);
-    let request_model = if force_anthropic {
-        body.get("model")
-            .and_then(Value::as_str)
-            .filter(|model| is_known_codex_model(model))
-            .map(str::to_string)
-            .unwrap_or_else(|| state.model.clone())
-    } else {
-        state.model.clone()
-    };
-    let reasoning_effort = effective_reasoning_effort(
-        &state,
-        requested_reasoning_effort.as_deref(),
-        &request_model,
-    );
     let responses_lite = body.get("responses_lite").cloned();
     let previous_response_id =
-        optional_string_field(&body, "previous_response_id").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?;
+        optional_string_field(&body, "previous_response_id").map_err(|error| respond(&error))?;
     if previous_response_id.as_deref().is_some_and(str::is_empty) {
         let error = ProviderError::InvalidRequest(
             "previous_response_id must be a non-empty string".to_string(),
         );
-        return Err(error_response(map_error_status(&error), error.to_string()).into_response());
+        return Err(respond(&error));
     }
     let compact_service_tier = if force_anthropic {
         anthropic_service_tier(&body)
     } else {
         optional_string_field(&body, "service_tier")
     }
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    .map_err(|error| respond(&error))?;
     let compact_text = if force_anthropic {
-        merge_anthropic_compact_text(body.get("text"), converted_text).map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?
+        merge_anthropic_compact_text(body.get("text"), converted_text)
+            .map_err(|error| respond(&error))?
     } else {
         body.get("text").filter(|value| !value.is_null()).cloned()
     };
     let compact_controls = CompactControls {
         previous_response_id,
-        prompt_cache_key: optional_string_field(&body, "prompt_cache_key").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?,
+        prompt_cache_key: if force_anthropic {
+            anthropic_prompt_cache_key(&body, &headers).map_err(|error| respond(&error))?
+        } else {
+            optional_string_field(&body, "prompt_cache_key").map_err(|error| respond(&error))?
+        },
         prompt_cache_options: body
             .get("prompt_cache_options")
             .filter(|value| !value.is_null())
             .cloned(),
         service_tier: compact_service_tier,
         text: compact_text,
-        verbosity: optional_string_field(&body, "verbosity").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?,
+        verbosity: optional_string_field(&body, "verbosity").map_err(|error| respond(&error))?,
     };
+    let requested_model = optional_string_field(&body, "model").map_err(|error| respond(&error))?;
+    let resolved = if force_anthropic {
+        let model = requested_model.as_deref().ok_or_else(|| {
+            respond(&ProviderError::InvalidRequest(
+                "model is required".to_string(),
+            ))
+        })?;
+        resolve_anthropic_route_model(&state, model)
+            .await
+            .map_err(|error| respond(&error))?
+    } else {
+        resolve_route_model(&state, requested_model).await?
+    };
+    let reasoning_effort = effective_reasoning_effort_with_options(
+        &state,
+        requested_reasoning_effort.as_deref(),
+        None,
+        &resolved.model,
+    )
+    .map_err(|error| respond(&error))?;
+    let provider = state.provider.clone();
 
     let result = task::spawn_blocking(move || {
-        provider.compact_messages_with_controls(
+        provider.compact_messages_for_resolved_model_with_controls(
             &messages,
             tools.as_deref(),
             reasoning_effort.as_deref(),
-            Some(request_model.as_str()),
+            resolved,
             responses_lite.as_ref(),
             &compact_controls,
         )
     })
     .await
-    .unwrap();
-
-    let checkpoint = result.map_err(|e| {
-        let status = map_error_status(&e);
-        error_response(status, e.to_string()).into_response()
+    .map_err(|error| {
+        respond(&ProviderError::Request(format!(
+            "blocking provider task failed: {error}"
+        )))
     })?;
+
+    let checkpoint = result.map_err(|error| respond(&error))?;
 
     Ok(Json(json!({"checkpoint": checkpoint})))
 }
 
 async fn anthropic_count_tokens(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    let body = anthropic_json(payload)?;
+    reject_unsupported_proxy_extension_presence(&body, true)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_explicit_null_anthropic_fields(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_unknown_top_level_fields(&body, ANTHROPIC_COUNT_FIELDS)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_unsupported_anthropic_controls(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    if let Some(value) = body.get("max_tokens") {
+        if positive_js_safe_integer(value).is_none() {
+            return Err(anthropic_provider_error_response(
+                &ProviderError::InvalidRequest("max_tokens must be a positive integer".to_string()),
+            ));
+        }
+    }
+    validate_anthropic_compatibility_scope(&body, &headers)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     if let Err(error) = validate_anthropic_context_management(&body) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1696,14 +3308,14 @@ async fn anthropic_count_tokens(
         )
             .into_response());
     }
-    if let Err(error) = reject_unsupported_tool_features(&body) {
+    if let Err(error) = reject_unsupported_tool_features(&body, true) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(format_anthropic_error(400, &error.to_string())),
         )
             .into_response());
     }
-    let (messages, tools, _tool_choice, _stop, _reasoning_effort, _text) =
+    let (messages, tools, _tool_choice, _stop, _reasoning_effort, _text, _parallel_tool_calls) =
         anthropic_request_to_internal(&body).map_err(|message| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1715,21 +3327,74 @@ async fn anthropic_count_tokens(
     let request_model = body
         .get("model")
         .and_then(Value::as_str)
-        .filter(|model| is_known_codex_model(model))
-        .unwrap_or(&state.model);
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            anthropic_provider_error_response(&ProviderError::InvalidRequest(
+                "model is required".to_string(),
+            ))
+        })?;
+    let resolved = resolve_anthropic_route_model(&state, request_model)
+        .await
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let context_window = context_window_for_model(&state, &resolved.model)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let auto_compact_token_limit = if context_window.is_some() {
+        auto_compact_token_limit_for_model(&state, &resolved.model)
+            .map_err(|error| anthropic_provider_error_response(&error))?
+    } else {
+        None
+    };
     Ok(Json(json!({
         "input_tokens": input_tokens,
-        "context_window": context_window_for_model(&state, request_model),
-        "auto_compact_token_limit": auto_compact_token_limit_for_model(&state, request_model),
+        "context_window": context_window,
+        "auto_compact_token_limit": auto_compact_token_limit,
     })))
 }
 
 async fn anthropic_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<axum::response::Response, axum::response::Response> {
+    let body = anthropic_json(payload)?;
+    reject_unsupported_proxy_extension_presence(&body, true)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_explicit_null_anthropic_fields(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_unknown_top_level_fields(&body, ANTHROPIC_MESSAGE_FIELDS)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     let request_id = format!("msg_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+    let client_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            anthropic_provider_error_response(&ProviderError::InvalidRequest(
+                "model is required".to_string(),
+            ))
+        })?
+        .to_string();
+    let stream = match body.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(anthropic_provider_error_response(
+                &ProviderError::InvalidRequest("stream must be a boolean".to_string()),
+            ));
+        }
+    };
+    match body.get("max_tokens") {
+        Some(value) if positive_js_safe_integer(value).is_some() => {}
+        _ => {
+            return Err(anthropic_provider_error_response(
+                &ProviderError::InvalidRequest("max_tokens must be a positive integer".to_string()),
+            ));
+        }
+    }
+    validate_anthropic_compatibility_scope(&body, &headers)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    reject_unsupported_anthropic_controls(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     validate_anthropic_context_management(&body).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1750,32 +3415,30 @@ async fn anthropic_messages(
         )
             .into_response());
     }
-    reject_unsupported_tool_features(&body).map_err(|error| {
-        error_response(map_error_status(&error), error.to_string()).into_response()
-    })?;
+    reject_unsupported_tool_features(&body, true)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
 
-    let subagent = body
-        .get("subagent")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            headers
-                .get("x-anthropic-subagent")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+    let body_subagent = optional_string_field(&body, "subagent")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let header_subagent = optional_header_string(&headers, "x-openai-subagent")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let subagent = merge_optional_nonempty_string(body_subagent, header_subagent, "subagent")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let body_memgen = match body.get("memgen_request") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            return Err(anthropic_provider_error_response(
+                &ProviderError::InvalidRequest("memgen_request must be a boolean".to_string()),
+            ));
+        }
+    };
+    let header_memgen = optional_header_bool(&headers, "x-openai-memgen-request")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let memgen_request = merge_optional_bool(body_memgen, header_memgen, "memgen_request")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
 
-    let memgen_request = body
-        .get("memgen_request")
-        .and_then(|v| v.as_bool())
-        .or_else(|| {
-            headers
-                .get("x-anthropic-memgen-request")
-                .and_then(|v| v.to_str().ok())
-                .map(|h| !matches!(h.to_lowercase().as_str(), "false" | "0" | ""))
-        });
-
-    let (messages, tools, tool_choice, stop, converted_reasoning_effort, text) =
+    let (messages, tools, tool_choice, stop, converted_reasoning_effort, text, parallel_tool_calls) =
         anthropic_request_to_internal(&body).map_err(|message| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1784,22 +3447,6 @@ async fn anthropic_messages(
                 .into_response()
         })?;
 
-    let stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let default_client_model = "claude-sonnet-4-5".to_string();
-    let client_model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&default_client_model)
-        .to_string();
-    let request_model = if is_known_codex_model(&client_model) {
-        client_model.clone()
-    } else {
-        state.model.clone()
-    };
     let explicit_reasoning_effort =
         optional_string_field(&body, "reasoning_effort").map_err(|error| {
             (
@@ -1826,13 +3473,6 @@ async fn anthropic_messages(
         .get("reasoning")
         .filter(|value| !value.is_null())
         .cloned();
-    let reasoning_effort = effective_reasoning_effort_with_options(
-        &state,
-        requested_reasoning_effort.as_deref(),
-        reasoning.as_ref(),
-        &request_model,
-    )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
     let service_tier = anthropic_service_tier(&body).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1848,21 +3488,30 @@ async fn anthropic_messages(
             .into_response()
     })?;
     let controls = generation_controls(
-        reasoning,
-        optional_string_field(&body, "safety_identifier").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?,
+        reasoning.clone(),
+        optional_string_field(&body, "safety_identifier")
+            .map_err(|error| anthropic_provider_error_response(&error))?,
         body.get("prompt_cache_options")
             .filter(|value| !value.is_null())
             .cloned(),
-        optional_string_field(&body, "verbosity").map_err(|error| {
-            error_response(map_error_status(&error), error.to_string()).into_response()
-        })?,
+        optional_string_field(&body, "verbosity")
+            .map_err(|error| anthropic_provider_error_response(&error))?,
         body.get("multi_agent"),
     )
-    .map_err(|error| error_response(map_error_status(&error), error.to_string()).into_response())?;
+    .map_err(|error| anthropic_provider_error_response(&error))?;
 
-    let max_tokens = body.get("max_tokens").and_then(|v| v.as_i64());
+    let resolved = resolve_anthropic_route_model(&state, &client_model)
+        .await
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let reasoning_effort = effective_reasoning_effort_with_options(
+        &state,
+        requested_reasoning_effort.as_deref(),
+        reasoning.as_ref(),
+        &resolved.model,
+    )
+    .map_err(|error| anthropic_provider_error_response(&error))?;
+
+    let max_tokens = None;
 
     let tool_choice_val: Option<Value> = tool_choice;
     let text_val: Option<Value> = text;
@@ -1870,7 +3519,6 @@ async fn anthropic_messages(
 
     if stream {
         let provider = state.provider.clone();
-        let request_model_clone = request_model.clone();
 
         let prepared = task::spawn_blocking({
             let provider = provider.clone();
@@ -1880,7 +3528,7 @@ async fn anthropic_messages(
                 let tc_ref = tool_choice_val.as_ref();
                 let text_ref = text_val.as_ref();
 
-                provider.prepare_chat_stream_with_controls(
+                provider.prepare_chat_stream_for_resolved_model_with_controls(
                     &messages,
                     tools_ref,
                     None,
@@ -1891,20 +3539,20 @@ async fn anthropic_messages(
                     subagent.as_deref(),
                     memgen_request,
                     None,
-                    Some(request_model_clone.as_str()),
+                    resolved,
                     tc_ref,
                     service_tier.as_deref(),
                     text_ref,
                     None,
                     Some(false),
                     responses_lite_val.as_ref(),
-                    None,
+                    parallel_tool_calls,
                     &controls,
                 )
             }
         })
         .await
-        .unwrap();
+        .map_err(join_error_response)?;
 
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -1914,7 +3562,7 @@ async fn anthropic_messages(
                     StatusCode::INTERNAL_SERVER_ERROR => 500u16,
                     status => status.as_u16(),
                 };
-                let body = format_anthropic_error(status_code, &error.to_string());
+                let body = format_anthropic_error(status_code, &public_error_message(&error));
                 return Err((
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     Json(body),
@@ -1923,25 +3571,33 @@ async fn anthropic_messages(
             }
         };
 
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let prepared = prepared.cancel_when(cancellation.clone());
         let (sender, receiver) = tokio::sync::mpsc::channel::<Event>(32);
         let worker_sender = sender.clone();
+        let worker_cancellation = cancellation.clone();
         let worker = task::spawn_blocking(move || {
             let mut adapter = AnthropicStreamAdapter::new(&client_model, &request_id);
             for chunk in adapter.start() {
-                worker_sender
-                    .blocking_send(anthropic_sse_event(&chunk))
-                    .map_err(|_| {
-                        ProviderError::Request("Anthropic SSE client disconnected".to_string())
-                    })?;
+                send_sse_event_with_backpressure(
+                    &worker_sender,
+                    anthropic_sse_event(&chunk),
+                    &worker_cancellation,
+                    "Anthropic SSE client disconnected",
+                )?;
             }
 
             provider.stream_prepared_chat(prepared, |event| {
-                for chunk in adapter.push(&event) {
-                    worker_sender
-                        .blocking_send(anthropic_sse_event(&chunk))
-                        .map_err(|_| {
-                            ProviderError::Request("Anthropic SSE client disconnected".to_string())
-                        })?;
+                let chunks = adapter
+                    .push(&event)
+                    .map_err(ProviderError::UpstreamProtocol)?;
+                for chunk in chunks {
+                    send_sse_event_with_backpressure(
+                        &worker_sender,
+                        anthropic_sse_event(&chunk),
+                        &worker_cancellation,
+                        "Anthropic SSE client disconnected",
+                    )?;
                 }
                 Ok(())
             })
@@ -1964,30 +3620,35 @@ async fn anthropic_messages(
                 let _ = sender
                     .send(anthropic_stream_error_event(
                         status_code,
-                        &error.to_string(),
+                        &public_error_message(&error),
                     ))
                     .await;
             }
         });
 
-        let event_stream = stream::unfold(receiver, |mut receiver| async move {
-            receiver
-                .recv()
-                .await
-                .map(|event| (Ok::<Event, std::convert::Infallible>(event), receiver))
-        });
+        let event_stream = stream::unfold(
+            DownstreamEventReceiver {
+                receiver,
+                cancellation,
+            },
+            |mut downstream| async move {
+                downstream
+                    .receiver
+                    .recv()
+                    .await
+                    .map(|event| (Ok::<Event, std::convert::Infallible>(event), downstream))
+            },
+        );
         Ok(Sse::new(event_stream).into_response())
     } else {
         let provider = state.provider.clone();
-        let request_model_clone = request_model.clone();
-
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
             let stop_ref = stop.as_deref();
             let tc_ref = tool_choice_val.as_ref();
             let text_ref = text_val.as_ref();
 
-            provider.chat_with_controls(
+            let prepared = provider.prepare_chat_stream_for_resolved_model_with_controls(
                 &messages,
                 tools_ref,
                 None,
@@ -1998,19 +3659,20 @@ async fn anthropic_messages(
                 subagent.as_deref(),
                 memgen_request,
                 None,
-                Some(request_model_clone.as_str()),
+                resolved,
                 tc_ref,
                 service_tier.as_deref(),
                 text_ref,
                 None,
                 Some(false),
                 responses_lite_val.as_ref(),
-                None,
+                parallel_tool_calls,
                 &controls,
-            )
+            )?;
+            provider.chat_prepared(prepared)
         })
         .await
-        .unwrap();
+        .map_err(join_error_response)?;
 
         let response = match result {
             Ok(response) => response,
@@ -2020,7 +3682,7 @@ async fn anthropic_messages(
                     StatusCode::INTERNAL_SERVER_ERROR => 500u16,
                     s => s.as_u16(),
                 };
-                let body = format_anthropic_error(status_code, &e.to_string());
+                let body = format_anthropic_error(status_code, &public_error_message(&e));
                 return Err((
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     Json(body),
@@ -2029,14 +3691,1671 @@ async fn anthropic_messages(
             }
         };
 
-        let out = internal_response_to_anthropic(&response, &client_model, &request_id);
+        let out = internal_response_to_anthropic(&response, &client_model, &request_id).map_err(
+            |message| anthropic_provider_error_response(&ProviderError::UpstreamProtocol(message)),
+        )?;
         Ok(Json(out).into_response())
+    }
+}
+
+#[cfg(test)]
+mod live_catalog_tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::header::CONTENT_TYPE;
+    use base64::Engine;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use tokio::task::JoinHandle;
+
+    type RecordedModelRequests = Vec<(HeaderMap, HashMap<String, String>)>;
+
+    fn upstream_contract() -> Value {
+        serde_json::from_str(include_str!("../../config/codex-upstream-contract.json"))
+            .expect("Codex upstream contract fixture must be valid JSON")
+    }
+
+    #[test]
+    fn openai_function_tool_preserves_strict_mode() {
+        let tools = parse_tools(&Some(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": true
+            }
+        })]))
+        .unwrap()
+        .unwrap();
+        assert!(tools[0].strict);
+    }
+
+    #[test]
+    fn assistant_tool_call_arguments_preserve_raw_strings() {
+        let calls = parse_tool_calls(
+            &Some(vec![json!({
+                "type": "function",
+                "id": "call_1",
+                "function": {
+                    "name": "lookup",
+                    "arguments": " not-yet-valid "
+                }
+            })]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(calls[0].arguments, " not-yet-valid ");
+
+        let calls = parse_tool_calls(
+            &Some(vec![json!({
+                "type": "function",
+                "id": "call_1",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"b\":2, \"a\":1}"
+                }
+            })]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(calls[0].arguments, "{\"b\":2, \"a\":1}");
+    }
+
+    #[test]
+    fn health_error_messages_never_expose_internal_error_details() {
+        let cases = [
+            (
+                ProviderError::Auth(crate::auth::AuthError::OAuth(
+                    "/secret/auth.json".to_string(),
+                )),
+                "ChatGPT OAuth credentials are unavailable",
+            ),
+            (
+                ProviderError::CatalogUnavailable("secret catalog body".to_string()),
+                "authenticated model catalog is unavailable",
+            ),
+            (
+                ProviderError::ModelNotFound("private-model".to_string()),
+                "configured model is unavailable in the authenticated catalog",
+            ),
+            (
+                ProviderError::UpstreamHttp {
+                    status: 500,
+                    message: "secret upstream body".to_string(),
+                },
+                "upstream request failed",
+            ),
+            (
+                ProviderError::UpstreamTransport("secret transport detail".to_string()),
+                "upstream request failed",
+            ),
+            (
+                ProviderError::UpstreamProtocol("secret payload".to_string()),
+                "upstream protocol validation failed",
+            ),
+            (
+                ProviderError::InvalidRequest("secret config".to_string()),
+                "health configuration is invalid",
+            ),
+            (
+                ProviderError::Request("secret task detail".to_string()),
+                "health preflight failed",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(health_error_message(&error), expected);
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        catalog: Arc<Mutex<Value>>,
+        catalog_etag: Arc<Mutex<String>>,
+        malformed_response: bool,
+        model_delay_millis: Arc<AtomicU64>,
+        response_models_etag: Arc<Mutex<Option<String>>>,
+        unauthorized_models_once: Arc<AtomicBool>,
+        unauthorized_models_always: Arc<AtomicBool>,
+        models_status: Arc<AtomicU16>,
+        replacement_auth_path: Arc<Mutex<Option<PathBuf>>>,
+        model_requests: Arc<Mutex<RecordedModelRequests>>,
+        response_requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl MockState {
+        fn new(catalog: Value) -> Self {
+            Self {
+                catalog: Arc::new(Mutex::new(catalog)),
+                catalog_etag: Arc::new(Mutex::new("catalog-v1".to_string())),
+                malformed_response: false,
+                model_delay_millis: Arc::new(AtomicU64::new(0)),
+                response_models_etag: Arc::new(Mutex::new(None)),
+                unauthorized_models_once: Arc::new(AtomicBool::new(false)),
+                unauthorized_models_always: Arc::new(AtomicBool::new(false)),
+                models_status: Arc::new(AtomicU16::new(200)),
+                replacement_auth_path: Arc::new(Mutex::new(None)),
+                model_requests: Arc::new(Mutex::new(Vec::new())),
+                response_requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    fn live_model(slug: &str, priority: i64, supported_in_api: bool) -> Value {
+        json!({
+            "slug": slug,
+            "display_name": slug,
+            "description": "live test model",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "low"},
+                {"effort": "medium", "description": "medium"},
+                {"effort": "high", "description": "high"}
+            ],
+            "visibility": "list",
+            "supported_in_api": supported_in_api,
+            "priority": priority,
+            "service_tiers": [{"id":"priority","name":"Priority","description":"Faster service"}],
+            "default_service_tier": "priority",
+            "support_verbosity": true,
+            "default_verbosity": "medium",
+            "supports_image_detail_original": true,
+            "context_window": 100000,
+            "max_context_window": 120000,
+            "auto_compact_token_limit": null,
+            "input_modalities": ["text", "image"],
+            "use_responses_lite": false,
+            "supports_reasoning_summaries": true,
+            "available_in_plans": ["plus"],
+            "prefer_websockets": false,
+            "requires_sandboxed_review": false,
+            "minimal_client_version": "0.153.3",
+            "base_instructions": "Never expose this.",
+            "model_messages": {"input": "Never expose this either."}
+        })
+    }
+
+    async fn mock_models(
+        State(state): State<MockState>,
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        state.model_requests.lock().unwrap().push((headers, query));
+        let delay = state.model_delay_millis.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        if state.unauthorized_models_once.swap(false, Ordering::SeqCst) {
+            let path = state
+                .replacement_auth_path
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("refresh test must configure an auth path");
+            write_auth_at(&path, "account-id", "refreshed-access-token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if state.unauthorized_models_always.load(Ordering::SeqCst) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let status = state.models_status.load(Ordering::SeqCst);
+        if status != 200 {
+            return (
+                StatusCode::from_u16(status).expect("test model status must be valid"),
+                "upstream catalog detail",
+            )
+                .into_response();
+        }
+        let catalog = state.catalog.lock().unwrap().clone();
+        let etag = state.catalog_etag.lock().unwrap().clone();
+        let mut response = Json(catalog).into_response();
+        let contract = upstream_contract();
+        let etag_header = axum::http::HeaderName::from_bytes(
+            contract["models_request"]["etag_header"]
+                .as_str()
+                .expect("models_request.etag_header must be a string")
+                .as_bytes(),
+        )
+        .expect("models_request.etag_header must be a valid header name");
+        response.headers_mut().insert(
+            etag_header,
+            axum::http::HeaderValue::from_str(&etag).expect("test ETag must be valid"),
+        );
+        response
+    }
+
+    async fn mock_responses(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        state.response_requests.lock().unwrap().push(body);
+        let output = if state.malformed_response {
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": 42}]
+                }
+            })
+        } else {
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }
+            })
+        };
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "end_turn": true,
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": 0}
+                }
+            }
+        });
+        let mut response = (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!("data: {output}\n\ndata: {completed}\n\n"),
+        )
+            .into_response();
+        if let Some(etag) = state.response_models_etag.lock().unwrap().as_deref() {
+            let contract = upstream_contract();
+            let responses_etag_header = axum::http::HeaderName::from_bytes(
+                contract["models_request"]["responses_etag_header"]
+                    .as_str()
+                    .expect("models_request.responses_etag_header must be a string")
+                    .as_bytes(),
+            )
+            .expect("models_request.responses_etag_header must be a valid header name");
+            response.headers_mut().insert(
+                responses_etag_header,
+                axum::http::HeaderValue::from_str(etag).expect("test ETag must be valid"),
+            );
+        }
+        response
+    }
+
+    async fn start_mock_upstream(state: MockState) -> (String, JoinHandle<()>) {
+        let contract = upstream_contract();
+        let models_contract = &contract["models_request"];
+        assert_eq!(models_contract["method"], "GET");
+        let models_path = models_contract["path"]
+            .as_str()
+            .expect("models_request.path must be a string");
+        let app = Router::new()
+            .route(models_path, get(mock_models))
+            .route("/responses", post(mock_responses))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn test_access_token(account_id: &str, marker: &str) -> String {
+        let claims = json!({
+            "exp": 9999999999i64,
+            "marker": marker,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
+        });
+        format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+
+    fn write_auth_at(path: &std::path::Path, account_id: &str, access_marker: &str) {
+        let access_token = test_access_token(account_id, access_marker);
+        let auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "id_token": "header.e30.signature",
+                "account_id": account_id
+            }
+        });
+        std::fs::write(path, serde_json::to_vec(&auth).unwrap()).unwrap();
+    }
+
+    fn write_auth_file(account_id: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codex-as-api-live-catalog-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        write_auth_at(&path, account_id, "header.e30.signature");
+        path
+    }
+
+    async fn start_api(
+        upstream: &str,
+        configured_model: &str,
+    ) -> (String, PathBuf, JoinHandle<()>) {
+        start_api_with_catalog_ttl(
+            upstream,
+            configured_model,
+            crate::model_catalog::DEFAULT_CATALOG_TTL,
+        )
+        .await
+    }
+
+    async fn start_api_with_catalog_ttl(
+        upstream: &str,
+        configured_model: &str,
+        catalog_ttl: std::time::Duration,
+    ) -> (String, PathBuf, JoinHandle<()>) {
+        let auth_path = write_auth_file("account-id");
+        let auth_path_string = auth_path.to_string_lossy().to_string();
+        let provider = Arc::new(
+            ChatGPTOAuthProvider::new_with_catalog_ttl(
+                configured_model.to_string(),
+                upstream.to_string(),
+                Some(auth_path_string.clone()),
+                Some(std::time::Duration::from_secs(5)),
+                catalog_ttl,
+            )
+            .unwrap(),
+        );
+        let config = CodexConfig {
+            model: None,
+            model_reasoning_effort: None,
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
+        };
+        let app = create_router(AppState {
+            auth_path: Some(auth_path_string),
+            codex_config: config,
+            provider,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), auth_path, handle)
+    }
+
+    #[tokio::test]
+    async fn models_and_chat_use_authenticated_live_catalog_and_raw_slug() {
+        let mut hidden_model = live_model("hidden-api-model", 2, false);
+        hidden_model["comp_hash"] = json!("compatibility-family");
+        let state = MockState::new(json!({
+            "models": [hidden_model, live_model("live-model", 1, true)]
+        }));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let models_response = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(models_response.status(), reqwest::StatusCode::OK);
+        assert!(models_response.headers().get("etag").is_none());
+        let models_body: Value = models_response.json().await.unwrap();
+        assert_eq!(models_body["data"].as_array().unwrap().len(), 2);
+        assert!(models_body["data"][0].get("created").is_none());
+        assert!(models_body["data"][0].get("base_instructions").is_none());
+        assert!(models_body["data"][0].get("model_messages").is_none());
+        assert!(models_body["data"][0]
+            .get("supports_reasoning_summaries")
+            .is_none());
+        assert_eq!(
+            models_body["data"][0]["supports_reasoning_summary_parameter"],
+            true
+        );
+        assert_eq!(models_body["data"][0]["default_reasoning_summary"], "auto");
+        assert_eq!(models_body["data"][0]["comp_hash"], "compatibility-family");
+        assert!(models_body["data"][0]["supported_reasoning_levels"][0]
+            .get("description")
+            .is_some());
+        assert_eq!(models_body["data"][0]["service_tiers"][0]["id"], "priority");
+        assert_eq!(
+            models_body["data"][0]["service_tiers"][0]["name"],
+            "Priority"
+        );
+
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["status"], "ok");
+        assert_eq!(health_body["catalog_status"], "fresh");
+        assert!(health_body.get("catalog_etag").is_none());
+        assert_eq!(health_body["model"], "live-model");
+        assert_eq!(health_body["reasoning_effort"], "medium");
+        assert_eq!(health_body["context_window"], 95000);
+        assert_eq!(health_body["auto_compact_token_limit"], 90000);
+        assert!(health_body["catalog_fetched_at"].as_str().is_some());
+        assert!(health_body["catalog_expires_at"].as_str().is_some());
+        assert!(health_body.get("error").is_none());
+        assert!(health_body.get("account_id").is_none());
+        assert!(health_body.get("token").is_none());
+        assert!(health_body.get("effective_context_window").is_none());
+
+        let chat = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let chat_status = chat.status();
+        let chat_text = chat.text().await.unwrap();
+        assert_eq!(chat_status, reqwest::StatusCode::OK, "{chat_text}");
+        let chat_body: Value = serde_json::from_str(&chat_text).unwrap();
+        assert_eq!(chat_body["model"], "live-model");
+
+        let default_chat = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "hello again"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(default_chat.status(), reqwest::StatusCode::OK);
+        let default_body: Value = default_chat.json().await.unwrap();
+        assert_eq!(default_body["model"], "live-model");
+
+        let model_requests = state.model_requests.lock().unwrap();
+        assert_eq!(model_requests.len(), 1);
+        let contract = upstream_contract();
+        let models_contract = &contract["models_request"];
+        let query_name = models_contract["client_version_query"]
+            .as_str()
+            .expect("models_request.client_version_query must be a string");
+        let client_version = contract["upstream"]["version"]
+            .as_str()
+            .expect("upstream.version must be a string");
+        assert_eq!(
+            model_requests[0].1.get(query_name).map(String::as_str),
+            Some(client_version)
+        );
+        assert_eq!(
+            crate::model_catalog::DEFAULT_CATALOG_TTL.as_secs(),
+            models_contract["cache_ttl_seconds"]
+                .as_u64()
+                .expect("models_request.cache_ttl_seconds must be unsigned")
+        );
+        assert_eq!(
+            crate::provider::MODEL_CATALOG_TIMEOUT.as_secs(),
+            models_contract["request_timeout_seconds"]
+                .as_u64()
+                .expect("models_request.request_timeout_seconds must be unsigned")
+        );
+        let actual_key = crate::model_catalog::CatalogKey {
+            account_id: "account-id".to_string(),
+            base_url: upstream.clone(),
+            client_version: client_version.to_string(),
+        };
+        let actual_scope = json!({
+            "account_id": actual_key.account_id,
+            "base_url": actual_key.base_url,
+            "client_version": actual_key.client_version,
+        });
+        let actual_scope_names: Vec<Value> = actual_scope
+            .as_object()
+            .expect("actual catalog scope must be an object")
+            .keys()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        assert_eq!(
+            models_contract["cache_scope"],
+            Value::Array(actual_scope_names)
+        );
+        assert_eq!(
+            model_requests[0].0.get("chatgpt-account-id").unwrap(),
+            "account-id"
+        );
+        assert_eq!(
+            model_requests[0].0.get("originator").unwrap(),
+            "codex_cli_rs"
+        );
+        assert_eq!(
+            model_requests[0].0.get("accept").unwrap(),
+            "application/json"
+        );
+        assert!(model_requests[0].0.get("user-agent").is_some());
+        drop(model_requests);
+        let response_requests = state.response_requests.lock().unwrap();
+        assert_eq!(response_requests.len(), 2);
+        assert_eq!(response_requests[0]["model"], "live-model");
+        assert_eq!(response_requests[1]["model"], "live-model");
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn models_exposes_an_empty_live_catalog_without_default_fallback() {
+        let state = MockState::new(json!({"models": []}));
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let models = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(models.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            models.json::<Value>().await.unwrap(),
+            json!({"object": "list", "data": []})
+        );
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_unauthorized_refreshes_once_and_retries_with_new_token() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.unauthorized_models_once.store(true, Ordering::SeqCst);
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        *state.replacement_auth_path.lock().unwrap() = Some(auth_path.clone());
+
+        let response = reqwest::Client::new()
+            .get(format!("{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let requests = state.model_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].0.get("authorization").unwrap(),
+            &format!(
+                "Bearer {}",
+                test_access_token("account-id", "header.e30.signature")
+            )
+        );
+        assert_eq!(
+            requests[1].0.get("authorization").unwrap(),
+            &format!(
+                "Bearer {}",
+                test_access_token("account-id", "refreshed-access-token")
+            )
+        );
+        drop(requests);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_terminal_unauthorized_preserves_upstream_error() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.unauthorized_models_once.store(true, Ordering::SeqCst);
+        state
+            .unauthorized_models_always
+            .store(true, Ordering::SeqCst);
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        *state.replacement_auth_path.lock().unwrap() = Some(auth_path.clone());
+        let client = reqwest::Client::new();
+
+        let response = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "upstream_error");
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.unauthorized_models_once.store(true, Ordering::SeqCst);
+        state
+            .unauthorized_models_always
+            .store(true, Ordering::SeqCst);
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        *state.replacement_auth_path.lock().unwrap() = Some(auth_path.clone());
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["auth_available"], true);
+        assert_eq!(health_body["status"], "error");
+        assert_eq!(health_body["catalog_status"], "unavailable");
+        assert_eq!(health_body["error"]["type"], "upstream_error");
+        assert_eq!(health_body["error"]["message"], "upstream request failed");
+        for field in [
+            "model",
+            "reasoning_effort",
+            "context_window",
+            "auto_compact_token_limit",
+        ] {
+            assert!(health_body[field].is_null(), "{field}");
+        }
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_non_auth_http_status_is_preserved_without_leaking_health_details() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.models_status.store(429, Ordering::SeqCst);
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let response = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "upstream_error");
+
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["status"], "error");
+        assert_eq!(health_body["auth_available"], true);
+        assert_eq!(health_body["catalog_status"], "unavailable");
+        assert_eq!(health_body["error"]["type"], "upstream_error");
+        assert_eq!(health_body["error"]["message"], "upstream request failed");
+        assert_eq!(state.model_requests.lock().unwrap().len(), 2);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_input_and_unknown_models_never_reach_responses() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let malformed_json = client
+            .post(format!("{api}/v1/chat/completions"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"model":42,"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed_json.status(), reqwest::StatusCode::BAD_REQUEST);
+        let malformed_json_body: Value = malformed_json.json().await.unwrap();
+        assert_eq!(
+            malformed_json_body["error"]["type"],
+            "invalid_request_error"
+        );
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let malformed = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({"model": "live-model", "messages": [{"role": "typo", "content": "x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let empty_model = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({"model": " ", "messages": [{"role": "user", "content": "x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_model.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let unsupported = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "x"}],
+                "n": 2
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        for control in [json!({"temperature": 0.0}), json!({"max_tokens": 128})] {
+            let mut request = json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "x"}]
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(control.as_object().unwrap().clone());
+            let response = client
+                .post(format!("{api}/v1/chat/completions"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let invalid_header = client
+            .post(format!("{api}/v1/chat/completions"))
+            .header("x-openai-memgen-request", "1")
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "x"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_header.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let anthropic_typo = client
+            .post(format!("{api}/v1/messages"))
+            .json(&json!({
+                "model": "live-model",
+                "max_tokens": 128,
+                "system": "Answer concisely.",
+                "messages": [{"role": "user", "content": "x"}],
+                "typo": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anthropic_typo.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let compact_typo = client
+            .post(format!("{api}/v1/compact"))
+            .json(&json!({"messages": [], "typo": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(compact_typo.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let unconfigured_claude = client
+            .post(format!("{api}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-current",
+                "max_tokens": 128,
+                "system": "Answer concisely.",
+                "messages": [{"role": "user", "content": "x"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unconfigured_claude.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let unconfigured_body: Value = unconfigured_claude.json().await.unwrap();
+        assert_eq!(unconfigured_body["error"]["type"], "invalid_request_error");
+        assert!(state.model_requests.lock().unwrap().is_empty());
+
+        let unknown = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model-typo",
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "x"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: Value = unknown.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "model_not_found");
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_whitespace_is_rejected_before_configured_backend_resolution() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "live-model").await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{api}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-current ",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "x"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(state.model_requests.lock().unwrap().is_empty());
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_compact_requires_a_valid_model_before_catalog_fetch() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "live-model").await;
+        let client = reqwest::Client::new();
+
+        for invalid_model in [
+            None,
+            Some(json!(null)),
+            Some(json!("")),
+            Some(json!("live-model ")),
+        ] {
+            let mut body = json!({
+                "system": "Compact precisely.",
+                "messages": [{"role": "user", "content": "History"}]
+            });
+            if let Some(invalid_model) = invalid_model {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("model".to_string(), invalid_model);
+            }
+            let response = client
+                .post(format!("{api}/v1/messages/compact"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let response_body: Value = response.json().await.unwrap();
+            assert_eq!(response_body["error"]["type"], "invalid_request_error");
+        }
+        assert!(state.model_requests.lock().unwrap().is_empty());
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_count_tokens_rejects_ignored_envelope_fields_before_catalog_fetch() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "live-model").await;
+        let client = reqwest::Client::new();
+
+        for unsupported in [json!({"stream": false}), json!({"metadata": {}})] {
+            let mut body = json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "Count this"}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(unsupported.as_object().unwrap().clone());
+            let response = client
+                .post(format!("{api}/v1/messages/count_tokens"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let response_body: Value = response.json().await.unwrap();
+            assert_eq!(response_body["error"]["type"], "invalid_request_error");
+        }
+
+        assert!(state.model_requests.lock().unwrap().is_empty());
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_catalog_failure_is_json_503_before_sse_headers() {
+        let state = MockState::new(json!({"models": []}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let response = reqwest::Client::new()
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "stream": true,
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "catalog_unavailable");
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_catalog_default_reasoning_is_http_503() {
+        let mut model = live_model("live-model", 1, true);
+        model["default_reasoning_level"] = json!("not-listed");
+        let state = MockState::new(json!({"models": [model]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["error"]["type"], "catalog_unavailable");
+
+        let chat = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let chat_body: Value = chat.json().await.unwrap();
+        assert_eq!(chat_body["error"]["type"], "catalog_unavailable");
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_ultra_without_wire_mapping_is_http_503() {
+        let mut model = live_model("live-model", 1, true);
+        model["supported_reasoning_levels"] = json!([{"effort": "ultra", "description": "ultra"}]);
+        model["default_reasoning_level"] = json!("ultra");
+        model["multi_agent_reasoning_effort"] = json!("ultra");
+        let state = MockState::new(json!({"models": [model]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["error"]["type"], "catalog_unavailable");
+
+        let chat = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_effective_context_is_catalog_unavailable() {
+        let mut model = live_model("live-model", 1, true);
+        model["context_window"] = json!(1);
+        model["max_context_window"] = json!(1);
+        model["auto_compact_token_limit"] = Value::Null;
+        let state = MockState::new(json!({"models": [model]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+
+        let health = reqwest::Client::new()
+            .get(format!("{api}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = health.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "catalog_unavailable");
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_zero_auto_compact_limit_is_exposed() {
+        let mut model = live_model("live-model", 1, true);
+        model["auto_compact_token_limit"] = json!(0);
+        let state = MockState::new(json!({"models": [model]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["auto_compact_token_limit"], 0);
+
+        let count = client
+            .post(format!("{api}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "Count this"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(count.status(), reqwest::StatusCode::OK);
+        let count_body: Value = count.json().await.unwrap();
+        assert_eq!(count_body["auto_compact_token_limit"], 0);
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_upstream_completion_is_502() {
+        let mut state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.malformed_response = true;
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let response = reqwest::Client::new()
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "x"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let response_status = response.status();
+        let response_text = response.text().await.unwrap();
+        assert_eq!(
+            response_status,
+            reqwest::StatusCode::BAD_GATEWAY,
+            "{response_text}"
+        );
+        let body: Value = serde_json::from_str(&response_text).unwrap();
+        assert_eq!(body["error"]["type"], "upstream_protocol_error");
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_stream_output_is_typed_sse_error_after_headers() {
+        let mut state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.malformed_response = true;
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let response = reqwest::Client::new()
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "stream": true,
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "x"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
+        let response_body = response.text().await.unwrap();
+        let data_frames: Vec<&str> = response_body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_ne!(data_frames.last().copied(), Some("[DONE]"));
+        let parsed_frames: Vec<Value> = data_frames
+            .iter()
+            .filter(|frame| **frame != "[DONE]")
+            .map(|frame| serde_json::from_str(frame).unwrap())
+            .collect();
+        let errors: Vec<&Value> = parsed_frames
+            .iter()
+            .filter_map(|frame| frame.get("error"))
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["type"], "upstream_protocol_error");
+        assert_eq!(errors[0]["code"], "upstream_protocol_error");
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_ttl_expiry_never_serves_stale_data_after_schema_failure() {
+        assert_eq!(
+            upstream_contract()["models_request"]["allow_stale_on_refresh_error"],
+            false
+        );
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) =
+            start_api_with_catalog_ttl(&upstream, "", std::time::Duration::from_millis(20)).await;
+        let client = reqwest::Client::new();
+
+        let first = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        *state.catalog.lock().unwrap() = json!({"models": "invalid"});
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        let expired = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(expired.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = expired.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "catalog_unavailable");
+        assert_eq!(state.model_requests.lock().unwrap().len(), 2);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_model_routes_share_one_catalog_fetch() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        state.model_delay_millis.store(50, Ordering::SeqCst);
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let url = format!("{api}/v1/models");
+            requests.push(tokio::spawn(async move {
+                client.get(url).send().await.unwrap()
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap().status(), reqwest::StatusCode::OK);
+        }
+        assert_eq!(state.model_requests.lock().unwrap().len(), 1);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_cache_is_scoped_by_authenticated_account() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            client
+                .get(format!("{api}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        write_auth_at(&auth_path, "second-account", "second-access-token");
+        assert_eq!(
+            client
+                .get(format!("{api}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let requests = state.model_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].0.get("chatgpt-account-id").unwrap(),
+            "account-id"
+        );
+        assert_eq!(
+            requests[1].0.get("chatgpt-account-id").unwrap(),
+            "second-account"
+        );
+        drop(requests);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_models_etag_invalidates_the_next_catalog_request() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        *state.response_models_etag.lock().unwrap() = Some("catalog-v2".to_string());
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            client
+                .get(format!("{api}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let chat = client
+            .post(format!("{api}/v1/chat/completions"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [
+                    {"role": "system", "content": "Answer concisely."},
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), reqwest::StatusCode::OK);
+
+        *state.catalog_etag.lock().unwrap() = "catalog-v2".to_string();
+        let refreshed = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(refreshed.status(), reqwest::StatusCode::OK);
+        assert!(refreshed.headers().get("etag").is_none());
+        assert_eq!(state.model_requests.lock().unwrap().len(), 2);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blank_catalog_etags_are_treated_as_absent() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        *state.catalog_etag.lock().unwrap() = String::new();
+        *state.response_models_etag.lock().unwrap() = Some(String::new());
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            client
+                .get(format!("{api}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{api}/v1/chat/completions"))
+                .json(&json!({
+                    "model": "live-model",
+                    "messages": [
+                        {"role": "system", "content": "Answer concisely."},
+                        {"role": "user", "content": "hello"}
+                    ]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{api}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(state.model_requests.lock().unwrap().len(), 1);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_never_exposes_the_upstream_catalog_etag() {
+        let secret = "access-token-sentinel";
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        *state.catalog_etag.lock().unwrap() = secret.to_string();
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{api}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body_text = response.text().await.unwrap();
+        let body: Value = serde_json::from_str(&body_text).unwrap();
+        assert!(body.get("catalog_etag").is_none());
+        assert!(!body_text.contains(secret));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_catalog_is_exposed_but_no_model_dependent_route_reaches_responses() {
+        let state = MockState::new(json!({"models": []}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        let client = reqwest::Client::new();
+
+        let models = client.get(format!("{api}/v1/models")).send().await.unwrap();
+        assert_eq!(models.status(), reqwest::StatusCode::OK);
+        let models_body: Value = models.json().await.unwrap();
+        assert_eq!(models_body["data"], json!([]));
+        let health = client.get(format!("{api}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["status"], "error");
+        assert_eq!(health_body["catalog_status"], "fresh");
+        assert_eq!(health_body["error"]["type"], "catalog_unavailable");
+        assert_eq!(
+            health_body["error"]["message"],
+            "authenticated model catalog is unavailable"
+        );
+        assert!(health_body["catalog_fetched_at"].as_str().is_some());
+        assert!(health_body["catalog_expires_at"].as_str().is_some());
+        for field in [
+            "model",
+            "reasoning_effort",
+            "context_window",
+            "auto_compact_token_limit",
+        ] {
+            assert!(health_body[field].is_null(), "{field}");
+        }
+        assert!(health_body.get("account_id").is_none());
+        assert!(health_body.get("token").is_none());
+
+        for (path, body, expected_status) in [
+            (
+                "/v1/images/generations",
+                json!({"prompt": "draw"}),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/v1/inspect",
+                json!({
+                    "prompt": "inspect",
+                    "images": [{"image_url": "data:image/png;base64,AA=="}]
+                }),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/v1/compact",
+                json!({
+                    "messages": [
+                        {"role": "system", "content": "Compact."},
+                        {"role": "user", "content": "history"}
+                    ]
+                }),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/v1/messages/compact",
+                json!({
+                    "model": "live-model",
+                    "max_tokens": 128,
+                    "system": "Compact.",
+                    "messages": [{"role": "user", "content": "history"}]
+                }),
+                reqwest::StatusCode::NOT_FOUND,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                json!({
+                    "model": "live-model",
+                    "system": "Count.",
+                    "messages": [{"role": "user", "content": "history"}]
+                }),
+                reqwest::StatusCode::NOT_FOUND,
+            ),
+            (
+                "/v1/messages",
+                json!({
+                    "model": "live-model",
+                    "max_tokens": 128,
+                    "system": "Answer.",
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+                reqwest::StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = client
+                .post(format!("{api}{path}"))
+                .header("x-claude-code-session-id", "test-session")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "{path}");
+        }
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_fresh_catalog_when_configured_model_is_missing() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "missing-model").await;
+
+        let health = reqwest::Client::new()
+            .get(format!("{api}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = health.json().await.unwrap();
+        assert_eq!(body["catalog_status"], "fresh");
+        assert_eq!(body["error"]["type"], "catalog_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "authenticated model catalog is unavailable"
+        );
+        assert!(body["catalog_fetched_at"].as_str().is_some());
+        assert!(body["catalog_expires_at"].as_str().is_some());
+        for field in [
+            "model",
+            "reasoning_effort",
+            "context_window",
+            "auto_compact_token_limit",
+        ] {
+            assert!(body[field].is_null(), "{field}");
+        }
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_accepts_a_model_without_optional_default_reasoning() {
+        let mut model = live_model("live-model", 1, true);
+        model["default_reasoning_level"] = Value::Null;
+        model["context_window"] = Value::Null;
+        model["max_context_window"] = Value::Null;
+        model["auto_compact_token_limit"] = Value::Null;
+        let state = MockState::new(json!({"models": [model]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+
+        let health = reqwest::Client::new()
+            .get(format!("{api}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let body: Value = health.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["catalog_status"], "fresh");
+        assert_eq!(body["model"], "live-model");
+        assert!(body["reasoning_effort"].is_null());
+        assert!(body["context_window"].is_null());
+        assert!(body["auto_compact_token_limit"].is_null());
+        assert!(body.get("error").is_none());
+
+        let count = reqwest::Client::new()
+            .post(format!("{api}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": "live-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(count.status(), reqwest::StatusCode::OK);
+        let count_body: Value = count.json().await.unwrap();
+        assert!(count_body["input_tokens"].as_u64().is_some());
+        assert!(count_body["context_window"].is_null());
+        assert!(count_body["auto_compact_token_limit"].is_null());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_auth_is_401_instead_of_a_catalog_fallback() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "").await;
+        std::fs::remove_file(&auth_path).unwrap();
+
+        let response = reqwest::Client::new()
+            .get(format!("{api}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(
+            body["error"]["message"],
+            "ChatGPT OAuth credentials are unavailable; rerun codex login"
+        );
+        assert!(!body.to_string().contains(auth_path.to_str().unwrap()));
+
+        let health = reqwest::Client::new()
+            .get(format!("{api}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["status"], "error");
+        assert_eq!(health_body["auth_available"], false);
+        assert_eq!(
+            health_body["error"]["message"],
+            "ChatGPT OAuth credentials are unavailable"
+        );
+
+        api_handle.abort();
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_code_anthropic_models_use_live_backend_without_forwarding_max_tokens() {
+        let state = MockState::new(json!({"models": [live_model("live-model", 1, true)]}));
+        let (upstream, upstream_handle) = start_mock_upstream(state.clone()).await;
+        let (api, auth_path, api_handle) = start_api(&upstream, "live-model").await;
+        let client = reqwest::Client::new();
+
+        for requested_model in ["live-model", "claude-sonnet-current"] {
+            let response = client
+                .post(format!("{api}/v1/messages"))
+                .header("x-claude-code-session-id", "test-session")
+                .json(&json!({
+                    "model": requested_model,
+                    "max_tokens": 128,
+                    "system": "Answer.",
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+            assert_eq!(body["model"], requested_model);
+        }
+
+        let requests = state.response_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(request["model"], "live-model");
+            assert!(request.get("max_tokens").is_none());
+            assert!(request.get("max_output_tokens").is_none());
+        }
+        drop(requests);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthError;
     use crate::messages::{Message, MessageRole};
     use axum::body::{Body, Bytes};
     use axum::http::{header::CONTENT_TYPE, Method, Uri};
@@ -2049,7 +5368,199 @@ mod tests {
     use tokio::task::JoinHandle;
 
     #[test]
-    fn auth_status_mapping_only_treats_missing_credentials_as_unauthorized() {
+    fn positive_integer_controls_accept_integral_json_number_forms() {
+        for value in [
+            json!(1),
+            json!(1.0),
+            json!(1e0),
+            json!(9_007_199_254_740_991.0),
+        ] {
+            assert!(positive_js_safe_integer(&value).is_some());
+        }
+        for value in [
+            json!(null),
+            json!(true),
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(9_007_199_254_740_992.0),
+        ] {
+            assert!(positive_js_safe_integer(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn openai_tool_choice_is_strictly_parsed_and_normalized() {
+        for choice in [json!("auto"), json!("none"), json!("required")] {
+            assert_eq!(
+                parse_openai_tool_choice(Some(&choice)).unwrap(),
+                Some(choice)
+            );
+        }
+        assert_eq!(
+            parse_openai_tool_choice(Some(&json!({
+                "type": "function",
+                "function": {"name": "lookup"}
+            })))
+            .unwrap(),
+            Some(json!({"type": "function", "name": "lookup"}))
+        );
+        for choice in [
+            json!(true),
+            json!(1),
+            json!("future"),
+            json!({}),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": null}),
+            json!({"type": "function", "function": {"name": ""}}),
+            json!({"type": "function", "function": {"name": "lookup", "extra": true}}),
+            json!({"type": "function", "function": {"name": "lookup"}, "extra": true}),
+        ] {
+            assert!(parse_openai_tool_choice(Some(&choice)).is_err());
+        }
+    }
+
+    #[test]
+    fn chat_messages_reject_role_mismatched_and_named_content() {
+        for value in [
+            json!({"role": "user", "content": [{"type": "output_text", "text": "wrong"}]}),
+            json!({"role": "system", "content": [{"type": "output_text", "text": "wrong"}]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [{"type": "output_text", "text": "wrong"}]
+            }),
+            json!({"role": "assistant", "content": [{"type": "input_text", "text": "wrong"}]}),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "lookup",
+                "content": "result"
+            }),
+        ] {
+            let message: ChatMessage = serde_json::from_value(value).unwrap();
+            assert!(matches!(
+                request_messages_to_internal(&[message]),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_messages_preserve_empty_content_arrays() {
+        for role in ["user", "developer", "assistant"] {
+            let message: ChatMessage =
+                serde_json::from_value(json!({"role": role, "content": []})).unwrap();
+            let normalized = request_messages_to_internal(&[message]).unwrap();
+            assert_eq!(normalized[0].structured_content, Some(vec![]));
+            let wire = crate::provider::messages_to_response_items(&normalized).unwrap();
+            assert_eq!(wire[0]["role"], role);
+            assert_eq!(wire[0]["content"], json!([]));
+        }
+    }
+
+    #[test]
+    fn chat_messages_accept_assistant_null_content_and_reject_missing_payload() {
+        let value = json!({"role": "assistant", "content": null});
+        validate_openai_chat_message_fields(&json!({"messages": [value.clone()]})).unwrap();
+        let message: ChatMessage = serde_json::from_value(value).unwrap();
+        let normalized = request_messages_to_internal(&[message]).unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, MessageRole::Assistant);
+        assert!(normalized[0].content.is_empty());
+        assert!(normalized[0].structured_content.is_none());
+        assert!(normalized[0].tool_calls.is_empty());
+
+        assert!(matches!(
+            validate_openai_chat_message_fields(&json!({
+                "messages": [{"role": "assistant"}]
+            })),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+
+        for role in ["system", "developer", "user", "tool"] {
+            let message: ChatMessage = serde_json::from_value(json!({"role": role})).unwrap();
+            assert!(matches!(
+                request_messages_to_internal(&[message]),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn chat_messages_normalize_input_audio_and_reject_invalid_shapes() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": "AAAA", "format": "wav"}
+            }]
+        }))
+        .unwrap();
+        let normalized = request_messages_to_internal(&[message]).unwrap();
+        assert_eq!(
+            normalized[0].structured_content,
+            Some(vec![json!({
+                "type": "input_audio",
+                "audio_url": "data:audio/wav;base64,AAAA"
+            })])
+        );
+
+        for content in [
+            json!({"type": "input_audio"}),
+            json!({"type": "input_audio", "input_audio": null}),
+            json!({"type": "input_audio", "input_audio": {"format": "wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "flac"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav", "extra": true}}),
+        ] {
+            let message: ChatMessage = serde_json::from_value(json!({
+                "role": "user",
+                "content": [content]
+            }))
+            .unwrap();
+            assert!(matches!(
+                request_messages_to_internal(&[message]),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+
+        let assistant: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": "AAAA", "format": "mp3"}
+            }]
+        }))
+        .unwrap();
+        assert!(matches!(
+            request_messages_to_internal(&[assistant]),
+            Err(ProviderError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn openai_stream_rejects_normalized_web_search_events() {
+        let mut state = OpenAiStreamState {
+            request_id: "chatcmpl-test".to_string(),
+            created: 0,
+            model: "gpt-5.5".to_string(),
+            tool_call_index: 0,
+            finished: false,
+        };
+        assert!(matches!(
+            state.push(&json!({
+                "type": "web_search_call",
+                "id": "search-1",
+                "input": {"query": "q"},
+                "content": []
+            })),
+            Err(ProviderError::UpstreamProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn auth_status_mapping_preserves_authentication_failures() {
         assert_eq!(
             map_error_status(&ProviderError::Auth(AuthError::Missing(
                 "missing".to_string()
@@ -2060,14 +5571,57 @@ mod tests {
             map_error_status(&ProviderError::Auth(AuthError::Refresh(
                 "failed".to_string()
             ))),
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::UNAUTHORIZED
         );
         assert_eq!(
             map_error_status(&ProviderError::Auth(AuthError::OAuth(
                 "invalid".to_string()
             ))),
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sse_event_bridge_applies_bounded_backpressure_and_cancels_on_drop() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Event::default().data("first")).await.unwrap();
+        assert_eq!(sender.max_capacity(), 1);
+
+        let worker_sender = sender.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = task::spawn_blocking(move || {
+            send_sse_event_with_backpressure(
+                &worker_sender,
+                Event::default().data("second"),
+                &worker_cancellation,
+                "test downstream disconnected",
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!worker.is_finished());
+
+        let mut downstream = DownstreamEventReceiver {
+            receiver,
+            cancellation: cancellation.clone(),
+        };
+        assert!(downstream.receiver.recv().await.is_some());
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(downstream.receiver.recv().await.is_some());
+        drop(downstream);
+        assert!(cancellation.load(Ordering::Acquire));
+
+        assert!(send_sse_event_with_backpressure(
+            &sender,
+            Event::default().data("third"),
+            &cancellation,
+            "test downstream disconnected",
+        )
+        .is_err());
     }
 
     fn has_nested_key(value: &Value, key: &str) -> bool {
@@ -2098,17 +5652,20 @@ mod tests {
     #[derive(Clone)]
     struct RecordingState {
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        response_prefix_events: Arc<Mutex<Vec<Value>>>,
         response_output: Arc<Mutex<Vec<Value>>>,
         emit_completed: Arc<Mutex<bool>>,
         trailing_event: Arc<Mutex<Option<Value>>>,
         completed_response_id: Arc<Mutex<Value>>,
         response_usage: Arc<Mutex<Value>>,
+        completed_end_turn: Arc<Mutex<Option<Value>>>,
     }
 
     impl Default for RecordingState {
         fn default() -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                response_prefix_events: Arc::new(Mutex::new(Vec::new())),
                 response_output: Arc::new(Mutex::new(vec![json!({
                     "type": "message",
                     "role": "assistant",
@@ -2120,8 +5677,10 @@ mod tests {
                 response_usage: Arc::new(Mutex::new(json!({
                     "input_tokens": 2,
                     "output_tokens": 1,
-                    "total_tokens": 3
+                    "total_tokens": 3,
+                    "input_tokens_details": {"cached_tokens": 0}
                 }))),
+                completed_end_turn: Arc::new(Mutex::new(Some(json!(true)))),
             }
         }
     }
@@ -2150,6 +5709,14 @@ mod tests {
 
         fn set_response_output(&self, output: Vec<Value>) {
             *self.response_output.lock().unwrap() = output;
+        }
+
+        fn set_response_prefix_events(&self, events: Vec<Value>) {
+            *self.response_prefix_events.lock().unwrap() = events;
+        }
+
+        fn response_prefix_events(&self) -> Vec<Value> {
+            self.response_prefix_events.lock().unwrap().clone()
         }
 
         fn response_output(&self) -> Vec<Value> {
@@ -2187,6 +5754,14 @@ mod tests {
         fn response_usage(&self) -> Value {
             self.response_usage.lock().unwrap().clone()
         }
+
+        fn set_completed_end_turn(&self, end_turn: Option<bool>) {
+            *self.completed_end_turn.lock().unwrap() = end_turn.map(Value::Bool);
+        }
+
+        fn completed_end_turn(&self) -> Option<Value> {
+            self.completed_end_turn.lock().unwrap().clone()
+        }
     }
 
     async fn record_responses_request(
@@ -2203,7 +5778,7 @@ mod tests {
             headers,
             body,
         );
-        let completed = json!({
+        let mut completed = json!({
             "type": "response.completed",
             "response": {
                 "id": state.completed_response_id(),
@@ -2211,7 +5786,16 @@ mod tests {
                 "usage": state.response_usage()
             }
         });
+        if let Some(end_turn) = state.completed_end_turn() {
+            completed["response"]["end_turn"] = end_turn;
+        }
         let mut stream_body = String::new();
+        for event in state.response_prefix_events() {
+            stream_body.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::to_string(&event).unwrap()
+            ));
+        }
         for item in state.response_output() {
             let done = json!({"type": "response.output_item.done", "item": item});
             stream_body.push_str(&format!(
@@ -2278,9 +5862,67 @@ mod tests {
         }))
     }
 
+    fn live_model(slug: &str, priority: i32, use_responses_lite: bool) -> Value {
+        json!({
+            "slug": slug,
+            "display_name": slug,
+            "description": "live catalog test fixture",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "none", "description": "none"},
+                {"effort": "low", "description": "low"},
+                {"effort": "medium", "description": "medium"},
+                {"effort": "high", "description": "high"},
+                {"effort": "max", "description": "max"}
+            ],
+            "multi_agent_reasoning_effort": "max",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": priority,
+            "service_tiers": [{"id": "priority", "name": "Priority", "description": "Priority"}],
+            "default_service_tier": null,
+            "support_verbosity": true,
+            "default_verbosity": "low",
+            "supports_image_detail_original": true,
+            "context_window": 272000,
+            "max_context_window": 272000,
+            "auto_compact_token_limit": null,
+            "input_modalities": ["text", "image"],
+            "use_responses_lite": use_responses_lite
+        })
+    }
+
+    async fn test_models() -> Json<Value> {
+        Json(json!({
+            "models": [
+                live_model("gpt-5.5", 1, false),
+                live_model("gpt-5.6-sol", 2, true)
+            ]
+        }))
+    }
+
+    async fn effective_context_overflow_models() -> Json<Value> {
+        let mut model = live_model("gpt-effective-context-overflow", 1, false);
+        model["context_window"] = json!(9_007_199_254_740_991i64);
+        model["max_context_window"] = json!(9_007_199_254_740_991i64);
+        model["effective_context_window_percent"] = json!(9_007_199_254_740_991i64);
+        Json(json!({"models": [model]}))
+    }
+
+    async fn start_effective_context_overflow_upstream() -> (String, JoinHandle<()>) {
+        let app = Router::new().route("/models", get(effective_context_overflow_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
     async fn start_recording_upstream() -> (String, RecordingState, JoinHandle<()>) {
         let state = RecordingState::default();
         let app = Router::new()
+            .route("/models", get(test_models))
             .route("/responses", post(record_responses_request))
             .route("/responses/compact", post(record_compact_request))
             .with_state(state.clone());
@@ -2330,6 +5972,7 @@ mod tests {
                         "type": "response.completed",
                         "response": {
                             "id": "resp-incremental",
+                            "end_turn": true,
                             "output": [],
                             "usage": {
                                 "input_tokens": 2,
@@ -2362,6 +6005,7 @@ mod tests {
             release_completion: Arc::new(Semaphore::new(0)),
         };
         let app = Router::new()
+            .route("/models", get(test_models))
             .route("/responses", post(gated_sse_response))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2381,7 +6025,9 @@ mod tests {
     }
 
     async fn start_silent_sse_upstream() -> (String, JoinHandle<()>) {
-        let app = Router::new().route("/responses", post(silent_sse_response));
+        let app = Router::new()
+            .route("/models", get(test_models))
+            .route("/responses", post(silent_sse_response));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -2397,8 +6043,40 @@ mod tests {
     async fn start_fixed_status_upstream(status: u16) -> (String, JoinHandle<()>) {
         let status = StatusCode::from_u16(status).unwrap();
         let app = Router::new()
+            .route("/models", get(test_models))
             .route("/responses", post(fixed_status_response))
             .with_state(status);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    async fn slow_error_body_response() -> impl IntoResponse {
+        let body_stream = stream::unfold(0usize, |index| async move {
+            if index >= 100 {
+                return None;
+            }
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Some((
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"x")),
+                index + 1,
+            ))
+        });
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Body::from_stream(body_stream),
+        )
+    }
+
+    async fn start_slow_error_body_upstream() -> (String, JoinHandle<()>) {
+        let app = Router::new()
+            .route("/models", get(test_models))
+            .route("/responses", post(slow_error_body_response));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -2437,13 +6115,26 @@ mod tests {
             "type": "response.completed",
             "response": {
                 "id": "resp-auth-retry",
+                "end_turn": true,
                 "output": [],
                 "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
             }
         });
+        let output = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "refreshed"}]
+            }
+        });
         (
             [(CONTENT_TYPE, "text/event-stream")],
-            format!("data: {}\n\n", serde_json::to_string(&completed).unwrap()),
+            format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::to_string(&output).unwrap(),
+                serde_json::to_string(&completed).unwrap()
+            ),
         )
             .into_response()
     }
@@ -2462,6 +6153,7 @@ mod tests {
     async fn start_auth_retry_upstream() -> (String, AuthRetryState, JoinHandle<()>) {
         let state = AuthRetryState::default();
         let app = Router::new()
+            .route("/models", get(test_models))
             .route("/responses", post(auth_retry_responses))
             .route("/token", post(auth_retry_token))
             .with_state(state.clone());
@@ -2531,8 +6223,6 @@ mod tests {
         model_auto_compact_token_limit: Option<i64>,
     ) -> CodexConfig {
         CodexConfig {
-            codex_home: "/tmp/codex-as-api-test".to_string(),
-            config_path: "/tmp/codex-as-api-test/config.toml".to_string(),
             model: None,
             model_reasoning_effort: model_reasoning_effort.map(|value| value.to_string()),
             model_context_window,
@@ -2585,9 +6275,9 @@ mod tests {
             upstream_base_url.to_string(),
             Some(auth_path_string.clone()),
             Some(timeout),
-        );
+        )
+        .unwrap();
         let app = create_router(AppState {
-            model: state_model.to_string(),
             auth_path: Some(auth_path_string),
             codex_config,
             provider: Arc::new(provider),
@@ -2602,16 +6292,37 @@ mod tests {
 
     fn helper_state(model: &str, codex_config: CodexConfig) -> AppState {
         AppState {
-            model: model.to_string(),
             auth_path: None,
             codex_config,
-            provider: Arc::new(ChatGPTOAuthProvider::new(
-                model.to_string(),
-                "http://127.0.0.1:1".to_string(),
-                None,
-                None,
-            )),
+            provider: Arc::new(
+                ChatGPTOAuthProvider::new(
+                    model.to_string(),
+                    "http://127.0.0.1:1".to_string(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
         }
+    }
+
+    fn model_for_settings(
+        context_window: Option<i64>,
+        max_context_window: Option<i64>,
+        auto_compact_token_limit: Option<i64>,
+        default_reasoning_level: Option<&str>,
+    ) -> Arc<ModelInfo> {
+        let mut model = live_model("live-settings-model", 0, false);
+        model["context_window"] = context_window.map_or(Value::Null, Value::from);
+        model["max_context_window"] = max_context_window.map_or(Value::Null, Value::from);
+        model["auto_compact_token_limit"] =
+            auto_compact_token_limit.map_or(Value::Null, Value::from);
+        model["default_reasoning_level"] = default_reasoning_level.map_or(Value::Null, Value::from);
+        crate::model_catalog::parse_models_response(
+            &serde_json::to_vec(&json!({"models": [model]})).unwrap(),
+        )
+        .unwrap()
+        .remove(0)
     }
 
     #[test]
@@ -2637,8 +6348,9 @@ mod tests {
         let msg = Message::new(MessageRole::User, "hello".to_string(), vec![], None, None).unwrap();
         let tools = vec![ToolSchema {
             name: "lookup".to_string(),
-            description: "Search docs".to_string(),
+            description: Some("Search docs".to_string()),
             parameters: json!({"type": "object"}),
+            strict: false,
         }];
         let expected_tokens = BASE_PROMPT_TOKENS
             + MESSAGE_BOUNDARY_TOKENS
@@ -2656,7 +6368,7 @@ mod tests {
         let tool_call = ToolCall {
             id: "call_123".to_string(),
             name: "lookup".to_string(),
-            arguments: HashMap::from([("query".to_string(), json!("문서"))]),
+            arguments: "{\"query\":\"문서\"}".to_string(),
         };
         let mut assistant = Message::new(
             MessageRole::Assistant,
@@ -2729,9 +6441,7 @@ mod tests {
                     "type": "clear_thinking_20251015",
                     "keep": "all"
                 }]
-            },
-            "multi_agent": null,
-            "programmatic_tool_calling": null
+            }
         });
 
         let response = client
@@ -2748,6 +6458,8 @@ mod tests {
         assert!(recording.requests().is_empty());
 
         for (field, value) in [
+            ("multi_agent", Value::Null),
+            ("programmatic_tool_calling", Value::Null),
             ("multi_agent", json!({"enabled": true})),
             ("programmatic_tool_calling", json!({"enabled": true})),
             ("tools", json!([{"type": "programmatic_tool_calling"}])),
@@ -2795,7 +6507,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anthropic_count_tokens_uses_normalized_input_and_ignores_control_fields() {
+    async fn anthropic_count_tokens_uses_normalized_input_and_ignores_supported_control_fields() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -2817,7 +6529,7 @@ mod tests {
                 }
             }]
         });
-        let (messages, tools, _, _, _, _) = anthropic_request_to_internal(&base_body).unwrap();
+        let (messages, tools, _, _, _, _, _) = anthropic_request_to_internal(&base_body).unwrap();
         let expected = estimate_input_tokens(&messages, tools.as_deref());
 
         let base_response = client
@@ -2833,12 +6545,6 @@ mod tests {
         let mut controlled_body = base_body.clone();
         let controlled = controlled_body.as_object_mut().unwrap();
         controlled.insert("max_tokens".to_string(), json!(128_000));
-        controlled.insert("stream".to_string(), json!(true));
-        controlled.insert("temperature".to_string(), json!(0.1));
-        controlled.insert(
-            "metadata".to_string(),
-            json!({"padding": "x".repeat(4_000)}),
-        );
         controlled.insert("output_config".to_string(), json!({"effort": "max"}));
         let tool = controlled
             .get_mut("tools")
@@ -2847,10 +6553,10 @@ mod tests {
             .and_then(Value::as_object_mut)
             .unwrap();
         tool.insert("strict".to_string(), json!(false));
-        tool.insert("defer_loading".to_string(), json!(false));
 
         let controlled_response = client
             .post(format!("{api_url}/v1/messages/count_tokens"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&controlled_body)
             .send()
             .await
@@ -2882,7 +6588,7 @@ mod tests {
         let requested = client
             .post(format!("{api_url}/v1/messages/count_tokens"))
             .json(&json!({
-                "model": "gpt-5.6",
+                "model": "gpt-5.6-sol",
                 "messages": [{"role": "user", "content": "Count this."}]
             }))
             .send()
@@ -2890,10 +6596,10 @@ mod tests {
             .unwrap();
         assert_eq!(requested.status(), reqwest::StatusCode::OK);
         let requested_body: Value = requested.json().await.unwrap();
-        assert_eq!(requested_body["context_window"], json!(272_000));
+        assert_eq!(requested_body["context_window"], json!(258_400));
         assert_eq!(requested_body["auto_compact_token_limit"], json!(244_800));
 
-        let fallback = client
+        let configured_backend = client
             .post(format!("{api_url}/v1/messages/count_tokens"))
             .json(&json!({
                 "model": "claude-sonnet-4-6",
@@ -2902,10 +6608,13 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(fallback.status(), reqwest::StatusCode::OK);
-        let fallback_body: Value = fallback.json().await.unwrap();
-        assert_eq!(fallback_body["context_window"], json!(272_000));
-        assert_eq!(fallback_body["auto_compact_token_limit"], json!(244_800));
+        assert_eq!(configured_backend.status(), reqwest::StatusCode::OK);
+        let configured_backend_body: Value = configured_backend.json().await.unwrap();
+        assert_eq!(configured_backend_body["context_window"], json!(258_400));
+        assert_eq!(
+            configured_backend_body["auto_compact_token_limit"],
+            json!(244_800)
+        );
         assert!(recording.requests().is_empty());
 
         api_handle.abort();
@@ -2914,8 +6623,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anthropic_route_uses_known_gpt_model_and_output_config_effort_then_falls_back_for_claude(
-    ) {
+    async fn anthropic_route_uses_live_gpt_model_and_explicit_backend_for_claude() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -2927,12 +6635,13 @@ mod tests {
 
         let gpt_response = client
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
-                "model": "gpt-5.6",
-                "max_tokens": 64,
+                "model": "gpt-5.6-sol",
+                "max_tokens": 2048,
                 "system": "You are precise.",
                 "messages": [{"role": "user", "content": "Use the requested GPT model."}],
-                "thinking": {"type": "enabled"},
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
                 "output_config": {"effort": "low"},
                 "speed": "fast",
                 "service_tier": "priority",
@@ -2949,15 +6658,16 @@ mod tests {
         let gpt_status = gpt_response.status();
         let gpt_body: Value = gpt_response.json().await.unwrap();
         assert_eq!(gpt_status, reqwest::StatusCode::OK, "{gpt_body}");
-        assert_eq!(gpt_body["model"], json!("gpt-5.6"));
+        assert_eq!(gpt_body["model"], json!("gpt-5.6-sol"));
 
         let claude_response = client
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "claude-opus-4-6",
                 "max_tokens": 64,
                 "system": "You are precise.",
-                "messages": [{"role": "user", "content": "Use the configured fallback."}],
+                "messages": [{"role": "user", "content": "Use the configured backend."}],
                 "speed": "standard"
             }))
             .send()
@@ -2984,29 +6694,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anthropic_stream_web_search_uses_disabled_thinking_over_ambient_effort() {
+    async fn anthropic_stream_custom_tool_uses_disabled_thinking_over_ambient_effort() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
-        recording.set_response_output(vec![
-            json!({
-                "type": "web_search_call",
-                "id": "search-1",
-                "status": "completed",
-                "action": {
-                    "type": "search",
-                    "query": "Codex release notes",
-                    "sources": [{
-                        "type": "url",
-                        "url": "https://example.com/codex",
-                        "title": "Codex release notes"
-                    }]
-                }
-            }),
-            json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "Search complete."}]
-            }),
-        ]);
+        recording.set_response_output(vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Lookup complete."}]
+        })]);
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
             "gpt-5.6-sol",
@@ -3016,12 +6710,20 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 100,
                 "system": "Use the available tools.",
-                "messages": [{"role": "user", "content": "Search the web."}],
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{"role": "user", "content": "Look up the docs."}],
+                "tools": [{
+                    "name": "lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }],
                 "stream": true,
                 "thinking": {"type": "disabled"},
                 "output_config": {"effort": "high"},
@@ -3030,17 +6732,15 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(CONTENT_TYPE)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "text/event-stream"
-        );
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let mut pending = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{pending}");
+        assert_eq!(content_type.as_deref(), Some("text/event-stream"));
         let mut events = Vec::new();
         parse_anthropic_sse_blocks(&mut pending, &mut events);
         assert!(pending.is_empty());
@@ -3048,35 +6748,13 @@ mod tests {
         assert_eq!(events.last().unwrap().0, "message_stop");
         assert_eq!(events.last().unwrap().1["type"], json!("message_stop"));
 
-        let server_tool_use = events
-            .iter()
-            .find(|(event, data)| {
-                event == "content_block_start"
-                    && data["content_block"]["type"] == json!("server_tool_use")
-            })
-            .unwrap();
-        assert_eq!(server_tool_use.1["content_block"]["name"], "web_search");
-        let search_result = events
-            .iter()
-            .find(|(event, data)| {
-                event == "content_block_start"
-                    && data["content_block"]["type"] == json!("web_search_tool_result")
-            })
-            .unwrap();
-        assert_eq!(
-            search_result.1["content_block"]["tool_use_id"],
-            server_tool_use.1["content_block"]["id"]
-        );
-
         let requests = recording.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].endpoint, RecordedEndpoint::Responses);
         assert_eq!(requests[0].body["model"], json!("gpt-5.6-sol"));
         assert_eq!(requests[0].body["reasoning"]["effort"], json!("none"));
-        assert_eq!(
-            requests[0].body["tools"],
-            json!([{"type": "web_search", "external_web_access": true}])
-        );
+        assert_eq!(requests[0].body["tools"][0]["type"], json!("function"));
+        assert_eq!(requests[0].body["tools"][0]["name"], json!("lookup"));
         assert!(requests[0]
             .headers
             .get(crate::model_capabilities::LITE_HEADER_NAME)
@@ -3098,6 +6776,7 @@ mod tests {
         .await;
         let response = reqwest::Client::new()
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "gpt-5.5",
                 "max_tokens": 64,
@@ -3105,8 +6784,7 @@ mod tests {
                 "tools": [{
                     "name": "lookup",
                     "strict": false,
-                    "defer_loading": null,
-                    "eager_input_streaming": false,
+                    "eager_input_streaming": null,
                     "input_schema": {"type": "object"}
                 }],
                 "messages": [
@@ -3252,7 +6930,7 @@ mod tests {
             json!({
                 "tools": [{
                     "name": "lookup",
-                    "strict": true,
+                    "defer_loading": true,
                     "input_schema": {"type": "object"}
                 }]
             }),
@@ -3395,71 +7073,250 @@ mod tests {
     }
 
     #[test]
-    fn catalog_defaults_drive_reasoning_context_and_compaction_threshold() {
-        let state = helper_state("gpt-5.6-sol", test_codex_config(None, None, None));
+    fn live_catalog_defaults_drive_reasoning_context_and_compaction_threshold() {
+        let state = helper_state("live-settings-model", test_codex_config(None, None, None));
+        let model = model_for_settings(Some(272_000), Some(272_000), None, Some("low"));
 
         assert_eq!(
-            effective_reasoning_effort(&state, None, &state.model),
+            effective_reasoning_effort_with_options(&state, None, None, &model).unwrap(),
             Some("low".to_string())
         );
-        assert_eq!(context_window(&state), 272_000);
-        assert_eq!(auto_compact_token_limit(&state), 244_800);
+        assert_eq!(
+            context_window_for_model(&state, &model).unwrap(),
+            Some(258_400)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(244_800)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_effective_context_overflow_fails_health_and_count() {
+        let (upstream_url, upstream_handle) = start_effective_context_overflow_upstream().await;
+        let model = "gpt-effective-context-overflow";
+        let (api_url, auth_path, api_handle) =
+            start_api_server(&upstream_url, model, test_codex_config(None, None, None)).await;
+
+        let client = reqwest::Client::new();
+        let health = client
+            .get(format!("{api_url}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let health_body: Value = health.json().await.unwrap();
+        assert_eq!(health_body["error"]["type"], json!("catalog_unavailable"));
+
+        let count = client
+            .post(format!("{api_url}/v1/messages/count_tokens"))
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(count.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let count_body: Value = count.json().await.unwrap();
+        assert_eq!(count_body["error"]["type"], json!("api_error"));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
     }
 
     #[test]
-    fn unknown_model_uses_legacy_context_and_compaction_fallback() {
-        let state = helper_state("unknown-model", test_codex_config(None, None, None));
+    fn missing_live_context_remains_absent_without_a_config_override() {
+        let state = helper_state("live-settings-model", test_codex_config(None, None, None));
+        let model = model_for_settings(None, None, None, None);
 
-        assert_eq!(effective_reasoning_effort(&state, None, &state.model), None);
-        assert_eq!(context_window(&state), 200_000);
-        assert_eq!(auto_compact_token_limit(&state), 160_000);
+        assert_eq!(context_window_for_model(&state, &model).unwrap(), None);
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn unknown_model_explicit_compaction_limit_clamps_to_resolved_fallback_context() {
+    fn configured_context_applies_when_live_context_is_absent() {
         let state = helper_state(
-            "unknown-model",
+            "live-settings-model",
+            test_codex_config(None, Some(100_000), None),
+        );
+        let model = model_for_settings(None, None, None, None);
+
+        assert_eq!(
+            context_window_for_model(&state, &model).unwrap(),
+            Some(95_000)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(90_000)
+        );
+    }
+
+    #[test]
+    fn explicit_compaction_is_clamped_to_ninety_percent_of_context() {
+        let state = helper_state(
+            "live-settings-model",
             test_codex_config(None, None, Some(190_000)),
         );
+        let model = model_for_settings(Some(100_000), Some(120_000), None, None);
 
-        assert_eq!(context_window(&state), 200_000);
-        assert_eq!(auto_compact_token_limit(&state), 180_000);
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(90_000)
+        );
     }
 
     #[test]
-    fn request_effort_precedes_config_and_catalog_without_wire_conversion() {
-        let state = helper_state("gpt-5.6-sol", test_codex_config(Some("ultra"), None, None));
+    fn request_effort_precedes_config_and_live_catalog() {
+        let state = helper_state(
+            "live-settings-model",
+            test_codex_config(Some("low"), None, None),
+        );
+        let model = model_for_settings(Some(100_000), Some(120_000), None, Some("medium"));
 
         assert_eq!(
-            effective_reasoning_effort(&state, Some("CustomEffort"), &state.model),
-            Some("CustomEffort".to_string())
+            effective_reasoning_effort_with_options(&state, Some("high"), None, &model).unwrap(),
+            Some("high".to_string())
         );
         assert_eq!(
-            effective_reasoning_effort(&state, None, &state.model),
-            Some("ultra".to_string())
+            effective_reasoning_effort_with_options(&state, None, None, &model).unwrap(),
+            Some("low".to_string())
         );
+    }
+
+    #[test]
+    fn configured_effort_errors_are_internal_while_request_errors_are_caller_errors() {
+        let model = model_for_settings(Some(100_000), Some(120_000), None, Some("medium"));
+        for configured in ["", "not-supported"] {
+            let state = helper_state(
+                "live-settings-model",
+                test_codex_config(Some(configured), None, None),
+            );
+            assert!(matches!(
+                effective_reasoning_effort_with_options(&state, None, None, &model),
+                Err(ProviderError::Request(_))
+            ));
+        }
+
+        let state = helper_state("live-settings-model", test_codex_config(None, None, None));
+        assert!(matches!(
+            effective_reasoning_effort_with_options(&state, Some("not-supported"), None, &model),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]
     fn configured_context_uses_official_ninety_percent_compaction_default() {
         let state = helper_state(
-            "unknown-model",
+            "live-settings-model",
             test_codex_config(None, Some(100_000), None),
         );
+        let model = model_for_settings(Some(80_000), Some(120_000), None, None);
 
-        assert_eq!(context_window(&state), 100_000);
-        assert_eq!(auto_compact_token_limit(&state), 90_000);
+        assert_eq!(
+            context_window_for_model(&state, &model).unwrap(),
+            Some(95_000)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(90_000)
+        );
     }
 
     #[test]
-    fn catalog_maximum_clamps_context_and_explicit_compaction_overrides() {
+    fn configured_context_without_a_live_max_is_not_clamped_to_live_context() {
         let state = helper_state(
-            "gpt-5.6-sol",
+            "live-settings-model",
+            test_codex_config(None, Some(100_000), None),
+        );
+        let model = model_for_settings(Some(80_000), None, None, None);
+
+        assert_eq!(
+            context_window_for_model(&state, &model).unwrap(),
+            Some(95_000)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(90_000)
+        );
+    }
+
+    #[test]
+    fn configured_context_and_compaction_are_clamped_to_live_limits() {
+        let state = helper_state(
+            "live-settings-model",
             test_codex_config(None, Some(500_000), Some(450_000)),
         );
+        let model = model_for_settings(Some(272_000), Some(272_000), None, None);
 
-        assert_eq!(context_window(&state), 272_000);
-        assert_eq!(auto_compact_token_limit(&state), 244_800);
+        assert_eq!(
+            context_window_for_model(&state, &model).unwrap(),
+            Some(258_400)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(&state, &model).unwrap(),
+            Some(244_800)
+        );
+    }
+
+    #[test]
+    fn nonpositive_live_catalog_limits_fail_when_consumed() {
+        let state = helper_state("live-settings-model", test_codex_config(None, None, None));
+        assert!(context_window_for_model(
+            &state,
+            &model_for_settings(Some(0), Some(1), None, None)
+        )
+        .is_err());
+        assert!(
+            context_window_for_model(&state, &model_for_settings(None, Some(-1), None, None))
+                .is_err()
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(
+                &state,
+                &model_for_settings(Some(100_000), Some(100_000), Some(0), None),
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(
+                &state,
+                &model_for_settings(Some(100_000), Some(100_000), Some(-1), None),
+            )
+            .unwrap(),
+            Some(-1)
+        );
+        assert_eq!(
+            auto_compact_token_limit_for_model(
+                &state,
+                &model_for_settings(Some(1), Some(1), None, None),
+            )
+            .unwrap(),
+            Some(0)
+        );
+
+        let configured = helper_state(
+            "live-settings-model",
+            test_codex_config(None, Some(50_000), None),
+        );
+        assert_eq!(
+            context_window_for_model(
+                &configured,
+                &model_for_settings(Some(0), Some(100_000), None, None),
+            )
+            .unwrap(),
+            Some(47_500)
+        );
+        assert!(context_window_for_model(
+            &configured,
+            &model_for_settings(Some(100_000), Some(0), None, None),
+        )
+        .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3497,9 +7354,13 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let response_body: Value = response.json().await.unwrap();
-        assert_eq!(response_body["model"], json!("codex-oauth:gpt-5.6-sol"));
+        let status = response.status();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{response_body}");
+        let response_body: Value = serde_json::from_str(&response_body).unwrap();
+        assert_eq!(response_body["model"], json!("gpt-5.6-sol"));
+        assert!(response_body["choices"][0]["logprobs"].is_null());
+        assert!(response_body["choices"][0]["message"]["refusal"].is_null());
 
         let requests = recording.requests();
         assert_eq!(requests.len(), 1);
@@ -3601,7 +7462,7 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
@@ -3655,7 +7516,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let response_body: Value = response.json().await.unwrap();
-        assert_eq!(response_body["model"], json!("codex-oauth:gpt-5.6-sol"));
+        assert_eq!(response_body["model"], json!("gpt-5.6-sol"));
         assert_eq!(
             response_body["choices"][0]["finish_reason"],
             json!("tool_calls")
@@ -3677,7 +7538,7 @@ mod tests {
         );
         assert_eq!(
             recording.requests()[0].body["reasoning"]["effort"],
-            json!("low")
+            json!("medium")
         );
 
         let stream_response = reqwest::Client::new()
@@ -3728,7 +7589,6 @@ mod tests {
                 "total_tokens": 3,
                 "prompt_tokens_details": {
                     "cached_tokens": 0,
-                    "cache_write_tokens": 0,
                 }
             })
         );
@@ -3737,6 +7597,206 @@ mod tests {
             .find(|event| event["choices"][0]["finish_reason"] == json!("tool_calls"))
             .unwrap();
         assert_eq!(terminal["choices"][0]["delta"], json!({}));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chat_route_handles_completion_terminal_semantics_and_reasoning_mismatch() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        recording.set_response_output(vec![]);
+        recording.set_completed_end_turn(None);
+        recording.set_response_usage(json!({
+            "input_tokens": 1,
+            "output_tokens": 0,
+            "total_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 0}
+        }));
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "system", "content": "Follow the request."},
+                {"role": "user", "content": "Return nothing."}
+            ],
+            "responses_lite": false
+        });
+
+        let terminal_without_end_turn = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let terminal_status = terminal_without_end_turn.status();
+        let terminal_body: Value = terminal_without_end_turn.json().await.unwrap();
+        assert_eq!(terminal_status, reqwest::StatusCode::OK, "{terminal_body}");
+        assert_eq!(terminal_body["choices"][0]["finish_reason"], "stop");
+
+        recording.set_completed_end_turn(Some(false));
+
+        let empty = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let empty_status = empty.status();
+        let empty_body: Value = empty.json().await.unwrap();
+        assert_eq!(
+            empty_status,
+            reqwest::StatusCode::BAD_GATEWAY,
+            "{empty_body}"
+        );
+        assert_eq!(empty_body["error"]["type"], "upstream_protocol_error");
+
+        let mut stream_request = request.clone();
+        stream_request["stream"] = json!(true);
+        let stream = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&stream_request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), reqwest::StatusCode::OK);
+        let stream_body = stream.text().await.unwrap();
+        assert!(stream_body.contains("upstream_protocol_error"));
+        assert!(!stream_body.contains("[DONE]"));
+
+        recording.set_response_output(vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "not terminal"}]
+        })]);
+        let not_terminal = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(not_terminal.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let not_terminal_body: Value = not_terminal.json().await.unwrap();
+        assert_eq!(
+            not_terminal_body["error"]["type"],
+            "upstream_protocol_error"
+        );
+
+        recording.set_completed_end_turn(Some(true));
+        recording.set_response_prefix_events(vec![json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "streamed summary",
+            "summary_index": 0
+        })]);
+        recording.set_response_output(vec![json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "different final summary"}]
+        })]);
+        let reasoning = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reasoning.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let reasoning_body: Value = reasoning.json().await.unwrap();
+        assert_eq!(reasoning_body["error"]["type"], "upstream_protocol_error");
+
+        recording.set_response_prefix_events(vec![json!({
+            "type": "response.reasoning_text.delta",
+            "delta": "streamed raw",
+            "content_index": 0
+        })]);
+        recording.set_response_output(vec![json!({
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "different raw"}]
+        })]);
+        let raw_reasoning = client
+            .post(format!("{api_url}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(raw_reasoning.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let raw_reasoning_body: Value = raw_reasoning.json().await.unwrap();
+        assert_eq!(
+            raw_reasoning_body["error"]["type"],
+            "upstream_protocol_error"
+        );
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn openai_chat_rejects_web_search_and_image_generation_provider_items() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let request = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "responses_lite": false,
+            "codex_metadata": false
+        });
+
+        for output in [
+            json!({
+                "type": "web_search_call",
+                "id": "search-1",
+                "status": "completed",
+                "action": {"type": "search", "query": "q", "sources": []}
+            }),
+            json!({
+                "type": "image_generation_call",
+                "id": "image-1",
+                "status": "completed",
+                "result": "data:image/png;base64,AAAA"
+            }),
+        ] {
+            recording.set_response_output(vec![output]);
+
+            let response = client
+                .post(format!("{api_url}/v1/chat/completions"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["type"], "upstream_protocol_error");
+
+            let mut streaming_request = request.clone();
+            streaming_request["stream"] = json!(true);
+            let stream_response = client
+                .post(format!("{api_url}/v1/chat/completions"))
+                .json(&streaming_request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(stream_response.status(), reqwest::StatusCode::OK);
+            let events = parse_sse_json_events(&stream_response.text().await.unwrap());
+            let errors: Vec<&Value> = events
+                .iter()
+                .filter(|event| event.get("error").is_some())
+                .collect();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0]["error"]["type"], "upstream_protocol_error");
+        }
 
         api_handle.abort();
         upstream_handle.abort();
@@ -3769,12 +7829,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("upstream_protocol_error"));
         assert_eq!(recording.requests().len(), 1);
 
         let chained_after_incomplete = reqwest::Client::new()
@@ -3808,12 +7865,12 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            inspect_response.status(),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(inspect_response.status(), reqwest::StatusCode::BAD_GATEWAY);
         let inspect_body: Value = inspect_response.json().await.unwrap();
-        assert_eq!(inspect_body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(
+            inspect_body["error"]["type"],
+            json!("upstream_protocol_error")
+        );
         assert_eq!(recording.requests().len(), 2);
 
         api_handle.abort();
@@ -3847,12 +7904,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("upstream_protocol_error"));
         assert_eq!(recording.requests().len(), 1);
 
         api_handle.abort();
@@ -3918,7 +7972,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn anthropic_stream_rejects_auto_and_on_lite_hosted_web_search_before_sse_headers() {
+    async fn anthropic_routes_reject_hosted_web_search_before_provider_work() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -3927,37 +7981,153 @@ mod tests {
         )
         .await;
 
-        for responses_lite in ["auto", "on"] {
-            let response = reqwest::Client::new()
-                .post(format!("{api_url}/v1/messages"))
-                .json(&json!({
+        for responses_lite in ["auto", "on", "off"] {
+            for route in [
+                "/v1/messages",
+                "/v1/messages/count_tokens",
+                "/v1/messages/compact",
+            ] {
+                let mut body = json!({
                     "model": "claude-sonnet-4-5",
                     "system": "Use the available tools.",
                     "messages": [{"role": "user", "content": "Search the web."}],
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                    "stream": true,
-                    "responses_lite": responses_lite,
                     "max_tokens": 100
+                });
+                if route == "/v1/messages" {
+                    body["stream"] = json!(true);
+                    body["responses_lite"] = json!(responses_lite);
+                } else if route == "/v1/messages/compact" {
+                    body["responses_lite"] = json!(responses_lite);
+                }
+                let response = reqwest::Client::new()
+                    .post(format!("{api_url}{route}"))
+                    .header("x-claude-code-session-id", "test-session")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    "application/json"
+                );
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["type"], json!("error"));
+                assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot be represented losslessly"));
+            }
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_nonstream_requires_authoritative_final_usage_and_finish_reason() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+
+        for missing in ["usage", "finish_reason"] {
+            recording.set_response_usage(if missing == "usage" {
+                Value::Null
+            } else {
+                json!({
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                    "input_tokens_details": {"cached_tokens": 0}
+                })
+            });
+            recording.set_completed_end_turn(if missing == "finish_reason" {
+                Some(false)
+            } else {
+                Some(true)
+            });
+            let response = reqwest::Client::new()
+                .post(format!("{api_url}/v1/messages"))
+                .header("x-claude-code-session-id", "test-session")
+                .json(&json!({
+                    "model": "gpt-5.5",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]
                 }))
                 .send()
                 .await
                 .unwrap();
-
-            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                "application/json"
-            );
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
             let body: Value = response.json().await.unwrap();
-            assert_eq!(body["type"], json!("error"));
-            assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+            assert_eq!(body["error"]["type"], json!("api_error"));
         }
-        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_final_contract_failures_end_with_error_not_message_stop() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+
+        for missing in ["usage", "finish_reason"] {
+            recording.set_response_usage(if missing == "usage" {
+                Value::Null
+            } else {
+                json!({
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                    "input_tokens_details": {"cached_tokens": 0}
+                })
+            });
+            recording.set_completed_end_turn(if missing == "finish_reason" {
+                Some(false)
+            } else {
+                Some(true)
+            });
+            let response = reqwest::Client::new()
+                .post(format!("{api_url}/v1/messages"))
+                .header("x-claude-code-session-id", "test-session")
+                .json(&json!({
+                    "model": "gpt-5.5",
+                    "max_tokens": 64,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let mut pending = response.text().await.unwrap();
+            let mut events = Vec::new();
+            parse_anthropic_sse_blocks(&mut pending, &mut events);
+            assert!(pending.is_empty());
+            assert_eq!(events.first().unwrap().0, "message_start");
+            assert_eq!(events.last().unwrap().0, "error");
+            assert!(events.iter().all(|(event, _)| event != "message_stop"));
+        }
 
         api_handle.abort();
         upstream_handle.abort();
@@ -3976,6 +8146,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "claude-sonnet-4-6",
                 "system": "Be precise.",
@@ -4083,6 +8254,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "claude-sonnet-4-6",
                 "system": "Be precise.",
@@ -4129,6 +8301,7 @@ mod tests {
             .await;
             let response = reqwest::Client::new()
                 .post(format!("{api_url}/v1/messages"))
+                .header("x-claude-code-session-id", "test-session")
                 .json(&json!({
                     "model": "claude-sonnet-4-6",
                     "system": "Be precise.",
@@ -4159,6 +8332,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_stream_bounds_the_total_upstream_error_body_read() {
+        let (upstream_url, upstream_handle) = start_slow_error_body_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server_with_timeout(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+            Duration::from_millis(50),
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Trigger the error."}],
+                "max_tokens": 64,
+                "stream": true,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let mut pending = tokio::time::timeout(Duration::from_millis(500), response.text())
+            .await
+            .expect("slow upstream error body exceeded the configured total timeout")
+            .unwrap();
+        let mut events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut events);
+        assert!(pending.is_empty());
+        assert_eq!(events[0].0, "message_start");
+        assert_eq!(events.last().unwrap().0, "error");
+        assert_eq!(
+            events.last().unwrap().1["error"]["type"],
+            json!("api_error")
+        );
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_nonstream_masks_upstream_error_details() {
+        let (upstream_url, upstream_handle) = start_fixed_status_upstream(500).await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Trigger the error."}],
+                "max_tokens": 64,
+                "stream": false,
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["message"], json!("upstream request failed"));
+        assert!(!body.to_string().contains("upstream rejected request"));
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn anthropic_stream_refreshes_once_and_surfaces_refresh_authentication_failures() {
         let (upstream_url, upstream_state, upstream_handle) = start_auth_retry_upstream().await;
         let _refresh_url = EnvironmentGuard::set(
@@ -4173,14 +8425,17 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
         let request = || {
-            client.post(format!("{api_url}/v1/messages")).json(&json!({
-                "model": "claude-sonnet-4-6",
-                "system": "Be precise.",
-                "messages": [{"role": "user", "content": "Exercise auth retry."}],
-                "max_tokens": 64,
-                "stream": true,
-                "responses_lite": false
-            }))
+            client
+                .post(format!("{api_url}/v1/messages"))
+                .header("x-claude-code-session-id", "test-session")
+                .json(&json!({
+                    "model": "claude-sonnet-4-6",
+                    "system": "Be precise.",
+                    "messages": [{"role": "user", "content": "Exercise auth retry."}],
+                    "max_tokens": 64,
+                    "stream": true,
+                    "responses_lite": false
+                }))
         };
 
         let refreshed = request().send().await.unwrap();
@@ -4226,7 +8481,7 @@ mod tests {
         assert_eq!(events.last().unwrap().0, "error");
         assert_eq!(
             events.last().unwrap().1["error"]["type"],
-            json!("api_error")
+            json!("authentication_error")
         );
         assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 3);
         assert_eq!(upstream_state.authorizations.lock().unwrap().len(), 5);
@@ -4263,7 +8518,45 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+        assert!(recording.requests().is_empty());
+
+        for (path, body) in [
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "Answer."}],
+                    "responses_lite": null
+                }),
+            ),
+            (
+                "/v1/images/generations",
+                json!({"prompt": "draw", "responses_lite": null}),
+            ),
+            (
+                "/v1/inspect",
+                json!({
+                    "prompt": "inspect",
+                    "images": [{"image_url": "data:image/png;base64,AAAA"}],
+                    "responses_lite": null
+                }),
+            ),
+        ] {
+            let response = reqwest::Client::new()
+                .post(format!("{api_url}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+            let error: Value = response.json().await.unwrap();
+            assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+        }
         assert!(recording.requests().is_empty());
 
         api_handle.abort();
@@ -4296,7 +8589,7 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
         assert!(recording.requests().is_empty());
 
         api_handle.abort();
@@ -4311,7 +8604,8 @@ mod tests {
             "type": "image_generation_call",
             "id": "image-1",
             "status": "completed",
-            "result": "https://example.test/image.png"
+            "result": "https://example.test/image.png",
+            "revised_prompt": "A lighthouse"
         })]);
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -4325,6 +8619,11 @@ mod tests {
             .json(&json!({
                 "model": "gpt-5.6-sol",
                 "prompt": "A lighthouse",
+                "reference_images": [{
+                    "image_url": "data:image/png;base64,BBBB",
+                    "detail": "high",
+                    "prompt_cache_breakpoint": null
+                }],
                 "responses_lite": false
             }))
             .send()
@@ -4346,6 +8645,106 @@ mod tests {
             requests[0].body["tools"],
             json!([{"type": "image_generation", "output_format": "png"}])
         );
+        assert_eq!(
+            requests[0].body["input"][0]["content"][1],
+            json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,BBBB",
+                "detail": "high"
+            })
+        );
+
+        for optional_fields in [json!({}), json!({"id": null, "revised_prompt": null})] {
+            let mut output = json!({
+                "type": "image_generation_call",
+                "status": "completed",
+                "result": "https://example.test/image.png"
+            });
+            output
+                .as_object_mut()
+                .unwrap()
+                .extend(optional_fields.as_object().unwrap().clone());
+            recording.set_response_output(vec![output]);
+            let optional = reqwest::Client::new()
+                .post(format!("{api_url}/v1/images/generations"))
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "prompt": "A lighthouse",
+                    "responses_lite": false
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(optional.status(), reqwest::StatusCode::OK);
+            let optional_body: Value = optional.json().await.unwrap();
+            assert_eq!(
+                optional_body["data"],
+                json!([{"url": "https://example.test/image.png"}])
+            );
+        }
+
+        let auto_size = reqwest::Client::new()
+            .post(format!("{api_url}/v1/images/generations"))
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "size": "auto",
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(auto_size.status(), reqwest::StatusCode::OK);
+
+        for invalid_body in [
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "size": "1024x1024"
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "tools": []
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "reference_images": "not-an-array"
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "reference_images": [{
+                    "image_url": "data:image/png;base64,BBBB",
+                    "unknown": true
+                }]
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "reference_images": [{
+                    "image_url": "data:image/png;base64,BBBB",
+                    "detail": "full"
+                }]
+            }),
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt": "A lighthouse",
+                "reference_images": [{
+                    "image_url": "data:image/png;base64,BBBB",
+                    "prompt_cache_breakpoint": true
+                }]
+            }),
+        ] {
+            let invalid = reqwest::Client::new()
+                .post(format!("{api_url}/v1/images/generations"))
+                .json(&invalid_body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
 
         let invalid = reqwest::Client::new()
             .post(format!("{api_url}/v1/images/generations"))
@@ -4358,7 +8757,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
-        assert_eq!(recording.requests().len(), 1);
+        assert_eq!(recording.requests().len(), 4);
 
         api_handle.abort();
         upstream_handle.abort();
@@ -4449,7 +8848,11 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "system": "Compact precisely.",
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -4472,6 +8875,11 @@ mod tests {
                 {"type": "additional_tools", "role": "developer", "tools": []},
                 {
                     "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Compact precisely."}]
+                },
+                {
+                    "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": "question"}]
                 },
@@ -4486,7 +8894,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn messages_compact_routes_known_gpt_model_and_falls_back_for_claude_model() {
+    async fn messages_compact_rejects_stop_sequences_and_non_auto_tool_choices_before_upstream() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         let (api_url, auth_path, api_handle) = start_api_server(
             &upstream_url,
@@ -4496,14 +8904,99 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        for model in ["gpt-5.6", "claude-fable-5"] {
+        for unsupported in [
+            json!({"stop_sequences": ["stop"]}),
+            json!({"tool_choice": {"type": "any"}}),
+            json!({"tool_choice": {"type": "tool", "name": "lookup"}}),
+            json!({"tool_choice": {"type": "none"}}),
+        ] {
+            let mut body = json!({
+                "model": "gpt-5.5",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "History"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(unsupported.as_object().unwrap().clone());
             let response = client
                 .post(format!("{api_url}/v1/messages/compact"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_compact_requires_a_positive_safe_integral_max_tokens_before_upstream() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(json!(0)),
+            Some(json!(-1)),
+            Some(json!(1.5)),
+            Some(json!(9_007_199_254_740_992_i64)),
+        ] {
+            let mut body = json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "History"}]
+            });
+            if let Some(value) = value {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("max_tokens".to_string(), value);
+            }
+            let response = client
+                .post(format!("{api_url}/v1/messages/compact"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_compact_routes_live_gpt_and_explicit_claude_backend_models() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.5",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for model in ["gpt-5.6-sol", "claude-fable-5"] {
+            let response = client
+                .post(format!("{api_url}/v1/messages/compact"))
+                .header("x-claude-code-session-id", "test-session")
                 .json(&json!({
                     "model": model,
+                    "max_tokens": 128,
                     "system": "Compact precisely.",
                     "messages": [{"role": "user", "content": "History"}],
-                    "speed": if model == "gpt-5.6" { "fast" } else { "standard" },
+                    "speed": if model == "gpt-5.6-sol" { "fast" } else { "standard" },
                     "responses_lite": "auto"
                 }))
                 .send()
@@ -4519,7 +9012,6 @@ mod tests {
                     {"role": "system", "content": "Compact precisely."},
                     {"role": "user", "content": "Native history"}
                 ],
-                "speed": "fast",
                 "responses_lite": false
             }))
             .send()
@@ -4540,8 +9032,10 @@ mod tests {
 
         let conflicting_effort = client
             .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "gpt-5.6-sol",
+                "max_tokens": 128,
                 "system": "Compact precisely.",
                 "messages": [{"role": "user", "content": "History"}],
                 "reasoning_effort": "high",
@@ -4580,12 +9074,18 @@ mod tests {
 
         let response = client
             .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "gpt-5.6-sol",
+                "max_tokens": 128,
                 "system": "Compact precisely.",
                 "messages": [{"role": "user", "content": "History"}],
                 "output_config": {
-                    "format": {"type": "json_schema", "schema": schema.clone()}
+                    "format": {
+                        "type": "json_schema",
+                        "name": "structured_output",
+                        "schema": schema.clone()
+                    }
                 },
                 "text": {"verbosity": "high"},
                 "responses_lite": false
@@ -4593,7 +9093,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let status = response.status();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{response_body}");
         let requests = recording.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
@@ -4610,8 +9112,10 @@ mod tests {
 
         let conflicting = client
             .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "gpt-5.6-sol",
+                "max_tokens": 128,
                 "system": "Compact precisely.",
                 "messages": [{"role": "user", "content": "History"}],
                 "output_config": {
@@ -4646,12 +9150,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], json!("chatgpt_oauth_error"));
+        assert_eq!(body["error"]["type"], json!("server_error"));
         assert!(recording.requests().is_empty());
 
         api_handle.abort();
@@ -4730,7 +9231,7 @@ mod tests {
         assert_eq!(recorded.body["model"], json!("gpt-5.6-sol"));
         assert_eq!(
             recorded.body["reasoning"],
-            json!({"effort": "low", "context": "all_turns"})
+            json!({"effort": "medium", "summary": "auto", "context": "all_turns"})
         );
         assert_eq!(recorded.body["text"], json!({"verbosity": "low"}));
         assert_eq!(recorded.body["parallel_tool_calls"], json!(false));
@@ -4841,7 +9342,7 @@ mod tests {
         let inspect_request = &requests[2];
         assert_eq!(inspect_request.endpoint, RecordedEndpoint::Responses);
         assert_eq!(inspect_request.body["tool_choice"], json!("auto"));
-        assert_eq!(inspect_request.body["reasoning"]["effort"], json!("low"));
+        assert_eq!(inspect_request.body["reasoning"]["effort"], json!("medium"));
         assert_eq!(
             inspect_request.body["reasoning"]["context"],
             json!("all_turns")
@@ -4850,7 +9351,10 @@ mod tests {
         let invalid_compact_response = reqwest::Client::new()
             .post(format!("{api_url}/v1/compact"))
             .json(&json!({
-                "messages": [{"role": "user", "content": "History"}],
+                "messages": [
+                    {"role": "system", "content": "Compact precisely."},
+                    {"role": "user", "content": "History"}
+                ],
                 "reasoning_effort": 42
             }))
             .send()
@@ -4897,7 +9401,7 @@ mod tests {
         assert_eq!(requests[0].endpoint, RecordedEndpoint::Compact);
         assert_eq!(
             requests[0].body["reasoning"],
-            json!({"effort": "high", "context": "all_turns"})
+            json!({"effort": "high", "summary": "auto", "context": "all_turns"})
         );
         assert_eq!(
             requests[0]
@@ -4950,7 +9454,6 @@ mod tests {
                     {"role": "user", "content": "Compact this."}
                 ],
                 "previous_response_id": "resp-prior",
-                "safety_identifier": null,
                 "include": null,
                 "prompt_cache_retention": null,
                 "responses_lite": false
@@ -4978,6 +9481,7 @@ mod tests {
             json!({"previous_response_id": ""}),
             json!({"previous_response_id": "   "}),
             json!({"previous_response_id": "resp-unknown"}),
+            json!({"safety_identifier": null}),
             json!({"safety_identifier": "stable-user"}),
             json!({"include": []}),
             json!({"prompt_cache_retention": "24h"}),
@@ -5010,6 +9514,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn safety_identifier_null_is_rejected_before_upstream_on_every_accepting_facade() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for (route, body) in [
+            (
+                "/v1/images/generations",
+                json!({"prompt": "draw", "safety_identifier": null}),
+            ),
+            (
+                "/v1/inspect",
+                json!({
+                    "prompt": "inspect",
+                    "images": [{"image_url": "data:image/png;base64,AAAA"}],
+                    "safety_identifier": null
+                }),
+            ),
+            (
+                "/v1/compact",
+                json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "safety_identifier": null
+                }),
+            ),
+            (
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 128,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "safety_identifier": null
+                }),
+            ),
+        ] {
+            let response = client
+                .post(format!("{api_url}{route}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{route}"
+            );
+        }
+        assert!(recording.requests().is_empty());
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpt_5_6_controls_structured_content_usage_and_response_id_wire_end_to_end() {
         let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
         recording.set_response_usage(json!({
@@ -5029,7 +9593,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
         let request_body = json!({
-            "model": "gpt-5.6",
+            "model": "gpt-5.6-sol",
             "messages": [
                 {"role": "system", "content": "Be exact."},
                 {"role": "user", "content": [
@@ -5046,7 +9610,7 @@ mod tests {
                     }
                 ]}
             ],
-            "reasoning": {"mode": "standard", "context": "current_turn"},
+            "reasoning": {"effort": "medium", "context": "current_turn"},
             "service_tier": "fast",
             "verbosity": "high",
             "text": {"verbosity": "high"},
@@ -5074,7 +9638,7 @@ mod tests {
         assert_eq!(outbound["model"], json!("gpt-5.6-sol"));
         assert_eq!(
             outbound["reasoning"],
-            json!({"effort": "medium", "context": "current_turn"})
+            json!({"effort": "medium", "summary": "auto", "context": "current_turn"})
         );
         assert!(outbound.get("safety_identifier").is_none());
         assert!(outbound.get("prompt_cache_options").is_none());
@@ -5381,7 +9945,7 @@ mod tests {
         let output = vec![json!({
             "type": "reasoning",
             "id": "reasoning-stream",
-            "summary": [],
+            "summary": [{"type": "summary_text", "text": "actual reasoning"}],
             "encrypted_content": "opaque-stream"
         })];
         recording.set_response_output(output.clone());
@@ -5631,7 +10195,7 @@ mod tests {
                     "image_url": "data:image/png;base64,AAAA",
                     "detail": "original"
                 }],
-                "reasoning": {"mode": "standard", "context": "all_turns"},
+                "reasoning": {"effort": "medium", "context": "all_turns"},
                 "verbosity": "medium",
                 "responses_lite": false
             }))
@@ -5649,12 +10213,13 @@ mod tests {
 
         let anthropic_response = client
             .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 128,
                 "system": "Be exact.",
                 "messages": [{"role": "user", "content": "Hello"}],
-                "reasoning": {"mode": "standard", "context": "current_turn"},
+                "reasoning": {"effort": "medium", "context": "current_turn"},
                 "verbosity": "high",
                 "responses_lite": false
             }))
@@ -5670,7 +10235,10 @@ mod tests {
         let compact_response = client
             .post(format!("{api_url}/v1/compact"))
             .json(&json!({
-                "messages": [{"role": "user", "content": "History"}],
+                "messages": [
+                    {"role": "system", "content": "Compact precisely."},
+                    {"role": "user", "content": "History"}
+                ],
                 "reasoning": {"effort": "high"},
                 "prompt_cache_key": "compact-cache-key",
                 "service_tier": "fast",
@@ -5700,7 +10268,10 @@ mod tests {
 
         let anthropic_compact_response = client
             .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "test-session")
             .json(&json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
                 "system": "Compact precisely.",
                 "messages": [{"role": "user", "content": "Anthropic history"}],
                 "reasoning_effort": "medium",
@@ -5901,7 +10472,6 @@ mod tests {
             }],
             "messages": [{
                 "role": "user",
-                "cache_control": {"type": "ephemeral"},
                 "content": [{
                     "type": "text",
                     "text": "Answer.",
@@ -5966,17 +10536,16 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(no_session.status(), reqwest::StatusCode::OK);
+        assert_eq!(no_session.status(), reqwest::StatusCode::BAD_REQUEST);
 
         let requests = recording.requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         let session_a_key = "fed3534a8ed1887fdc51648477597f2a98ec264b033271334062e9cba3c23fae";
         let session_b_key = "00d0e78bab5b2ca951064120f1c2d86d481250a6814637aeec71f12b6aed398b";
         assert_eq!(requests[0].body["prompt_cache_key"], session_a_key);
         assert_eq!(requests[1].body["prompt_cache_key"], session_a_key);
         assert_eq!(requests[2].body["prompt_cache_key"], session_b_key);
         assert_eq!(requests[3].body["prompt_cache_key"], "caller-cache-key");
-        assert!(requests[4].body.get("prompt_cache_key").is_none());
         for request in &requests {
             assert!(request.body.get("client_metadata").is_none());
             assert!(request.body.get("previous_response_id").is_none());
