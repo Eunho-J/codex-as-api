@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.8.2
+
+### Hotfix: disjoint Anthropic cache usage (all runtimes)
+
+- Correct Anthropic Messages usage in streaming and non-streaming responses:
+  `input_tokens` now excludes both cache reads and reported cache creation,
+  which remain in their separate `cache_read_input_tokens` and
+  `cache_creation_input_tokens` counters. Previously, consumers adding those
+  counters counted cached input twice.
+- Keep OpenAI/Responses totals unchanged. Preserve unknown cache counters as
+  null; subtract only reported cache buckets. Reject impossible cache sums
+  exceeding the upstream input total instead of emitting negative/clamped usage.
+- Add no-cache, partial/full-cache, cache-write, invalid-total and HTTP pipeline
+  regressions across TypeScript, Python and Rust. Example: 100 total input,
+  50 cache read and 25 cache write becomes 25 uncached + 50 read + 25 write.
+
 ## v0.8.1
 
 ### Explicit Ultra Fast selection (all runtimes)

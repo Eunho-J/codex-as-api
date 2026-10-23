@@ -975,6 +975,16 @@ function messageStartSse(
   });
 }
 
+// OpenAI input totals include cache reads/writes; Anthropic reports them as
+// disjoint buckets. Keep upstream totals intact and convert only at this boundary.
+function uncachedInputTokens(total: number, read: unknown, write: unknown): number {
+  const cached = Number(read ?? 0) + Number(write ?? 0);
+  if (cached > total) {
+    throw new ChatGPTOAuthProtocolError("usage cache tokens must not exceed input_tokens");
+  }
+  return total - cached;
+}
+
 function usageFromInternalResponse(usage: Usage): Record<string, unknown> {
   const inputTokens = requireUsageNumber(usage.prompt_tokens, "prompt_tokens");
   const outputTokens = requireUsageNumber(usage.completion_tokens, "completion_tokens");
@@ -1000,6 +1010,8 @@ function usageFromInternalResponse(usage: Usage): Record<string, unknown> {
     service_tier: null,
     speed: null,
   };
+  result.input_tokens = uncachedInputTokens(inputTokens,
+    result.cache_read_input_tokens, result.cache_creation_input_tokens);
   return result;
 }
 
@@ -1058,6 +1070,8 @@ function usageFromProviderEvent(usageEvent: unknown): Record<string, unknown> {
       );
     }
   }
+  result.input_tokens = uncachedInputTokens(inputTokens,
+    result.cache_read_input_tokens, result.cache_creation_input_tokens);
   if (u.server_tool_use != null) {
     result.server_tool_use = requireUsageBreakdown(
       u.server_tool_use,

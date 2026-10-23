@@ -718,13 +718,23 @@ def _reject_unrepresentable_response_events(raw: dict | None) -> None:
         )
 
 
+def _uncached_input_tokens(total: int, cache_read: int | None, cache_write: int | None) -> int:
+    # OpenAI totals include cache buckets; Anthropic exposes disjoint counters.
+    cached = (cache_read or 0) + (cache_write or 0)
+    if cached > total:
+        raise ChatGPTOAuthProtocolError("usage cache tokens must not exceed input_tokens")
+    return total - cached
+
+
 def _anthropic_usage_from_internal(usage: Usage) -> dict[str, Any]:
     return {
         "cache_creation": None,
         "cache_creation_input_tokens": usage.cache_write_tokens,
         "cache_read_input_tokens": usage.cached_tokens,
         "inference_geo": None,
-        "input_tokens": usage.prompt_tokens,
+        "input_tokens": _uncached_input_tokens(
+            usage.prompt_tokens, usage.cached_tokens, usage.cache_write_tokens
+        ),
         "iterations": None,
         "output_tokens": usage.completion_tokens,
         "server_tool_use": None,
@@ -910,7 +920,7 @@ def _anthropic_usage_from_provider(usage: Any) -> dict[str, Any]:
     out: dict[str, Any] = {
         "cache_creation_input_tokens": cache_write,
         "cache_read_input_tokens": cache_read,
-        "input_tokens": input_tokens,
+        "input_tokens": _uncached_input_tokens(input_tokens, cache_read, cache_write),
         "iterations": None,
         "output_tokens": output_tokens,
         "server_tool_use": server_tool_use,

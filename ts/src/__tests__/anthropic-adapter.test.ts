@@ -1125,6 +1125,26 @@ describe("internalResponseToAnthropic", () => {
     const usage = result.usage as Record<string, unknown>;
     assert.equal(usage.cache_read_input_tokens, 50);
     assert.equal(usage.cache_creation_input_tokens, 25);
+    assert.equal(usage.input_tokens, 25);
+    assert.equal(Number(usage.input_tokens) + Number(usage.cache_read_input_tokens)
+      + Number(usage.cache_creation_input_tokens), 100);
+  });
+
+  it("converts disjoint cache buckets without mutating OpenAI totals", () => {
+    for (const [read, write] of [[0, 0], [40, 0], [100, 0], [0, 100], [40, 60]]) {
+      const source = makeUsage({ prompt_tokens: 100, completion_tokens: 7,
+        cached_tokens: read, cache_write_tokens: write });
+      const result = internalResponseToAnthropic(makeResponse({ content: "hi", usage: source }), "m", "msg");
+      const usage = result.usage as Record<string, number>;
+      assert.equal(usage.input_tokens, 100 - read - write);
+      assert.equal(usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens, 100);
+      assert.equal(source.prompt_tokens, 100);
+    }
+    for (const [read, write] of [[101, 0], [60, 41]]) {
+      assert.throws(() => internalResponseToAnthropic(makeResponse({ content: "hi",
+        usage: makeUsage({ prompt_tokens: 100, completion_tokens: 7,
+          cached_tokens: read, cache_write_tokens: write }) }), "m", "msg"), /cache tokens must not exceed/);
+    }
   });
 
   it("uses null cache counters when internal usage omits them", () => {
@@ -1414,11 +1434,34 @@ describe("anthropicStreamAdapter", () => {
     assert.deepEqual(msgDelta.usage, {
       cache_creation_input_tokens: 11,
       cache_read_input_tokens: 13,
-      input_tokens: 123,
+      input_tokens: 99,
       iterations: null,
       output_tokens: 7,
       server_tool_use: { web_search_requests: 2, web_fetch_requests: 1 },
     });
+  });
+
+  it("splits stream cache buckets and rejects impossible cache totals", async () => {
+    for (const [read, write] of [[0, 0], [40, 0], [100, 0], [0, 100], [40, 60], [60, 41], [101, 0]]) {
+      const source = { input_tokens: 100, output_tokens: 7, total_tokens: 107,
+        input_tokens_details: { cached_tokens: read, cache_write_tokens: write } };
+      const collect = () => collectStreamEvents([{ type: "finish", finish_reason: "stop", usage: source }]);
+      if (read + write > 100) {
+        await assert.rejects(collect, /cache tokens must not exceed/);
+      } else {
+        const events = await collect();
+        const usage = events.find(e => e.type === "message_delta")!.usage as Record<string, number>;
+        assert.equal(usage.input_tokens, 100 - read - write);
+        assert.equal(usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens, 100);
+        assert.equal(source.input_tokens, 100);
+      }
+    }
+    const events = await collectStreamEvents([{ type: "finish", finish_reason: "stop", usage: {
+      input_tokens: 100, output_tokens: 7, total_tokens: 107, input_tokens_details: { cached_tokens: 40 },
+    } }]);
+    const usage = events.find(e => e.type === "message_delta")!.usage as Record<string, unknown>;
+    assert.equal(usage.input_tokens, 60);
+    assert.equal(usage.cache_creation_input_tokens, null);
   });
 
   it("rejects absent stream usage and uses null unknown cache counters", async () => {

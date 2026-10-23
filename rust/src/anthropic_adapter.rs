@@ -1223,7 +1223,7 @@ pub fn internal_response_to_anthropic(
         "cache_creation_input_tokens": usage.cache_write_tokens,
         "cache_read_input_tokens": usage.cached_tokens,
         "inference_geo": null,
-        "input_tokens": usage.prompt_tokens,
+        "input_tokens": uncached_input_tokens(usage.prompt_tokens, usage.cached_tokens, usage.cache_write_tokens)?,
         "iterations": null,
         "output_tokens": usage.completion_tokens,
         "server_tool_use": null,
@@ -1642,6 +1642,18 @@ fn validate_usage_counter_object(
     Ok(())
 }
 
+// OpenAI input totals include caches; Anthropic counters are disjoint.
+fn uncached_input_tokens(total: i64, read: Option<i64>, write: Option<i64>) -> Result<i64, String> {
+    let cached = read
+        .unwrap_or(0)
+        .checked_add(write.unwrap_or(0))
+        .ok_or_else(|| "usage cache tokens must not exceed input_tokens".to_string())?;
+    if cached > total {
+        return Err("usage cache tokens must not exceed input_tokens".to_string());
+    }
+    Ok(total - cached)
+}
+
 fn anthropic_usage_from_provider(usage: &Value) -> Result<Value, String> {
     let usage = usage
         .as_object()
@@ -1688,7 +1700,14 @@ fn anthropic_usage_from_provider(usage: &Value) -> Result<Value, String> {
         "cache_read_input_tokens".to_string(),
         cache_read.map_or(Value::Null, |value| json!(value)),
     );
-    out.insert("input_tokens".to_string(), json!(input_tokens));
+    out.insert(
+        "input_tokens".to_string(),
+        json!(uncached_input_tokens(
+            input_tokens,
+            cache_read,
+            cache_creation
+        )?),
+    );
     out.insert("iterations".to_string(), Value::Null);
     out.insert("output_tokens".to_string(), json!(output_tokens));
     out.insert("server_tool_use".to_string(), Value::Null);
@@ -3091,6 +3110,52 @@ mod tests {
     }
 
     #[test]
+    fn test_disjoint_cache_buckets_stream_and_response() {
+        for (read, write) in [
+            (0, 0),
+            (40, 0),
+            (100, 0),
+            (0, 100),
+            (40, 60),
+            (101, 0),
+            (60, 41),
+        ] {
+            let source = json!({"input_tokens":100,"output_tokens":7,"total_tokens":107,
+                "input_tokens_details":{"cached_tokens":read,"cache_write_tokens":write}});
+            let stream_usage = anthropic_usage_from_provider(&source);
+            let usage = crate::messages::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 7,
+                total_tokens: 107,
+                cached_tokens: Some(read),
+                cache_write_tokens: Some(write),
+            };
+            let response = make_response("hi", vec![], "stop", Some(usage), None);
+            let converted = internal_response_to_anthropic(&response, "m", "id");
+            if read + write > 100 {
+                assert!(stream_usage
+                    .unwrap_err()
+                    .contains("cache tokens must not exceed"));
+                assert!(converted
+                    .unwrap_err()
+                    .contains("cache tokens must not exceed"));
+            } else {
+                for output in [stream_usage.unwrap(), converted.unwrap()["usage"].clone()] {
+                    assert_eq!(output["input_tokens"], 100 - read - write);
+                    assert_eq!(
+                        output["input_tokens"].as_i64().unwrap()
+                            + output["cache_read_input_tokens"].as_i64().unwrap()
+                            + output["cache_creation_input_tokens"].as_i64().unwrap(),
+                        100
+                    );
+                }
+                assert_eq!(source["input_tokens"], 100);
+            }
+        }
+        assert!(uncached_input_tokens(i64::MAX, Some(i64::MAX), Some(1)).is_err());
+    }
+
+    #[test]
     fn test_response_usage_present() {
         let usage = crate::messages::Usage {
             prompt_tokens: 100,
@@ -3101,7 +3166,7 @@ mod tests {
         };
         let resp = make_response("Hi", vec![], "stop", Some(usage), None);
         let out = internal_response_to_anthropic(&resp, "claude-3", "msg_u").unwrap();
-        assert_eq!(out["usage"]["input_tokens"], 100);
+        assert_eq!(out["usage"]["input_tokens"], 71);
         assert_eq!(out["usage"]["output_tokens"], 50);
         assert_eq!(out["usage"]["cache_read_input_tokens"], 20);
         assert_eq!(out["usage"]["cache_creation_input_tokens"], 9);
@@ -3421,7 +3486,7 @@ mod tests {
         let msg_start = parsed.iter().find(|(e, _)| e == "message_start").unwrap();
         assert!(msg_start.1["message"].get("usage").is_none());
         let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
-        assert_eq!(msg_delta.1["usage"]["input_tokens"], 123);
+        assert_eq!(msg_delta.1["usage"]["input_tokens"], 99);
         assert_eq!(msg_delta.1["usage"]["output_tokens"], 7);
         assert_eq!(msg_delta.1["usage"]["cache_creation_input_tokens"], 11);
         assert_eq!(msg_delta.1["usage"]["cache_read_input_tokens"], 13);

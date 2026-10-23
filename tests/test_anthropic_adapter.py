@@ -1206,6 +1206,23 @@ class TestInternalResponseToAnthropic:
         result = internal_response_to_anthropic(resp, "m", "msg_1")
         assert result["usage"]["cache_read_input_tokens"] == 50
         assert result["usage"]["cache_creation_input_tokens"] == 25
+        assert result["usage"]["input_tokens"] == 25
+
+    @pytest.mark.parametrize("read,write", [(0, 0), (40, 0), (100, 0), (0, 100), (40, 60), (101, 0), (60, 41)])
+    def test_disjoint_cache_buckets(self, read, write):
+        source = Usage(prompt_tokens=100, completion_tokens=7, total_tokens=107,
+                       cached_tokens=read, cache_write_tokens=write)
+        response = AssistantResponse(content="hi", tool_calls=(), finish_reason="stop",
+                                     usage=source, reasoning_content=None, raw=None)
+        if read + write > 100:
+            with pytest.raises(ChatGPTOAuthProtocolError, match="cache tokens must not exceed"):
+                internal_response_to_anthropic(response, "m", "msg")
+        else:
+            usage = internal_response_to_anthropic(response, "m", "msg")["usage"]
+            assert usage["input_tokens"] == 100 - read - write
+            buckets = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            assert sum(usage[k] for k in buckets) == 100
+            assert source.prompt_tokens == 100
 
     def test_web_search_provider_output_is_rejected(self):
         resp = AssistantResponse(
@@ -1460,7 +1477,7 @@ class TestAnthropicStreamAdapter:
         assert msg_delta["usage"] == {
             "cache_creation_input_tokens": 11,
             "cache_read_input_tokens": 13,
-            "input_tokens": 123,
+            "input_tokens": 99,
             "iterations": None,
             "output_tokens": 7,
             "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
@@ -1515,6 +1532,22 @@ class TestAnthropicStreamAdapter:
 
         with pytest.raises(ChatGPTOAuthProtocolError, match="provider (finish )?usage"):
             self._collect_events(events)
+
+    @pytest.mark.parametrize("read,write", [(0, 0), (40, 0), (100, 0), (0, 100), (40, 60), (101, 0), (60, 41)])
+    def test_stream_disjoint_cache_buckets(self, read, write):
+        source = {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107,
+                  "input_tokens_details": {"cached_tokens": read, "cache_write_tokens": write}}
+        events = [{"type": "finish", "finish_reason": "stop", "usage": source}]
+        if read + write > 100:
+            with pytest.raises(ChatGPTOAuthProtocolError, match="cache tokens must not exceed"):
+                self._collect_events(events)
+        else:
+            result = self._collect_events(events)
+            usage = next(e["usage"] for e in result if e["type"] == "message_delta")
+            assert usage["input_tokens"] == 100 - read - write
+            buckets = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            assert sum(usage[k] for k in buckets) == 100
+            assert source["input_tokens"] == 100
 
     def test_maps_responses_cache_write_details_into_message_delta(self):
         result = self._collect_events(

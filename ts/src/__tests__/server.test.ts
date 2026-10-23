@@ -344,9 +344,9 @@ async function withRecordingUpstream(
           end_turn: true,
           output: [],
           usage: {
-            input_tokens: 1,
+            input_tokens: 10,
             output_tokens: 1,
-            total_tokens: 2,
+            total_tokens: 11,
             input_tokens_details: {
               cached_tokens: 1,
               cache_write_tokens: 3,
@@ -4879,9 +4879,9 @@ describe("GPT-5.6 request extensions", () => {
           const chat = await chatResponse.json() as Record<string, unknown>;
           assert.equal(chat.response_id, "response-1");
           assert.deepEqual(chat.usage, {
-            prompt_tokens: 1,
+            prompt_tokens: 10,
             completion_tokens: 1,
-            total_tokens: 2,
+            total_tokens: 11,
             prompt_tokens_details: {
               cached_tokens: 1,
               cache_write_tokens: 3,
@@ -5062,6 +5062,12 @@ describe("GPT-5.6 request extensions", () => {
             }),
           });
           assert.equal(anthropicResponse.status, 200);
+          const anthropicBody = await anthropicResponse.json() as { usage: Record<string, number> };
+          assert.equal(anthropicBody.usage.input_tokens, 6);
+          assert.equal(anthropicBody.usage.cache_read_input_tokens, 1);
+          assert.equal(anthropicBody.usage.cache_creation_input_tokens, 3);
+          assert.equal(anthropicBody.usage.input_tokens + anthropicBody.usage.cache_read_input_tokens
+            + anthropicBody.usage.cache_creation_input_tokens, 10);
           const anthropicRequest = requests[5].body;
           assert.deepEqual(anthropicRequest.reasoning, {
             effort: "high",
@@ -5607,9 +5613,9 @@ describe("GPT-5.6 HTTP pipeline", () => {
           assert.equal(chatResult.choices[0].message.content, "ok");
           assert.equal(chatResult.response_id, "response-1");
           assert.deepEqual(chatResult.usage, {
-            prompt_tokens: 1,
+            prompt_tokens: 10,
             completion_tokens: 1,
-            total_tokens: 2,
+            total_tokens: 11,
             prompt_tokens_details: {
               cached_tokens: 1,
               cache_write_tokens: 3,
