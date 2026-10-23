@@ -1,5 +1,25 @@
 # Release Notes
 
+## v0.8.3
+
+### Client-neutral Anthropic compatibility (all runtimes)
+
+- Remove Claude Code identity gates around valid required `max_tokens` and
+  ephemeral `cache_control` hints on Messages, counting and compact routes.
+  These are compatibility hints, not native Codex output caps or cache TTLs;
+  optional Claude session cache affinity remains available.
+- Include provisional zero usage in every initial streaming `message_start`,
+  followed by authoritative final usage with the 0.8.2 disjoint cache accounting.
+- Support summarized thinking as real unsigned thinking blocks/deltas, retaining
+  existing Codex reasoning extensions. Omitted and disabled thinking suppress
+  reasoning output; never fabricate an Anthropic signature.
+- Resolve disabled-derived effort to the model's lowest supported level when
+  `none` is unavailable; explicit effort selection remains capability-checked.
+- Validate and strip replayed assistant thinking history for multi-turn clients.
+  Accept standard `metadata.user_id` and boolean tool streaming hints without
+  inventing backend semantics, and use the live catalog default for unconfigured
+  `claude-*` facade routing.
+
 ## v0.8.2
 
 ### Hotfix: disjoint Anthropic cache usage (all runtimes)

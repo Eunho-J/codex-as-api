@@ -319,6 +319,7 @@ export interface ChatOptions {
   toolChoice?: string | Record<string, unknown>;
   temperature?: number;
   reasoningEffort?: string;
+  reasoningSummary?: "auto" | "none";
   reasoning?: ReasoningOptions;
   maxTokens?: number;
   stop?: string | string[];
@@ -498,9 +499,6 @@ export class ChatGPTOAuthProvider {
     }
     if (!clientModel.startsWith("claude-")) {
       throw new ChatGPTOAuthInvalidRequestError("Anthropic model must use an explicit claude-* facade");
-    }
-    if (this.model == null) {
-      throw new ChatGPTOAuthInvalidRequestError("Claude facade backend model is not configured");
     }
     try {
       return await this.prepareModel(this.model, snapshot);
@@ -1024,6 +1022,7 @@ export class ChatGPTOAuthProvider {
     opts: {
       model?: string;
       reasoningEffort?: string;
+      reasoningSummary?: "auto" | "none";
       responsesLite?: boolean | string;
       tools?: ToolSchema[];
       promptCacheOptions?: PromptCacheOptions;
@@ -1077,6 +1076,7 @@ export class ChatGPTOAuthProvider {
     finalizeResponsesPayload(payload, {
       endpoint: "compact",
       capability: prepared.capability,
+      reasoningSummary: opts.reasoningSummary,
       responsesLite: opts.responsesLite,
       serviceTier: opts.serviceTier,
       text: opts.text,
@@ -1248,6 +1248,7 @@ export class ChatGPTOAuthProvider {
     finalizeResponsesPayload(payload, {
       endpoint: "responses",
       capability: prepared.capability,
+      reasoningSummary: opts.reasoningSummary,
       responsesLite: lite,
       serviceTier: opts.serviceTier,
       text: opts.text,
@@ -2304,6 +2305,7 @@ function finalizeResponsesPayload(
   opts: {
     endpoint: "responses" | "compact";
     capability: ModelCapability;
+    reasoningSummary?: "auto" | "none";
     responsesLite?: boolean | string;
     serviceTier?: string;
     text?: Record<string, unknown>;
@@ -2326,10 +2328,18 @@ function finalizeResponsesPayload(
     );
   }
   applyModelCapabilityFields(payload, opts.capability, opts.text, opts.serviceTier);
-  const configuredSummary = opts.capability.supportsReasoningSummaryParameter
-    && opts.capability.defaultReasoningSummary !== "none"
-    ? opts.capability.defaultReasoningSummary
-    : undefined;
+  let configuredSummary: string | undefined;
+  if (opts.capability.supportsReasoningSummaryParameter) {
+    if (opts.reasoningSummary === "none") {
+      configuredSummary = undefined;
+    } else if (opts.reasoningSummary === "auto") {
+      configuredSummary = opts.capability.defaultReasoningSummary !== "none"
+        ? opts.capability.defaultReasoningSummary
+        : "auto";
+    } else if (opts.capability.defaultReasoningSummary !== "none") {
+      configuredSummary = opts.capability.defaultReasoningSummary;
+    }
+  }
   if (configuredSummary != null) {
     if (payload.reasoning == null) payload.reasoning = {};
     if (!isRecordValue(payload.reasoning)) {
@@ -3017,6 +3027,9 @@ export function setReasoningPayload(
 export function wireReasoningEffort(effort: string, capability: ModelCapability): string {
   const supported = capability.supportedReasoningEfforts.map((preset) => preset.effort);
   if (effort !== "ultra") {
+    if (effort === "disabled" && supported.includes("persistent")) {
+      return "disabled";
+    }
     if (!supported.includes(effort)) {
       throw new ChatGPTOAuthInvalidRequestError(
         "reasoning effort is not supported by the selected model",

@@ -49,12 +49,13 @@ function makeStreamUsage(overrides: Record<string, unknown> = {}): Record<string
 
 async function collectStreamEvents(
   events: Record<string, unknown>[],
+  opts?: Parameters<typeof anthropicStreamAdapter>[3],
 ): Promise<Record<string, unknown>[]> {
   async function* makeIter(): AsyncIterable<Record<string, unknown>> {
     for (const e of events) yield e;
   }
   const result: Record<string, unknown>[] = [];
-  for await (const sseStr of anthropicStreamAdapter(makeIter(), "test-model", "msg_test")) {
+  for await (const sseStr of anthropicStreamAdapter(makeIter(), "test-model", "msg_test", opts)) {
     for (const line of sseStr.trim().split("\n")) {
       if (line.startsWith("data: ")) {
         result.push(JSON.parse(line.slice(6)));
@@ -326,17 +327,44 @@ describe("anthropicRequestToInternal", () => {
     }
   });
 
-  it("rejects assistant thinking history that cannot be represented", () => {
-    assert.throws(() => anthropicRequestToInternal({
+  it("validates and strips assistant thinking history while rejecting malformed blocks", () => {
+    const { messages } = anthropicRequestToInternal({
       model: "test",
       messages: [{
         role: "assistant",
         content: [
           { type: "thinking", thinking: "Let me think...", signature: "sig-abc" },
+          { type: "thinking", thinking: "Unsigned thinking", signature: null },
+          { type: "thinking", thinking: "Omitted signature" },
+          { type: "redacted_thinking", data: "encrypted-blob" },
           { type: "text", text: "The answer is 42." },
         ],
       }],
-    }), ChatGPTOAuthInvalidRequestError);
+    });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].role, MessageRole.ASSISTANT);
+    assert.equal(messages[0].content, "The answer is 42.");
+
+    for (const badBlock of [
+      { type: "thinking" },
+      { type: "thinking", thinking: 42 },
+      { type: "thinking", thinking: "ok", signature: 42 },
+      { type: "thinking", thinking: "ok", extra: true },
+      { type: "redacted_thinking" },
+      { type: "redacted_thinking", data: 42 },
+      { type: "redacted_thinking", data: "blob", extra: true },
+    ]) {
+      assert.throws(() => anthropicRequestToInternal({
+        model: "test",
+        messages: [{
+          role: "assistant",
+          content: [
+            badBlock,
+            { type: "text", text: "The answer is 42." },
+          ],
+        }],
+      }), ChatGPTOAuthInvalidRequestError);
+    }
   });
 
   it("rejects assistant server web-search history that cannot be represented", () => {
@@ -431,35 +459,34 @@ describe("anthropicRequestToInternal", () => {
       model: "test",
       messages: [] as Record<string, unknown>[],
     };
-    for (const field of ["defer_loading", "eager_input_streaming"] as const) {
-      for (const value of [false, true]) {
-        assert.throws(() => anthropicRequestToInternal({
-          ...base,
-          tools: [{
-            name: "lookup",
-            input_schema: { type: "object" },
-            [field]: value,
-          }],
-        }));
-      }
-    }
-
-    const { tools } = anthropicRequestToInternal({
+    assert.throws(() => anthropicRequestToInternal({
       ...base,
       tools: [{
         name: "lookup",
-        description: "",
         input_schema: { type: "object" },
-        strict: true,
-        eager_input_streaming: null,
+        defer_loading: true,
       }],
-    });
-    assert.deepEqual(tools, [{
-      name: "lookup",
-      description: "",
-      parameters: { type: "object" },
-      strict: true,
-    }]);
+    }), ChatGPTOAuthInvalidRequestError);
+
+    for (const eagerValue of [false, true, null]) {
+      const { tools: converted } = anthropicRequestToInternal({
+        ...base,
+        tools: [{
+          name: "lookup",
+          description: "",
+          input_schema: { type: "object" },
+          strict: true,
+          defer_loading: false,
+          eager_input_streaming: eagerValue,
+        }],
+      });
+      assert.deepEqual(converted, [{
+        name: "lookup",
+        description: "",
+        parameters: { type: "object" },
+        strict: true,
+      }]);
+    }
 
     assert.throws(() => anthropicRequestToInternal({
       ...base,
@@ -468,6 +495,8 @@ describe("anthropicRequestToInternal", () => {
     for (const invalidTool of [
       { name: "lookup", input_schema: {}, strict: null },
       { name: "lookup", input_schema: {}, defer_loading: null },
+      { name: "lookup", input_schema: {}, defer_loading: "false" },
+      { name: "lookup", input_schema: {}, eager_input_streaming: "true" },
       { name: "lookup", input_schema: {}, allowed_callers: null },
     ]) {
       assert.throws(() => anthropicRequestToInternal({
@@ -595,12 +624,23 @@ describe("anthropicRequestToInternal", () => {
   });
 
   it("thinking enabled", () => {
-    const { reasoningEffort } = anthropicRequestToInternal({
+    const enabled = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "enabled", budget_tokens: 4096 },
     });
-    assert.equal(reasoningEffort, "high");
+    assert.equal(enabled.reasoningEffort, "high");
+    assert.equal(enabled.thinkingDisplay, "summarized");
+    assert.equal(enabled.reasoningSummary, "auto");
+    const withSummarized = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      maxTokens: 4096,
+      thinking: { type: "enabled", budget_tokens: 1024, display: "summarized" },
+    });
+    assert.equal(withSummarized.reasoningEffort, "high");
+    assert.equal(withSummarized.thinkingDisplay, "summarized");
+    assert.equal(withSummarized.reasoningSummary, "auto");
     const withDisplay = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
@@ -608,24 +648,44 @@ describe("anthropicRequestToInternal", () => {
       thinking: { type: "enabled", budget_tokens: 1024, display: "omitted" },
     });
     assert.equal(withDisplay.reasoningEffort, "high");
+    assert.equal(withDisplay.thinkingDisplay, "omitted");
+    assert.equal(withDisplay.reasoningSummary, "none");
   });
 
   it("thinking adaptive", () => {
-    const { reasoningEffort } = anthropicRequestToInternal({
+    const summarized = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "adaptive", display: "summarized" },
+    });
+    assert.equal(summarized.reasoningEffort, "medium");
+    assert.equal(summarized.thinkingDisplay, "summarized");
+    assert.equal(summarized.reasoningSummary, "auto");
+    const { reasoningEffort, thinkingDisplay, reasoningSummary } = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "adaptive", display: "omitted" },
     });
     assert.equal(reasoningEffort, "medium");
+    assert.equal(thinkingDisplay, "omitted");
+    assert.equal(reasoningSummary, "none");
   });
 
   it("thinking disabled", () => {
-    const { reasoningEffort } = anthropicRequestToInternal({
+    const {
+      reasoningEffort,
+      thinkingDisplay,
+      reasoningSummary,
+      thinkingDisabled,
+    } = anthropicRequestToInternal({
       model: "test",
       messages: [{ role: "user", content: "hi" }],
       thinking: { type: "disabled" },
     });
     assert.equal(reasoningEffort, "none");
+    assert.equal(thinkingDisplay, "omitted");
+    assert.equal(reasoningSummary, "none");
+    assert.equal(thinkingDisabled, true);
   });
 
   it("uses output_config effort ahead of adaptive or enabled thinking", () => {
@@ -647,10 +707,11 @@ describe("anthropicRequestToInternal", () => {
       { type: "enabled" },
       { type: "enabled", budget_tokens: 0 },
       { type: "enabled", budget_tokens: 1023 },
-      { type: "enabled", budget_tokens: 1024, display: "summarized" },
+      { type: "enabled", budget_tokens: 1024, display: "visible" },
       { type: "adaptive", budget_tokens: 4096 },
       { type: "adaptive", display: "visible" },
       { type: "disabled", budget_tokens: 4096 },
+      { type: "disabled", display: "omitted" },
     ]) {
       assert.throws(() => anthropicRequestToInternal({
         model: "test",
@@ -1084,12 +1145,26 @@ describe("internalResponseToAnthropic", () => {
     });
     const result = internalResponseToAnthropic(resp, "test-model", "msg_123");
     const content = result.content as Record<string, unknown>[];
-    assert.equal(content.length, 1);
-    assert.equal(content[0].type, "text");
-    assert.equal(content[0].text, "42");
-    assert.equal(result.codex_reasoning, "Let me think about this...");
-    assert.equal(Object.hasOwn(content[0], "thinking"), false);
+    assert.equal(content.length, 2);
+    assert.deepEqual(content[0], {
+      type: "thinking",
+      thinking: "Let me think about this...",
+    });
     assert.equal(Object.hasOwn(content[0], "signature"), false);
+    assert.equal(content[1].type, "text");
+    assert.equal(content[1].text, "42");
+    assert.equal(result.codex_reasoning, "Let me think about this...");
+
+    for (const opts of [
+      { thinkingDisplay: "omitted" as const },
+      { suppressReasoning: true },
+    ]) {
+      const suppressed = internalResponseToAnthropic(resp, "test-model", "msg_123", opts);
+      const suppressedContent = suppressed.content as Record<string, unknown>[];
+      assert.equal(suppressedContent.length, 1);
+      assert.equal(suppressedContent[0].type, "text");
+      assert.equal(Object.hasOwn(suppressed, "codex_reasoning"), false);
+    }
   });
 
   it("represents an empty response with an empty content array", () => {
@@ -1209,6 +1284,17 @@ describe("internalResponseToAnthropic", () => {
 // ---------------------------------------------------------------------------
 
 describe("anthropicStreamAdapter", () => {
+  it("includes numeric initial usage for standard Anthropic consumers", async () => {
+    const events = await collectStreamEvents([
+      { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+    ]);
+    const message = events[0].message as Record<string, unknown>;
+    const usage = message.usage as Record<string, unknown>;
+    assert.equal(usage.input_tokens, 0);
+    assert.equal(usage.output_tokens, 0);
+    assert.equal(usage.cache_read_input_tokens, 0);
+    assert.equal(usage.cache_creation_input_tokens, 0);
+  });
   it("text only stream", async () => {
     const events = [
       { type: "content", text: "Hello" },
@@ -1241,25 +1327,60 @@ describe("anthropicStreamAdapter", () => {
     ];
     const result = await collectStreamEvents(events);
     const blockStarts = result.filter((e) => e.type === "content_block_start");
-    assert.equal(blockStarts.length, 1);
-    assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "text");
+    assert.equal(blockStarts.length, 2);
+    assert.deepEqual(blockStarts[0], {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    assert.equal((blockStarts[1].content_block as Record<string, unknown>).type, "text");
+    assert.equal(blockStarts[1].index, 1);
+    const thinkingDeltas = result.filter(
+      (e) => e.type === "content_block_delta"
+        && (e.delta as Record<string, unknown>).type === "thinking_delta",
+    );
+    assert.deepEqual(thinkingDeltas, [{
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "thinking_delta", thinking: "thinking..." },
+    }]);
     const reasoningEvents = result.filter((e) => e.type === "codex_reasoning_delta");
     assert.deepEqual(reasoningEvents, [{ type: "codex_reasoning_delta", delta: "thinking..." }]);
     assert.equal(result.some((event) => event.type === "signature_delta"), false);
+
+    for (const opts of [
+      { thinkingDisplay: "omitted" as const },
+      { suppressReasoning: true },
+    ]) {
+      const suppressed = await collectStreamEvents(events, opts);
+      const suppressedStarts = suppressed.filter((e) => e.type === "content_block_start");
+      assert.equal(suppressedStarts.length, 1);
+      assert.equal((suppressedStarts[0].content_block as Record<string, unknown>).type, "text");
+      assert.equal(suppressedStarts[0].index, 0);
+      assert.equal(suppressed.some((e) => e.type === "codex_reasoning_delta"), false);
+    }
   });
 
-  it("represents a reasoning-only stream without content blocks", async () => {
+  it("represents a reasoning-only stream with an unsigned thinking content block", async () => {
     const events = [
       { type: "reasoning_delta", text: "thinking..." },
       { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
     ];
     const result = await collectStreamEvents(events);
 
-    assert.equal(result.some((event) => event.type === "content_block_start"), false);
+    assert.deepEqual(
+      result.filter((event) => event.type === "content_block_start"),
+      [{
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "thinking", thinking: "" },
+      }],
+    );
     assert.deepEqual(
       result.filter((event) => event.type === "codex_reasoning_delta"),
       [{ type: "codex_reasoning_delta", delta: "thinking..." }],
     );
+    assert.equal(result.some((event) => event.type === "signature_delta"), false);
     assert.equal(result.at(-1)?.type, "message_stop");
   });
 
@@ -1327,8 +1448,13 @@ describe("anthropicStreamAdapter", () => {
     ]);
     const reasoning = result.find((event) => event.type === "codex_reasoning_delta")!;
     assert.equal(reasoning.delta, "");
-    const textDelta = result.find((event) => event.type === "content_block_delta")!;
-    assert.deepEqual(textDelta.delta, { type: "text_delta", text: "" });
+    const deltas = result
+      .filter((event) => event.type === "content_block_delta")
+      .map((event) => event.delta);
+    assert.deepEqual(deltas, [
+      { type: "thinking_delta", thinking: "" },
+      { type: "text_delta", text: "" },
+    ]);
   });
 
   it("rejects legacy provider finish reasons without reflecting them", async () => {
@@ -1423,10 +1549,10 @@ describe("anthropicStreamAdapter", () => {
     ];
     const result = await collectStreamEvents(events);
     const msgStart = result.find((e) => e.type === "message_start")!;
-    assert.equal(
-      Object.hasOwn(msgStart.message as Record<string, unknown>, "usage"),
-      false,
-    );
+    assert.deepEqual((msgStart.message as Record<string, unknown>).usage, {
+      input_tokens: 0, output_tokens: 0,
+      cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    });
     assert.equal((msgStart.message as Record<string, unknown>).container, null);
     assert.equal((msgStart.message as Record<string, unknown>).context_management, null);
 

@@ -217,6 +217,36 @@ mod live_catalog_tests {
     }
 
     #[test]
+    fn disabled_thinking_fallback_selects_lowest_catalog_effort_without_relaxing_explicit_effort() {
+        let with_none = model_with_levels(&["none", "low", "medium"], None);
+        assert_eq!(
+            resolve_reasoning_effort_with_fallback(&with_none, "none", true).unwrap(),
+            "none"
+        );
+        let with_minimal = model_with_levels(&["minimal", "low", "medium"], None);
+        assert_eq!(
+            resolve_reasoning_effort_with_fallback(&with_minimal, "none", true).unwrap(),
+            "minimal"
+        );
+        let with_persistent = model_with_levels(&["persistent", "low"], None);
+        assert_eq!(
+            resolve_reasoning_effort_with_fallback(&with_persistent, "none", true).unwrap(),
+            "disabled"
+        );
+        let low_only = model_with_levels(&["low", "medium", "high", "xhigh"], None);
+        assert_eq!(
+            resolve_reasoning_effort_with_fallback(&low_only, "none", true).unwrap(),
+            "low"
+        );
+        assert!(resolve_reasoning_effort(&low_only, "none").is_err());
+        let medium_first = model_with_levels(&["ultra", "medium", "high"], None);
+        assert_eq!(
+            resolve_reasoning_effort_with_fallback(&medium_first, "none", true).unwrap(),
+            "medium"
+        );
+    }
+
+    #[test]
     fn malformed_upstream_tool_image_and_web_items_fail() {
         assert!(tool_call_from_response_item(&json!({
             "type": "function_call",
@@ -1014,6 +1044,8 @@ impl ResponseChainStore {
 #[derive(Debug, Clone, Default)]
 pub struct GenerationControls {
     pub reasoning: Option<Value>,
+    pub reasoning_summary: Option<String>,
+    pub allow_disabled_reasoning_fallback: bool,
     pub safety_identifier: Option<String>,
     pub prompt_cache_options: Option<Value>,
     pub verbosity: Option<String>,
@@ -1024,6 +1056,8 @@ pub struct CompactControls {
     pub previous_response_id: Option<String>,
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_options: Option<Value>,
+    pub reasoning_summary: Option<String>,
+    pub allow_disabled_reasoning_fallback: bool,
     pub service_tier: Option<String>,
     pub text: Option<Value>,
     pub verbosity: Option<String>,
@@ -1896,13 +1930,15 @@ impl ChatGPTOAuthProvider {
             controls,
         )?;
         let merged_text = merge_text_verbosity(None, controls.verbosity.as_deref())?;
-        let request = finalize_responses_request(
+        let request = finalize_responses_request_with_reasoning_controls(
             payload,
             &resolved,
             responses_lite,
             merged_text.as_ref(),
             None,
             ResponsesEndpointKind::Standard,
+            controls.reasoning_summary.as_deref(),
+            controls.allow_disabled_reasoning_fallback,
         )?;
         let output_items = self.collect_response_output_items(request)?;
 
@@ -1952,13 +1988,15 @@ impl ChatGPTOAuthProvider {
             controls,
         )?;
         let merged_text = merge_text_verbosity(None, controls.verbosity.as_deref())?;
-        let request = finalize_responses_request(
+        let request = finalize_responses_request_with_reasoning_controls(
             payload,
             &resolved,
             responses_lite,
             merged_text.as_ref(),
             None,
             ResponsesEndpointKind::Standard,
+            controls.reasoning_summary.as_deref(),
+            controls.allow_disabled_reasoning_fallback,
         )?;
         let output_items = self.collect_response_output_items(request)?;
         let text = inspection_text_from_response_items(&output_items)?;
@@ -2024,6 +2062,8 @@ impl ChatGPTOAuthProvider {
         }
         let generation_controls = GenerationControls {
             prompt_cache_options: controls.prompt_cache_options.clone(),
+            reasoning_summary: controls.reasoning_summary.clone(),
+            allow_disabled_reasoning_fallback: controls.allow_disabled_reasoning_fallback,
             ..GenerationControls::default()
         };
         apply_generation_controls(
@@ -2033,13 +2073,15 @@ impl ChatGPTOAuthProvider {
         )?;
         let merged_text =
             merge_text_verbosity(controls.text.as_ref(), controls.verbosity.as_deref())?;
-        let request = finalize_responses_request(
+        let request = finalize_responses_request_with_reasoning_controls(
             payload,
             &resolved,
             responses_lite,
             merged_text.as_ref(),
             controls.service_tier.as_deref(),
             ResponsesEndpointKind::Compact,
+            controls.reasoning_summary.as_deref(),
+            controls.allow_disabled_reasoning_fallback,
         )?;
         let extra_headers = responses_lite_headers(request.use_responses_lite);
         let data = self.post_json(
@@ -2227,13 +2269,15 @@ impl ChatGPTOAuthProvider {
             controls,
         )?;
         let merged_text = merge_text_verbosity(text, controls.verbosity.as_deref())?;
-        finalize_responses_request(
+        finalize_responses_request_with_reasoning_controls(
             payload,
             resolved,
             responses_lite,
             merged_text.as_ref(),
             service_tier,
             ResponsesEndpointKind::Standard,
+            controls.reasoning_summary.as_deref(),
+            controls.allow_disabled_reasoning_fallback,
         )
     }
 
@@ -3660,13 +3704,37 @@ fn tool_schema_to_response_dict(tool: &ToolSchema) -> Result<Value, ProviderErro
     Ok(output)
 }
 
+#[cfg(test)]
 fn finalize_responses_request(
+    payload: Value,
+    resolved: &ResolvedModel,
+    responses_lite: Option<&Value>,
+    text: Option<&Value>,
+    service_tier: Option<&str>,
+    endpoint: ResponsesEndpointKind,
+) -> Result<FinalizedResponsesRequest, ProviderError> {
+    finalize_responses_request_with_reasoning_controls(
+        payload,
+        resolved,
+        responses_lite,
+        text,
+        service_tier,
+        endpoint,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_responses_request_with_reasoning_controls(
     mut payload: Value,
     resolved: &ResolvedModel,
     responses_lite: Option<&Value>,
     text: Option<&Value>,
     service_tier: Option<&str>,
     endpoint: ResponsesEndpointKind,
+    reasoning_summary_override: Option<&str>,
+    allow_disabled_reasoning_fallback: bool,
 ) -> Result<FinalizedResponsesRequest, ProviderError> {
     let model = &resolved.model;
     for modality in required_input_modalities(&payload) {
@@ -3754,16 +3822,30 @@ fn finalize_responses_request(
         .and_then(Value::as_str)
         .map(str::to_string)
     {
-        let wire_effort = resolve_reasoning_effort(model, &effort)?;
+        let wire_effort = resolve_reasoning_effort_with_fallback(
+            model,
+            &effort,
+            allow_disabled_reasoning_fallback,
+        )?;
         payload_object
             .get_mut("reasoning")
             .and_then(Value::as_object_mut)
             .expect("reasoning was read as an object")
             .insert("effort".to_string(), Value::String(wire_effort));
     }
-    let reasoning_summary = (model.supports_reasoning_summary_parameter
-        && model.default_reasoning_summary != "none")
-        .then_some(model.default_reasoning_summary.as_str());
+    let reasoning_summary = match reasoning_summary_override {
+        Some("none") => None,
+        Some(override_summary) => model.supports_reasoning_summary_parameter.then(|| {
+            if model.default_reasoning_summary != "none" {
+                model.default_reasoning_summary.as_str()
+            } else {
+                override_summary
+            }
+        }),
+        None => (model.supports_reasoning_summary_parameter
+            && model.default_reasoning_summary != "none")
+            .then_some(model.default_reasoning_summary.as_str()),
+    };
     if let Some(summary) = reasoning_summary {
         let reasoning = payload_object
             .entry("reasoning".to_string())
@@ -3844,6 +3926,14 @@ pub(crate) fn resolve_reasoning_effort(
     model: &ModelInfo,
     requested: &str,
 ) -> Result<String, ProviderError> {
+    resolve_reasoning_effort_with_fallback(model, requested, false)
+}
+
+pub(crate) fn resolve_reasoning_effort_with_fallback(
+    model: &ModelInfo,
+    requested: &str,
+    allow_disabled_fallback: bool,
+) -> Result<String, ProviderError> {
     if requested.is_empty() || requested != requested.trim() {
         return Err(ProviderError::InvalidRequest(
             "reasoning_effort must be a non-empty string without surrounding whitespace"
@@ -3882,6 +3972,32 @@ pub(crate) fn resolve_reasoning_effort(
                 "the requested model has no wire reasoning effort for ultra".to_string(),
             )
         });
+    }
+    if allow_disabled_fallback && requested == "none" {
+        for candidate in ["none", "minimal", "persistent", "low"] {
+            if model
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| level.effort == candidate)
+            {
+                return Ok(if candidate == "persistent" {
+                    "disabled".to_string()
+                } else {
+                    candidate.to_string()
+                });
+            }
+        }
+        if let Some(level) = model
+            .supported_reasoning_levels
+            .iter()
+            .find(|level| level.effort != "ultra")
+        {
+            return Ok(if level.effort == "persistent" {
+                "disabled".to_string()
+            } else {
+                level.effort.clone()
+            });
+        }
     }
     if !model
         .supported_reasoning_levels
@@ -6527,7 +6643,7 @@ mod tests {
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
         assert!(user_agent.starts_with("codex_cli_rs/0.153.3 ("));
-        assert!(user_agent.ends_with(") codex-as-api/0.8.2"));
+        assert!(user_agent.ends_with(") codex-as-api/0.8.3"));
     }
 
     #[test]

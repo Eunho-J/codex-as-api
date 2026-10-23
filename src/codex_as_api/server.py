@@ -22,6 +22,7 @@ from .anthropic_adapter import (
     anthropic_stream_adapter,
     format_anthropic_error,
     internal_response_to_anthropic,
+    resolve_anthropic_thinking_options,
 )
 from .auth import (
     ChatGPTOAuthCatalogUnavailableError,
@@ -92,6 +93,7 @@ _ANTHROPIC_MESSAGES_FIELDS = frozenset(
         "context_management",
         "max_tokens",
         "messages",
+        "metadata",
         "model",
         "multi_agent",
         "output_config",
@@ -123,6 +125,7 @@ _ANTHROPIC_COUNT_TOKENS_FIELDS = frozenset(
         "context_management",
         "max_tokens",
         "messages",
+        "metadata",
         "model",
         "multi_agent",
         "output_config",
@@ -355,7 +358,11 @@ def _strip_anthropic_cache_controls(body: dict[str, Any]) -> None:
         _validate_anthropic_cache_control(body["cache_control"], "request")
         body.pop("cache_control")
 
-    _strip_anthropic_content_cache_controls(body.get("system"), "system")
+    system = body.get("system")
+    if isinstance(system, dict) and "cache_control" in system:
+        _validate_anthropic_cache_control(system["cache_control"], "system")
+        system.pop("cache_control")
+    _strip_anthropic_content_cache_controls(system, "system")
     messages = body.get("messages")
     if isinstance(messages, list):
         for index, message in enumerate(messages):
@@ -374,34 +381,6 @@ def _strip_anthropic_cache_controls(body: dict[str, Any]) -> None:
             tool.pop("cache_control")
 
 
-def _has_anthropic_cache_control(body: dict[str, Any]) -> bool:
-    def content_has_cache_control(value: object) -> bool:
-        if not isinstance(value, list):
-            return False
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            if (block.get("cache_control") is not None) or content_has_cache_control(block.get("content")):
-                return True
-        return False
-
-    if body.get("cache_control") is not None:
-        return True
-    if content_has_cache_control(body.get("system")):
-        return True
-    messages = body.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            if content_has_cache_control(message.get("content")):
-                return True
-    tools = body.get("tools")
-    return isinstance(tools, list) and any(
-        isinstance(tool, dict) and tool.get("cache_control") is not None for tool in tools
-    )
-
-
 def _claude_code_session_id(headers: Headers) -> str | None:
     values = headers.getlist(CLAUDE_CODE_SESSION_HEADER)
     if not values:
@@ -412,20 +391,6 @@ def _claude_code_session_id(headers: Headers) -> str | None:
     if not value.strip():
         raise ChatGPTOAuthInvalidRequestError(f"{CLAUDE_CODE_SESSION_HEADER} must be a non-empty string")
     return value
-
-
-def _validate_anthropic_compatibility_scope(
-    body: dict[str, Any],
-    claude_session_id: str | None,
-) -> None:
-    if claude_session_id is not None:
-        return
-    if body.get("max_tokens") is not None:
-        raise ChatGPTOAuthInvalidRequestError("max_tokens is accepted without forwarding only for Claude Code requests")
-    if _has_anthropic_cache_control(body):
-        raise ChatGPTOAuthInvalidRequestError(
-            "cache_control is accepted without forwarding only for Claude Code requests"
-        )
 
 
 def _anthropic_prompt_cache_key(body: dict[str, Any], claude_session_id: str | None) -> str | None:
@@ -1236,8 +1201,17 @@ def _reject_unsupported_generation_features(body: dict[str, Any], *, anthropic: 
             )
         for key in ("defer_loading", "eager_input_streaming"):
             for fields in (item, function_fields):
-                if key in fields and not (anthropic and key == "eager_input_streaming" and fields[key] is None):
-                    raise ChatGPTOAuthInvalidRequestError(f"{key} is not supported by the Chat facade")
+                if key not in fields:
+                    continue
+                if anthropic and key == "eager_input_streaming" and (
+                    fields[key] is None or isinstance(fields[key], bool)
+                ):
+                    continue
+                if anthropic and key == "defer_loading" and (
+                    fields[key] is None or fields[key] is False
+                ):
+                    continue
+                raise ChatGPTOAuthInvalidRequestError(f"{key} is not supported by the Chat facade")
 
 
 def _reasoning_fields(
@@ -1438,14 +1412,11 @@ def _messages_from_compact_body(
     body: dict[str, Any],
     *,
     anthropic: bool = False,
-    claude_session_id: str | None = None,
-) -> tuple[list[Message], list[ToolSchema] | None, str | None, dict[str, Any] | None]:
+) -> tuple[list[Message], list[ToolSchema] | None, str | None, dict[str, Any] | None, str | None, bool]:
     messages_value = body.get("messages")
     if not isinstance(messages_value, list) or not messages_value:
         raise ChatGPTOAuthInvalidRequestError("messages must be a non-empty array")
     if anthropic or any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
-        if anthropic:
-            _validate_anthropic_compatibility_scope(body, claude_session_id)
         _strip_anthropic_cache_controls(body)
         _validate_anthropic_context_management(body.get("context_management"))
         anthropic_model = body.get("model")
@@ -1479,12 +1450,17 @@ def _messages_from_compact_body(
                 max_tokens=max_tokens,
                 output_format=_anthropic_output_format_from_body(body),
                 output_config=body.get("output_config"),
+                metadata=body.get("metadata"),
+            )
+            _thinking_display, reasoning_summary, thinking_disabled = resolve_anthropic_thinking_options(
+                raw_thinking,
+                max_tokens,
             )
         except ValueError as exc:
             raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
         if converted_tool_choice is not None and converted_tool_choice != "auto":
             raise ChatGPTOAuthInvalidRequestError("compact supports only Anthropic tool_choice.type=auto")
-        return messages, tools, reasoning_effort, text
+        return messages, tools, reasoning_effort, text, reasoning_summary, thinking_disabled
 
     try:
         validated_messages = [ChatMessage.model_validate(message) for message in messages_value]
@@ -1494,7 +1470,7 @@ def _messages_from_compact_body(
     raw_tools = body.get("tools")
     if raw_tools is not None and not isinstance(raw_tools, list):
         raise ChatGPTOAuthInvalidRequestError("tools must be an array")
-    return messages, _parse_tools(raw_tools), None, None
+    return messages, _parse_tools(raw_tools), None, None, None, False
 
 
 def _json_token_count(value: Any) -> int:
@@ -2144,8 +2120,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
         _reject_unknown_fields(body, _ANTHROPIC_COUNT_TOKENS_FIELDS)
         _reject_explicit_null_anthropic_fields(body)
         max_tokens = _positive_integer_field(body, "max_tokens", required=False)
-        claude_session_id = _claude_code_session_id(http_request.headers)
-        _validate_anthropic_compatibility_scope(body, claude_session_id)
+        _claude_code_session_id(http_request.headers)
     except ChatGPTOAuthInvalidRequestError as exc:
         return JSONResponse(
             status_code=400,
@@ -2176,6 +2151,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
             max_tokens=max_tokens,
             output_format=_anthropic_output_format_from_body(body),
             output_config=body.get("output_config"),
+            metadata=body.get("metadata"),
         )
         input_tokens = _estimate_input_tokens(messages, tools)
     except (ValueError, ChatGPTOAuthInvalidRequestError) as exc:
@@ -2213,7 +2189,6 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         _reject_explicit_null_anthropic_fields(body)
         max_tokens = _positive_integer_field(body, "max_tokens", required=True)
         claude_session_id = _claude_code_session_id(http_request.headers)
-        _validate_anthropic_compatibility_scope(body, claude_session_id)
     except ChatGPTOAuthInvalidRequestError as exc:
         return JSONResponse(
             status_code=400,
@@ -2266,6 +2241,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             claude_session_id,
         )
         _validate_anthropic_context_management(body.get("context_management"))
+        raw_thinking = body.get("thinking")
         messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
             model=body.get("model"),
             messages=body.get("messages"),
@@ -2273,10 +2249,15 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             tools=body.get("tools"),
             tool_choice=body.get("tool_choice"),
             stop_sequences=body.get("stop_sequences"),
-            thinking=body.get("thinking"),
+            thinking=raw_thinking,
             max_tokens=max_tokens,
             output_format=_anthropic_output_format_from_body(body),
             output_config=body.get("output_config"),
+            metadata=body.get("metadata"),
+        )
+        thinking_display, reasoning_summary, thinking_disabled = resolve_anthropic_thinking_options(
+            cast(dict[str, Any] | None, raw_thinking),
+            max_tokens,
         )
         parallel_tool_calls = anthropic_parallel_tool_calls(cast(dict[str, Any] | None, body.get("tool_choice")))
     except (ValueError, ChatGPTOAuthInvalidRequestError) as exc:
@@ -2327,6 +2308,9 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         )
     request_model = resolved_model[1].slug
     nested_request_effort = body.get("reasoning", {}).get("effort") if isinstance(body.get("reasoning"), dict) else None
+    allow_disabled_fallback = (
+        thinking_disabled and explicit_effort is None and nested_request_effort is None
+    )
     _validate_configured_reasoning_effort(
         resolved_model[1],
         effective_reasoning_effort,
@@ -2345,6 +2329,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             reasoning_effort=effective_reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
             text=text,
@@ -2378,6 +2364,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                         reasoning_effort=effective_reasoning_effort,
                         reasoning_mode=reasoning_mode,
                         reasoning_context=reasoning_context,
+                        reasoning_summary=reasoning_summary,
+                        allow_disabled_fallback=allow_disabled_fallback,
                         stop=stop,
                         prompt_cache_key=prompt_cache_key,
                         subagent=subagent,
@@ -2394,6 +2382,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                     ),
                     model=client_model,
                     request_id=request_id,
+                    thinking_display=thinking_display,
                 )
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
@@ -2423,6 +2412,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             reasoning_effort=effective_reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
             subagent=subagent,
@@ -2443,7 +2434,12 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
 
     request_id = f"msg_{uuid.uuid4().hex[:24]}"
     try:
-        result = internal_response_to_anthropic(response, client_model, request_id)
+        result = internal_response_to_anthropic(
+            response,
+            client_model,
+            request_id,
+            thinking_display=thinking_display,
+        )
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)
         return JSONResponse(
@@ -2527,7 +2523,8 @@ async def compact(request: Request) -> JSONResponse:
     body = await _request_json_object(request)
     _reject_explicit_null_responses_lite(body)
     is_anthropic_compact = request.url.path == "/v1/messages/compact"
-    claude_session_id = _claude_code_session_id(request.headers) if is_anthropic_compact else None
+    if is_anthropic_compact:
+        _claude_code_session_id(request.headers)
     _reject_unknown_fields(
         body,
         _ANTHROPIC_COMPACT_FIELDS if is_anthropic_compact else _OPENAI_COMPACT_FIELDS,
@@ -2538,10 +2535,9 @@ async def compact(request: Request) -> JSONResponse:
     for field in ("safety_identifier", "include", "prompt_cache_retention"):
         if body.get(field) is not None:
             raise ChatGPTOAuthInvalidRequestError(f"{field} is not supported by the compact facade")
-    messages, tools, reasoning_effort, anthropic_text = _messages_from_compact_body(
+    messages, tools, reasoning_effort, anthropic_text, reasoning_summary, thinking_disabled = _messages_from_compact_body(
         body,
         anthropic=is_anthropic_compact,
-        claude_session_id=claude_session_id,
     )
     if is_anthropic_compact:
         compact_parallel_tool_calls = anthropic_parallel_tool_calls(
@@ -2587,6 +2583,12 @@ async def compact(request: Request) -> JSONResponse:
             requested_model,
         )
     selected_effort = _request_reasoning_effort(explicit_effort)
+    allow_disabled_fallback = (
+        is_anthropic_compact
+        and thinking_disabled
+        and body.get("reasoning_effort") is None
+        and nested_effort is None
+    )
     _validate_configured_reasoning_effort(
         resolved_model[1],
         selected_effort,
@@ -2596,6 +2598,8 @@ async def compact(request: Request) -> JSONResponse:
         "model": resolved_model[1].slug,
         "tools": tools,
         "reasoning_effort": selected_effort,
+        "reasoning_summary": reasoning_summary,
+        "allow_disabled_fallback": allow_disabled_fallback,
         "responses_lite": body.get("responses_lite"),
         "_resolved_model": resolved_model,
     }

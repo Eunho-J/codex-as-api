@@ -65,16 +65,18 @@ def test_resolve_auth_path_explicit_ignores_codex_home(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_resolve_auth_path_rejects_empty_explicit_path(value):
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError) as caught:
         resolve_auth_path(value)
+    assert "non-empty" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_resolve_auth_path_rejects_empty_codex_home(monkeypatch, value):
     monkeypatch.setenv("CODEX_HOME", value)
 
-    with pytest.raises(ValueError, match="CODEX_HOME"):
+    with pytest.raises(ValueError) as caught:
         resolve_auth_path(None)
+    assert "CODEX_HOME" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -96,14 +98,16 @@ def test_jwt_claims_valid(make_jwt):
 
 
 def test_jwt_claims_missing_payload_raises():
-    with pytest.raises(ChatGPTOAuthError, match="JWT structure"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _jwt_claims("onlyonepart")
+    assert "JWT structure" in str(caught.value)
 
 
 @pytest.mark.parametrize("token", ["header..sig", ".payload.sig", "header.payload.", "a.b.c.d"])
 def test_jwt_claims_empty_or_extra_parts_raise(token):
-    with pytest.raises(ChatGPTOAuthError, match="JWT structure"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _jwt_claims(token)
+    assert "JWT structure" in str(caught.value)
 
 
 def test_jwt_claims_invalid_base64_raises(make_jwt):
@@ -122,8 +126,9 @@ def test_jwt_claims_invalid_base64_raises(make_jwt):
     ],
 )
 def test_jwt_claims_rejects_noncanonical_base64url_payloads(payload):
-    with pytest.raises(ChatGPTOAuthMissingError, match="JWT payload"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         _jwt_claims(f"header.{payload}.sig")
+    assert "JWT payload" in str(caught.value)
 
 
 def test_jwt_claims_non_dict_raises(make_jwt):
@@ -153,8 +158,9 @@ def test_expiration_missing_exp_returns_none(make_jwt):
 
 def test_expiration_non_int_exp_raises(make_jwt):
     token = make_jwt({"exp": "not-an-int"})
-    with pytest.raises(ChatGPTOAuthMissingError, match="exp claim"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         _expiration(token)
+    assert "exp claim" in str(caught.value)
 
 
 @pytest.mark.parametrize("raw_exp", ["1.0", "1e0"])

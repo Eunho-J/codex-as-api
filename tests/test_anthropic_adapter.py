@@ -12,6 +12,7 @@ from codex_as_api.anthropic_adapter import (
     anthropic_stream_adapter,
     format_anthropic_error,
     internal_response_to_anthropic,
+    resolve_anthropic_thinking_options,
 )
 from codex_as_api.auth import ChatGPTOAuthProtocolError
 from codex_as_api.messages import (
@@ -227,19 +228,51 @@ class TestAnthropicRequestToInternal:
                 ],
             )
 
-    def test_assistant_thinking_block(self):
-        with pytest.raises(ValueError, match="cannot be preserved"):
+    def test_assistant_thinking_and_redacted_thinking_blocks_are_validated_and_stripped(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me think...", "signature": "sig-abc"},
+                        {"type": "thinking", "thinking": "Unsigned block"},
+                        {"type": "thinking", "thinking": "Null sig", "signature": None},
+                        {"type": "redacted_thinking", "data": "opaque-data"},
+                        {"type": "text", "text": "The answer is 42."},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Thinking-only assistant turn"},
+                    ],
+                },
+            ],
+        )
+        assert len(messages) == 2
+        assert messages[0].role is MessageRole.ASSISTANT
+        assert messages[0].content == "The answer is 42."
+        assert messages[1].role is MessageRole.ASSISTANT
+        assert messages[1].content == ""
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"type": "thinking"},
+            {"type": "thinking", "thinking": 123},
+            {"type": "thinking", "thinking": "ok", "signature": 123},
+            {"type": "thinking", "thinking": "ok", "extra": True},
+            {"type": "redacted_thinking"},
+            {"type": "redacted_thinking", "data": 123},
+            {"type": "redacted_thinking", "data": "ok", "extra": True},
+        ],
+    )
+    def test_rejects_malformed_assistant_thinking_blocks(self, block):
+        with pytest.raises(ValueError, match="thinking"):
             anthropic_request_to_internal(
                 model="test",
-                messages=[
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "thinking", "thinking": "Let me think...", "signature": "sig-abc"},
-                            {"type": "text", "text": "The answer is 42."},
-                        ],
-                    }
-                ],
+                messages=[{"role": "assistant", "content": [block]}],
             )
 
     def test_rejects_assistant_server_web_search_history(self):
@@ -341,9 +374,17 @@ class TestAnthropicRequestToInternal:
         assert tools[0].parameters == {"type": "object", "properties": {"city": {"type": "string"}}}
         assert tools[0].strict is True
 
-    @pytest.mark.parametrize("field", ["defer_loading", "eager_input_streaming"])
-    @pytest.mark.parametrize("value", [False, True])
-    def test_non_null_beta_tool_fields_fail_loudly(self, field, value):
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("defer_loading", True),
+            ("defer_loading", "false"),
+            ("defer_loading", 0),
+            ("eager_input_streaming", "true"),
+            ("eager_input_streaming", 1),
+        ],
+    )
+    def test_invalid_or_unsupported_beta_tool_fields_fail_loudly(self, field, value):
         with pytest.raises(ValueError, match=field):
             anthropic_request_to_internal(
                 model="test",
@@ -357,7 +398,9 @@ class TestAnthropicRequestToInternal:
                 ],
             )
 
-    def test_nullable_beta_tool_fields_are_omitted(self):
+    @pytest.mark.parametrize("eager_input_streaming", [None, False, True])
+    @pytest.mark.parametrize("defer_loading", [None, False])
+    def test_allowed_beta_tool_fields_are_accepted_and_omitted(self, eager_input_streaming, defer_loading):
         _, tools, _, _, _, _ = anthropic_request_to_internal(
             model="test",
             messages=[{"role": "user", "content": "hi"}],
@@ -366,13 +409,46 @@ class TestAnthropicRequestToInternal:
                     "name": "lookup",
                     "input_schema": {"type": "object"},
                     "strict": False,
-                    "eager_input_streaming": None,
+                    "eager_input_streaming": eager_input_streaming,
+                    "defer_loading": defer_loading,
                 }
             ],
         )
         assert tools is not None
         assert tools[0].name == "lookup"
         assert tools[0].strict is False
+
+    @pytest.mark.parametrize("metadata", [None, {}, {"user_id": None}, {"user_id": ""}, {"user_id": "user-123"}])
+    def test_metadata_user_id_is_accepted_and_ignored(self, metadata):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            metadata=metadata,
+        )
+        assert len(messages) == 1
+        assert messages[0].content == "hi"
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            "invalid",
+            [],
+            123,
+            True,
+            {"user_id": 123},
+            {"user_id": True},
+            {"user_id": {}},
+            {"extra": "x"},
+            {"user_id": "ok", "extra": "x"},
+        ],
+    )
+    def test_rejects_malformed_metadata(self, metadata):
+        with pytest.raises(ValueError, match="metadata"):
+            anthropic_request_to_internal(
+                model="test",
+                messages=[{"role": "user", "content": "hi"}],
+                metadata=metadata,
+            )
 
     @pytest.mark.parametrize("strict", [None, "true", 1])
     def test_non_boolean_tool_strict_fails_loudly(self, strict):
@@ -717,12 +793,39 @@ class TestAnthropicRequestToInternal:
         )
         assert effort == "high"
 
-    def test_enabled_thinking_rejects_summarized_display(self):
+    @pytest.mark.parametrize("display", [None, "summarized", "omitted"])
+    def test_enabled_and_adaptive_thinking_accept_summarized_and_omitted_display(self, display):
+        enabled = {"type": "enabled", "budget_tokens": 1024}
+        adaptive = {"type": "adaptive"}
+        if display is not None:
+            enabled["display"] = display
+            adaptive["display"] = display
+        _, _, _, _, enabled_effort, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=enabled,
+        )
+        _, _, _, _, adaptive_effort, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking=adaptive,
+        )
+        assert enabled_effort == "low"
+        assert adaptive_effort == "medium"
+        expected_display = "omitted" if display == "omitted" else "summarized"
+        expected_summary = "none" if display == "omitted" else "auto"
+        assert resolve_anthropic_thinking_options(enabled) == (expected_display, expected_summary, False)
+        assert resolve_anthropic_thinking_options(adaptive) == (expected_display, expected_summary, False)
+        assert resolve_anthropic_thinking_options({"type": "disabled"}) == ("omitted", "none", True)
+        assert resolve_anthropic_thinking_options(None) == ("summarized", None, False)
+
+    @pytest.mark.parametrize("display", ["", "full", 1, True, {}])
+    def test_thinking_rejects_invalid_display_values(self, display):
         with pytest.raises(ValueError, match="display"):
             anthropic_request_to_internal(
                 model="test",
                 messages=[{"role": "user", "content": "hi"}],
-                thinking={"type": "enabled", "budget_tokens": 1024, "display": "summarized"},
+                thinking={"type": "enabled", "budget_tokens": 1024, "display": display},
             )
 
     def test_tool_choice_none_rejects_parallel_control(self):
@@ -1172,9 +1275,21 @@ class TestInternalResponseToAnthropic:
             raw=None,
         )
         result = internal_response_to_anthropic(resp, "test-model", "msg_123")
-        assert result["content"] == [{"type": "text", "text": "42", "citations": None}]
+        assert result["content"] == [
+            {"type": "thinking", "thinking": "Let me think about this..."},
+            {"type": "text", "text": "42", "citations": None},
+        ]
         assert result["codex_reasoning"] == "Let me think about this..."
-        assert all(block["type"] != "thinking" for block in result["content"])
+
+        omitted = internal_response_to_anthropic(
+            resp,
+            "test-model",
+            "msg_123",
+            thinking_display="omitted",
+        )
+        assert omitted["content"] == [{"type": "text", "text": "42", "citations": None}]
+        assert "codex_reasoning" not in omitted
+        assert all(block["type"] != "thinking" for block in omitted["content"])
 
     def test_missing_usage_is_rejected(self):
         resp = AssistantResponse(
@@ -1271,7 +1386,7 @@ class TestInternalResponseToAnthropic:
         with pytest.raises(ChatGPTOAuthProtocolError, match="server_tool_use"):
             internal_response_to_anthropic(response, "m", "msg_1")
 
-    def test_reasoning_only_response_uses_codex_extension_with_empty_content(self):
+    def test_reasoning_only_response_emits_unsigned_thinking_and_replays_cleanly(self):
         resp = AssistantResponse(
             content="",
             tool_calls=(),
@@ -1283,7 +1398,7 @@ class TestInternalResponseToAnthropic:
 
         result = internal_response_to_anthropic(resp, "m", "msg_1")
 
-        assert result["content"] == []
+        assert result["content"] == [{"type": "thinking", "thinking": "private reasoning"}]
         assert result["codex_reasoning"] == "private reasoning"
         replayed, _, _, _, _, _ = anthropic_request_to_internal(
             model="m",
@@ -1293,6 +1408,10 @@ class TestInternalResponseToAnthropic:
         assert replayed[0].role is MessageRole.ASSISTANT
         assert replayed[0].content == ""
 
+        omitted = internal_response_to_anthropic(resp, "m", "msg_1", thinking_display="omitted")
+        assert omitted["content"] == []
+        assert "codex_reasoning" not in omitted
+
 
 # ---------------------------------------------------------------------------
 # Streaming adapter
@@ -1300,10 +1419,15 @@ class TestInternalResponseToAnthropic:
 
 
 class TestAnthropicStreamAdapter:
-    def _collect_events(self, events: list[dict]) -> list[dict]:
+    def _collect_events(self, events: list[dict], *, thinking_display: str = "summarized") -> list[dict]:
         """Run stream adapter and parse the SSE output back into dicts."""
         result = []
-        for sse_str in anthropic_stream_adapter(iter(events), "test-model", "msg_test"):
+        for sse_str in anthropic_stream_adapter(
+            iter(events),
+            "test-model",
+            "msg_test",
+            thinking_display=thinking_display,
+        ):
             for line in sse_str.strip().split("\n"):
                 if line.startswith("data: "):
                     result.append(json.loads(line[6:]))
@@ -1322,6 +1446,12 @@ class TestAnthropicStreamAdapter:
         result = self._collect_events(events)
         types = [e["type"] for e in result]
         assert types[0] == "message_start"
+        assert result[0]["message"]["usage"] == {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
         assert "content_block_start" in types
         assert "content_block_delta" in types
         assert "content_block_stop" in types
@@ -1374,11 +1504,34 @@ class TestAnthropicStreamAdapter:
         result = self._collect_events(events)
 
         block_starts = [e for e in result if e["type"] == "content_block_start"]
-        assert len(block_starts) == 1
-        assert block_starts[0]["content_block"]["type"] == "text"
+        assert len(block_starts) == 2
+        assert block_starts[0]["content_block"] == {"type": "thinking", "thinking": ""}
+        assert block_starts[1]["content_block"]["type"] == "text"
+        thinking_deltas = [
+            e
+            for e in result
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "thinking_delta"
+        ]
+        assert thinking_deltas == [
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "thinking..."},
+            }
+        ]
         reasoning = [e for e in result if e["type"] == "codex_reasoning_delta"]
         assert reasoning == [{"type": "codex_reasoning_delta", "delta": "thinking..."}]
-        assert all(e.get("type") != "thinking" for e in result)
+
+        omitted = self._collect_events(events, thinking_display="omitted")
+        omitted_starts = [e for e in omitted if e["type"] == "content_block_start"]
+        assert len(omitted_starts) == 1
+        assert omitted_starts[0]["content_block"]["type"] == "text"
+        assert [e for e in omitted if e["type"] == "codex_reasoning_delta"] == []
+        assert [
+            e
+            for e in omitted
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "thinking_delta"
+        ] == []
 
     def test_tool_call_stream(self):
         events = [
@@ -1472,7 +1625,8 @@ class TestAnthropicStreamAdapter:
         ]
         result = self._collect_events(events)
         msg_start = [e for e in result if e["type"] == "message_start"][0]
-        assert "usage" not in msg_start["message"]
+        assert msg_start["message"]["usage"]["input_tokens"] == 0
+        assert msg_start["message"]["usage"]["output_tokens"] == 0
         msg_delta = [e for e in result if e["type"] == "message_delta"][0]
         assert msg_delta["usage"] == {
             "cache_creation_input_tokens": 11,
@@ -1626,7 +1780,7 @@ class TestAnthropicStreamAdapter:
         with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported normalized response event type"):
             self._collect_events([{"type": "computer_call"}])
 
-    def test_reasoning_only_stream_uses_codex_extension(self):
+    def test_reasoning_only_stream_emits_thinking_block_and_codex_extension(self):
         events = [
             {"type": "reasoning_delta", "text": "thinking..."},
             {
@@ -1638,9 +1792,23 @@ class TestAnthropicStreamAdapter:
 
         result = self._collect_events(events)
 
-        assert result[1] == {"type": "codex_reasoning_delta", "delta": "thinking..."}
+        assert result[1] == {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+        assert result[2] == {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "thinking..."},
+        }
+        assert result[3] == {"type": "codex_reasoning_delta", "delta": "thinking..."}
+        assert result[4] == {"type": "content_block_stop", "index": 0}
         assert result[-2]["type"] == "message_delta"
         assert result[-1] == {"type": "message_stop"}
+
+        omitted = self._collect_events(events, thinking_display="omitted")
+        assert [event["type"] for event in omitted] == ["message_start", "message_delta", "message_stop"]
 
 
 # ---------------------------------------------------------------------------

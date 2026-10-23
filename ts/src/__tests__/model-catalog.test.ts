@@ -1015,9 +1015,16 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       () => provider.prepareAnthropicModel("gpt-5.6-sol", snapshot),
       (error) => error instanceof ChatGPTOAuthInvalidRequestError,
     );
+    assert.equal(
+      (await new ChatGPTOAuthProvider().prepareAnthropicModel("claude-sonnet-4-5", snapshot)).slug,
+      "gpt-5.6-sol",
+    );
+    const hiddenOnly = parseModelCatalog({
+      models: [rawModel("hidden-only", { visibility: "hide" })],
+    }, metadata());
     await assert.rejects(
-      () => new ChatGPTOAuthProvider().prepareAnthropicModel("claude-sonnet-4-5", snapshot),
-      (error) => error instanceof ChatGPTOAuthInvalidRequestError,
+      () => new ChatGPTOAuthProvider().prepareAnthropicModel("claude-sonnet-4-5", hiddenOnly),
+      (error) => error instanceof ChatGPTOAuthCatalogUnavailableError,
     );
   });
 });

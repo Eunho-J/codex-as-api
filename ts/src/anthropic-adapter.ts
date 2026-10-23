@@ -19,6 +19,11 @@ import { parseJsonStrict } from "./utf8-json.js";
 // Request conversion: Anthropic → internal
 // ---------------------------------------------------------------------------
 
+export interface AnthropicResponseOptions {
+  thinkingDisplay?: "summarized" | "omitted";
+  suppressReasoning?: boolean;
+}
+
 export function anthropicRequestToInternal(opts: {
   model?: string;
   messages: Record<string, unknown>[];
@@ -37,6 +42,9 @@ export function anthropicRequestToInternal(opts: {
   parallelToolCalls: boolean | undefined;
   stop: string[] | null;
   reasoningEffort: string | null;
+  reasoningSummary?: "auto" | "none";
+  thinkingDisplay?: "summarized" | "omitted";
+  thinkingDisabled?: boolean;
   text: Record<string, unknown> | null;
 } {
   const internalMessages: Message[] = [];
@@ -75,7 +83,12 @@ export function anthropicRequestToInternal(opts: {
     toolChoice: internalToolChoice,
     parallelToolCalls,
   } = convertToolChoice(opts.toolChoice ?? null);
-  const reasoningEffort = convertReasoningEffort(
+  const {
+    reasoningEffort,
+    reasoningSummary,
+    thinkingDisplay,
+    thinkingDisabled,
+  } = convertReasoningEffort(
     opts.thinking ?? null,
     opts.outputConfig ?? null,
     opts.maxTokens,
@@ -91,6 +104,9 @@ export function anthropicRequestToInternal(opts: {
     parallelToolCalls,
     stop: opts.stopSequences ?? null,
     reasoningEffort,
+    ...(reasoningSummary === undefined ? {} : { reasoningSummary }),
+    ...(thinkingDisplay === undefined ? {} : { thinkingDisplay }),
+    ...(thinkingDisabled === undefined ? {} : { thinkingDisabled }),
     text,
   };
 }
@@ -349,13 +365,36 @@ function convertAssistantMessage(
         arguments: JSON.stringify(b.input),
       });
     } else if (blockType === "thinking") {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "assistant thinking history cannot be represented by the Codex OAuth transport",
+      assertAllowedFields(
+        b,
+        ["type", "thinking", "signature"],
+        `assistant thinking block ${blockIndex}`,
       );
+      if (typeof b.thinking !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `assistant thinking block ${blockIndex} requires string thinking`,
+        );
+      }
+      if (
+        b.signature !== undefined
+        && b.signature !== null
+        && typeof b.signature !== "string"
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `assistant thinking block ${blockIndex} signature must be a string when provided`,
+        );
+      }
     } else if (blockType === "redacted_thinking") {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "redacted_thinking cannot be represented by the Codex OAuth transport",
+      assertAllowedFields(
+        b,
+        ["type", "data"],
+        `assistant redacted_thinking block ${blockIndex}`,
       );
+      if (typeof b.data !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `assistant redacted_thinking block ${blockIndex} requires string data`,
+        );
+      }
     } else if (blockType === "server_tool_use" || blockType === "web_search_tool_result") {
       throw new ChatGPTOAuthInvalidRequestError(
         `${String(blockType)} history cannot be represented by the Codex OAuth transport`,
@@ -365,11 +404,6 @@ function convertAssistantMessage(
         `assistant content block ${blockIndex} has unsupported type ${String(blockType)}`,
       );
     }
-  }
-  if (textParts.length === 0 && toolCalls.length === 0) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "assistant message content array must not be empty",
-    );
   }
   const msg: Message = {
     role: MessageRole.ASSISTANT,
@@ -386,11 +420,25 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
     if (typeof tool !== "object" || tool === null || Array.isArray(tool)) {
       throw new ChatGPTOAuthInvalidRequestError(`tool ${index} must be an object`);
     }
-    for (const field of ["defer_loading", "eager_input_streaming"] as const) {
-      const value = tool[field];
-      if ((field === "defer_loading" && Object.hasOwn(tool, field)) || value != null) {
-        throw new ChatGPTOAuthInvalidRequestError(`tool ${index} ${field} is not supported`);
-      }
+    if (
+      Object.hasOwn(tool, "defer_loading")
+      && typeof tool.defer_loading !== "boolean"
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tool ${index} defer_loading must be a boolean`,
+      );
+    }
+    if (tool.defer_loading === true) {
+      throw new ChatGPTOAuthInvalidRequestError(`tool ${index} defer_loading is not supported`);
+    }
+    if (
+      tool.eager_input_streaming !== undefined
+      && tool.eager_input_streaming !== null
+      && typeof tool.eager_input_streaming !== "boolean"
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tool ${index} eager_input_streaming must be a boolean when provided`,
+      );
     }
     if (tool.type === "programmatic_tool_calling") {
       throw new ChatGPTOAuthInvalidRequestError(
@@ -513,13 +561,22 @@ function convertToolChoice(
 function convertThinking(
   thinking: Record<string, unknown> | null,
   maxTokens: number | undefined,
-): string | null {
-  if (thinking === null) return null;
+): {
+  effort: string | null;
+  display?: "summarized" | "omitted";
+  reasoningSummary?: "auto" | "none";
+  disabled?: boolean;
+} {
+  if (thinking === null) return { effort: null };
   if (thinking.type === "enabled") {
     assertAllowedFields(thinking, ["type", "budget_tokens", "display"], "thinking");
-    if (thinking.display != null && thinking.display !== "omitted") {
+    if (
+      thinking.display != null
+      && thinking.display !== "summarized"
+      && thinking.display !== "omitted"
+    ) {
       throw new ChatGPTOAuthInvalidRequestError(
-        "thinking.display must be omitted when provided",
+        "thinking.display must be one of: summarized, omitted",
       );
     }
     if (
@@ -536,20 +593,39 @@ function convertThinking(
         "thinking.budget_tokens must be less than max_tokens",
       );
     }
-    return "high";
+    const display = thinking.display === "omitted" ? "omitted" : "summarized";
+    return {
+      effort: "high",
+      display,
+      reasoningSummary: display === "omitted" ? "none" : "auto",
+    };
   }
   if (thinking.type === "adaptive") {
     assertAllowedFields(thinking, ["type", "display"], "thinking");
-    if (thinking.display != null && thinking.display !== "omitted") {
+    if (
+      thinking.display != null
+      && thinking.display !== "summarized"
+      && thinking.display !== "omitted"
+    ) {
       throw new ChatGPTOAuthInvalidRequestError(
-        "thinking.display must be omitted when provided",
+        "thinking.display must be one of: summarized, omitted",
       );
     }
-    return "medium";
+    const display = thinking.display === "omitted" ? "omitted" : "summarized";
+    return {
+      effort: "medium",
+      display,
+      reasoningSummary: display === "omitted" ? "none" : "auto",
+    };
   }
   if (thinking.type === "disabled") {
     assertAllowedFields(thinking, ["type"], "thinking");
-    return "none";
+    return {
+      effort: "none",
+      display: "omitted",
+      reasoningSummary: "none",
+      disabled: true,
+    };
   }
   throw new ChatGPTOAuthInvalidRequestError("thinking.type must be one of: enabled, adaptive, disabled");
 }
@@ -598,42 +674,62 @@ function convertReasoningEffort(
   thinking: Record<string, unknown> | null,
   outputConfigValue: unknown,
   maxTokens: number | undefined,
-): string | null {
-  const thinkingEffort = convertThinking(thinking, maxTokens);
-  if (outputConfigValue == null) return thinkingEffort;
-  if (
-    typeof outputConfigValue !== "object"
-    || Array.isArray(outputConfigValue)
-  ) {
-    throw new ChatGPTOAuthInvalidRequestError("output_config must be an object");
-  }
+): {
+  reasoningEffort: string | null;
+  reasoningSummary?: "auto" | "none";
+  thinkingDisplay?: "summarized" | "omitted";
+  thinkingDisabled?: boolean;
+} {
+  let outputEffort: string | null = null;
+  if (outputConfigValue != null) {
+    if (
+      typeof outputConfigValue !== "object"
+      || Array.isArray(outputConfigValue)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError("output_config must be an object");
+    }
 
-  const outputConfig = outputConfigValue as Record<string, unknown>;
-  for (const key of Object.keys(outputConfig)) {
-    if (!["effort", "format", "task_budget"].includes(key)) {
-      throw new ChatGPTOAuthInvalidRequestError(`output_config.${key} is not supported`);
+    const outputConfig = outputConfigValue as Record<string, unknown>;
+    for (const key of Object.keys(outputConfig)) {
+      if (!["effort", "format", "task_budget"].includes(key)) {
+        throw new ChatGPTOAuthInvalidRequestError(`output_config.${key} is not supported`);
+      }
+    }
+    if (outputConfig.task_budget != null) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "output_config.task_budget is not supported by the Codex OAuth backend",
+      );
+    }
+    if (outputConfig.effort != null) {
+      if (
+        typeof outputConfig.effort !== "string"
+        || !["low", "medium", "high", "xhigh", "max"].includes(
+          outputConfig.effort,
+        )
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          "output_config.effort must be one of: low, medium, high, xhigh, max",
+        );
+      }
+      outputEffort = outputConfig.effort;
     }
   }
-  if (outputConfig.task_budget != null) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "output_config.task_budget is not supported by the Codex OAuth backend",
-    );
+
+  const convertedThinking = convertThinking(thinking, maxTokens);
+  if (convertedThinking.disabled || convertedThinking.effort === "none") {
+    return {
+      reasoningEffort: "none",
+      reasoningSummary: "none",
+      thinkingDisplay: "omitted",
+      thinkingDisabled: true,
+    };
   }
-  if (outputConfig.effort == null) return thinkingEffort;
-  if (
-    typeof outputConfig.effort !== "string"
-    || !["low", "medium", "high", "xhigh", "max"].includes(
-      outputConfig.effort,
-    )
-  ) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "output_config.effort must be one of: low, medium, high, xhigh, max",
-    );
-  }
-  if (thinkingEffort === "none") {
-    return "none";
-  }
-  return outputConfig.effort;
+  return {
+    reasoningEffort: outputEffort ?? convertedThinking.effort,
+    reasoningSummary: convertedThinking.reasoningSummary,
+    thinkingDisplay: convertedThinking.display,
+    thinkingDisabled: convertedThinking.disabled,
+  };
 }
 
 export function anthropicOutputFormatToOpenAIText(
@@ -777,10 +873,20 @@ export function internalResponseToAnthropic(
   response: AssistantResponse,
   model: string,
   requestId: string,
+  opts?: AnthropicResponseOptions,
 ): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
+  const suppressReasoning = opts?.suppressReasoning === true
+    || opts?.thinkingDisplay === "omitted";
 
   rejectUnrepresentableResponseEvents(response.raw);
+
+  if (!suppressReasoning && response.reasoning_content) {
+    content.push({
+      type: "thinking",
+      thinking: response.reasoning_content,
+    });
+  }
 
   if (response.content) {
     content.push({ type: "text", text: response.content, citations: null });
@@ -818,9 +924,9 @@ export function internalResponseToAnthropic(
     stop_reason: stopReason,
     stop_sequence: null,
     usage: usageDict,
-    ...(response.reasoning_content == null
-      ? {}
-      : { codex_reasoning: response.reasoning_content }),
+    ...(!suppressReasoning && response.reasoning_content != null && response.reasoning_content !== ""
+      ? { codex_reasoning: response.reasoning_content }
+      : {}),
   };
 }
 
@@ -948,9 +1054,10 @@ export async function* anthropicStreamAdapter(
   eventIterator: AsyncIterable<Record<string, unknown>>,
   model: string,
   requestId: string,
+  opts?: AnthropicResponseOptions,
 ): AsyncGenerator<string> {
   yield messageStartSse(model, requestId);
-  for await (const chunk of renderAnthropicStreamEvents(eventIterator)) {
+  for await (const chunk of renderAnthropicStreamEvents(eventIterator, opts)) {
     yield chunk;
   }
 }
@@ -971,6 +1078,13 @@ function messageStartSse(
       context_management: null,
       stop_reason: null,
       stop_sequence: null,
+      // Provisional counters; authoritative cumulative usage arrives in message_delta.
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
     },
   });
 }
@@ -1134,11 +1248,14 @@ function requireUsageNumber(value: unknown, field: string): number {
 
 async function* renderAnthropicStreamEvents(
   events: AsyncIterable<Record<string, unknown>>,
+  opts?: AnthropicResponseOptions,
 ): AsyncGenerator<string> {
   let blockIndex = 0;
-  let currentBlock: "text" | "tool_use" | null = null;
+  let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let sawFinish = false;
   let hasToolCalls = false;
+  const suppressReasoning = opts?.suppressReasoning === true
+    || opts?.thinkingDisplay === "omitted";
 
   for await (const event of events) {
     if (sawFinish) {
@@ -1150,6 +1267,26 @@ async function* renderAnthropicStreamEvents(
       if (typeof event.text !== "string") {
         throw new ChatGPTOAuthProtocolError("reasoning event text must be a string");
       }
+      if (suppressReasoning) {
+        continue;
+      }
+      if (currentBlock !== "thinking") {
+        if (currentBlock !== null) {
+          yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+          blockIndex++;
+        }
+        yield sse("content_block_start", {
+          type: "content_block_start",
+          index: blockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        });
+        currentBlock = "thinking";
+      }
+      yield sse("content_block_delta", {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "thinking_delta", thinking: event.text },
+      });
       yield sse("codex_reasoning_delta", {
         type: "codex_reasoning_delta",
         delta: event.text,

@@ -216,6 +216,8 @@ const ANTHROPIC_COMPACT_FIELDS = new Set<string>([
   "output_format",
   "context_management",
   "max_tokens",
+  "cache_control",
+  "metadata",
   "programmatic_tool_calling",
   "safety_identifier",
   "include",
@@ -245,6 +247,10 @@ const ANTHROPIC_COUNT_FIELDS = new Set<string>([
   "output_format",
   "output_config",
   "context_management",
+  "cache_control",
+  "metadata",
+  "multi_agent",
+  "programmatic_tool_calling",
 ]);
 
 const ANTHROPIC_MESSAGE_FIELDS = new Set<string>([
@@ -259,6 +265,12 @@ const ANTHROPIC_MESSAGE_FIELDS = new Set<string>([
   "output_format",
   "output_config",
   "context_management",
+  "cache_control",
+  "metadata",
+  "safety_identifier",
+  "prompt_cache_options",
+  "multi_agent",
+  "programmatic_tool_calling",
   "previous_response_id",
   "responses_lite",
   "stream",
@@ -1197,11 +1209,14 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   async function compact(req: Request, res: Response): Promise<void> {
     const isAnthropicCompact = req.path === "/v1/messages/compact";
     try {
-      const isClaudeCode = resolveClaudeCodeSessionId(req) != null;
+      resolveClaudeCodeSessionId(req);
       const rawBody = requireRequestBody(req.body);
-      if (isAnthropicCompact) rejectExplicitNullAnthropicFields(rawBody);
+      if (isAnthropicCompact) {
+        rejectExplicitNullAnthropicFields(rawBody);
+        validateAnthropicMetadata(rawBody.metadata);
+      }
       const body = isAnthropicCompact
-        ? stripAnthropicCacheControls(rawBody, isClaudeCode)
+        ? stripAnthropicCacheControls(rawBody)
         : rawBody;
       assertAllowedTopLevelFields(
         body,
@@ -1210,12 +1225,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
       );
       rejectUnsupportedGenerationFeatures(body, { anthropic: isAnthropicCompact });
       rejectUnsupportedCompactFields(body);
-      const compactMaxTokens = optionalPositiveInteger(body.max_tokens, "max_tokens");
-      if (compactMaxTokens != null && !isClaudeCode) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "max_tokens is accepted without forwarding only for Claude Code requests",
-        );
-      }
+      optionalPositiveInteger(body.max_tokens, "max_tokens");
       if (body.stop_sequences != null) {
         throw new ChatGPTOAuthInvalidRequestError(
           "stop_sequences is not supported by the private Codex OAuth transport",
@@ -1227,7 +1237,14 @@ export function createApp(opts?: CreateAppOptions): express.Express {
       const requestedModel = optionalModel(body.model);
       const responsesLite = optionalBooleanOrString(body.responses_lite, "responses_lite");
       const directServiceTier = optionalString(body.service_tier, "service_tier");
-      const { messages, reasoningEffort, tools, text: outputFormatText } = messagesFromCompactBody(
+      const {
+        messages,
+        reasoningEffort,
+        reasoningSummary,
+        thinkingDisabled,
+        tools,
+        text: outputFormatText,
+      } = messagesFromCompactBody(
         body,
         requestedModel ?? model,
         isAnthropicCompact,
@@ -1240,6 +1257,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         body.reasoning_effort,
         reasoningEffort,
       );
+      const allowDisabledFallback = isAnthropicCompact
+        && thinkingDisabled === true
+        && body.reasoning_effort == null
+        && (!isRecord(body.reasoning) || body.reasoning.effort == null);
       const checkpoint = await provider.compactMessages(messages, {
         model: requestModel,
         reasoningEffort: resolveReasoningEffort(
@@ -1249,7 +1270,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           ),
           codexConfig,
           preparedModel.capability,
+          { allowDisabledFallback },
         ),
+        reasoningSummary,
         responsesLite,
         tools: tools ?? undefined,
         promptCacheKey: resolvePromptCacheKey(body.prompt_cache_key),
@@ -1278,27 +1301,22 @@ export function createApp(opts?: CreateAppOptions): express.Express {
 
   app.post("/v1/messages/count_tokens", async (req: Request, res: Response) => {
     try {
-      const isClaudeCode = resolveClaudeCodeSessionId(req) != null;
+      resolveClaudeCodeSessionId(req);
       const rawBody = requireRequestBody(req.body);
       rejectAnthropicUnsupportedFieldPresence(rawBody, [
         "temperature",
         "top_p",
         "top_k",
-        "metadata",
       ]);
+      validateAnthropicMetadata(rawBody.metadata);
       rejectExplicitNullFields(rawBody, ["max_tokens"]);
       rejectExplicitNullAnthropicFields(rawBody);
-      const body = stripAnthropicCacheControls(rawBody, isClaudeCode);
+      const body = stripAnthropicCacheControls(rawBody);
       assertAllowedTopLevelFields(body, ANTHROPIC_COUNT_FIELDS, "/v1/messages/count_tokens");
       rejectUnsupportedGenerationFeatures(body, { anthropic: true });
       validateAnthropicContextManagement(body.context_management);
       const requestedModel = optionalModel(body.model);
       const maxTokens = optionalPositiveInteger(body.max_tokens, "max_tokens");
-      if (maxTokens != null && !isClaudeCode) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "max_tokens is accepted without forwarding only for Claude Code requests",
-        );
-      }
       if (body.stop_sequences != null) {
         throw new ChatGPTOAuthInvalidRequestError(
           "stop_sequences is not supported by the private Codex OAuth transport",
@@ -1339,13 +1357,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         "temperature",
         "top_p",
         "top_k",
-        "metadata",
       ]);
+      validateAnthropicMetadata(rawBody.metadata);
       rejectExplicitNullAnthropicFields(rawBody);
-      const body = stripAnthropicCacheControls(
-        rawBody,
-        claudeCodeSessionId != null,
-      );
+      const body = stripAnthropicCacheControls(rawBody);
       assertAllowedTopLevelFields(body, ANTHROPIC_MESSAGE_FIELDS, "/v1/messages");
       rejectUnsupportedGenerationFeatures(body, { anthropic: true });
       validateAnthropicContextManagement(body.context_management);
@@ -1393,6 +1408,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         parallelToolCalls,
         stop,
         reasoningEffort,
+        reasoningSummary,
+        thinkingDisplay,
+        thinkingDisabled,
         text,
       } =
         anthropicRequestToInternal({
@@ -1408,11 +1426,6 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           outputConfig: body.output_config,
         });
 
-      if (maxTokens != null && claudeCodeSessionId == null) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "max_tokens is accepted without forwarding only for Claude Code requests",
-        );
-      }
       if (stop != null) {
         throw new ChatGPTOAuthInvalidRequestError(
           "stop_sequences is not supported by the private Codex OAuth transport",
@@ -1425,17 +1438,28 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         body.reasoning_effort,
         reasoningEffort,
       );
+      const allowDisabledFallback = thinkingDisabled === true
+        && body.reasoning_effort == null
+        && (!isRecord(body.reasoning) || body.reasoning.effort == null);
       const resolvedReasoning = resolveReasoning(
         body.reasoning,
         requestedReasoningEffort,
         codexConfig,
         preparedModel.capability,
+        { allowDisabledFallback },
       );
+      const responseOpts = {
+        thinkingDisplay,
+        suppressReasoning: thinkingDisabled === true
+          || resolvedReasoning?.effort === "none"
+          || resolvedReasoning?.effort === "disabled",
+      };
       const chatOpts = {
         model: requestModel,
         tools: tools ?? undefined,
         toolChoice: toolChoice ?? undefined,
         reasoningEffort: resolvedReasoning?.effort,
+        reasoningSummary,
         reasoning: resolvedReasoning,
         maxTokens,
         stop: stop ?? undefined,
@@ -1447,7 +1471,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         responsesLite,
         parallelToolCalls,
         serviceTier: resolveAnthropicServiceTier(body),
-        ignoreMaxTokens: claudeCodeSessionId != null,
+        // Anthropic requires max_tokens; Codex OAuth does not expose this cap.
+        // Accept the compatibility hint for every client, not only Claude Code.
+        ignoreMaxTokens: true,
         preparedModel,
       };
 
@@ -1469,6 +1495,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
             responseStream,
             clientModel!,
             requestId,
+            responseOpts,
           )) {
             await writeWithBackpressure(res, chunk, downstream.controller.signal);
           }
@@ -1479,7 +1506,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         }
       } else {
         const response = await provider.chat(messages, chatOpts);
-        res.json(internalResponseToAnthropic(response, clientModel!, requestId));
+        res.json(internalResponseToAnthropic(response, clientModel!, requestId, responseOpts));
       }
     } catch (err) {
       handleAnthropicError(err, res);
@@ -1597,18 +1624,16 @@ function claudeSessionPromptCacheKey(sessionId: string): string {
 
 function stripAnthropicCacheControls<T extends Record<string, unknown>>(
   body: T,
-  allow: boolean,
 ): T {
-  const stripped = stripCacheControlFromRecord(body, "request", allow);
+  const stripped = stripCacheControlFromRecord(body, "request");
   if (Array.isArray(stripped.system)) {
     stripped.system = stripped.system.map((block, index) =>
-      stripAnthropicContentCacheControls(block, `system block ${index}`, allow)
+      stripAnthropicContentCacheControls(block, `system block ${index}`)
     );
   } else if (isRecord(stripped.system)) {
     stripped.system = stripAnthropicContentCacheControls(
       stripped.system,
       "system",
-      allow,
     );
   }
   if (Array.isArray(stripped.messages)) {
@@ -1620,7 +1645,6 @@ function stripAnthropicCacheControls<T extends Record<string, unknown>>(
           stripAnthropicContentCacheControls(
             block,
             `message ${index} content block ${blockIndex}`,
-            allow,
           )
         );
       }
@@ -1630,7 +1654,7 @@ function stripAnthropicCacheControls<T extends Record<string, unknown>>(
   if (Array.isArray(stripped.tools)) {
     stripped.tools = stripped.tools.map((tool, index) =>
       isRecord(tool)
-        ? stripCacheControlFromRecord(tool, `tool ${index}`, allow)
+        ? stripCacheControlFromRecord(tool, `tool ${index}`)
         : tool
     );
   }
@@ -1640,16 +1664,14 @@ function stripAnthropicCacheControls<T extends Record<string, unknown>>(
 function stripAnthropicContentCacheControls(
   value: unknown,
   location: string,
-  allow: boolean,
 ): unknown {
   if (!isRecord(value)) return value;
-  const stripped = stripCacheControlFromRecord(value, location, allow);
+  const stripped = stripCacheControlFromRecord(value, location);
   if (Array.isArray(stripped.content)) {
     stripped.content = stripped.content.map((block, index) =>
       stripAnthropicContentCacheControls(
         block,
         `${location} nested content block ${index}`,
-        allow,
       )
     );
   }
@@ -1659,18 +1681,12 @@ function stripAnthropicContentCacheControls(
 function stripCacheControlFromRecord(
   value: Record<string, unknown>,
   location: string,
-  allow: boolean,
 ): Record<string, unknown> {
   const stripped = { ...value };
   if (!Object.hasOwn(stripped, "cache_control")) return stripped;
   if (stripped.cache_control === null) {
     delete stripped.cache_control;
     return stripped;
-  }
-  if (!allow) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      `${location} cache_control is accepted only for Claude Code requests`,
-    );
   }
   validateAnthropicCacheControl(stripped.cache_control, location);
   delete stripped.cache_control;
@@ -1681,8 +1697,7 @@ function validateAnthropicCacheControl(
   value: unknown,
   location: string,
 ): void {
-  // Accepted only as a Claude request-shape hint; Codex receives no TTL or
-  // breakpoint metadata.
+  // Client-neutral request-shape hint; Codex receives no TTL or breakpoint metadata.
   if (!isRecord(value)) {
     throw new ChatGPTOAuthInvalidRequestError(
       `${location} cache_control must be an object`,
@@ -1803,13 +1818,34 @@ function requirePositiveCatalogLimit(
   }
 }
 
+function resolveDisabledReasoningEffort(capability: ModelCapability): string {
+  const supported = capability.supportedReasoningEfforts.map((preset) => preset.effort);
+  for (const candidate of ["none", "minimal", "persistent", "low"]) {
+    if (supported.includes(candidate)) {
+      return wireReasoningEffort(candidate, capability);
+    }
+  }
+  const fallback = supported.find((effort) => effort !== "ultra")
+    ?? capability.defaultReasoningEffort;
+  if (fallback != null) {
+    return wireReasoningEffort(fallback, capability);
+  }
+  throw new ChatGPTOAuthInvalidRequestError(
+    "reasoning effort is not supported by the selected model",
+  );
+}
+
 function resolveReasoningEffort(
   requested: unknown,
   config: CodexConfig,
   capability: ModelCapability,
+  opts?: { allowDisabledFallback?: boolean },
 ): string | undefined {
   if (requested != null) {
     validateReasoningEffortValue(requested, "reasoning_effort");
+    if (requested === "none" && opts?.allowDisabledFallback === true) {
+      return resolveDisabledReasoningEffort(capability);
+    }
     return wireReasoningEffort(requested, capability);
   }
 
@@ -1857,6 +1893,7 @@ function resolveReasoning(
   requestedEffort: unknown,
   config: CodexConfig,
   capability: ModelCapability,
+  opts?: { allowDisabledFallback?: boolean },
 ): ReasoningOptions | undefined {
   if (
     requestedReasoning != null
@@ -1911,7 +1948,7 @@ function resolveReasoning(
       "reasoning.mode is not supported by the private Codex OAuth transport",
     );
   }
-  const effort = resolveReasoningEffort(explicitEffort, config, capability);
+  const effort = resolveReasoningEffort(explicitEffort, config, capability, opts);
   if (effort == null && mode == null && context == null) return undefined;
   const reasoning: ReasoningOptions = {};
   if (effort != null) reasoning.effort = effort as string;
@@ -2013,6 +2050,8 @@ function messagesFromCompactBody(
 ): {
   messages: Message[];
   reasoningEffort: string | null;
+  reasoningSummary?: "auto" | "none";
+  thinkingDisabled?: boolean;
   tools: ToolSchema[] | null;
   text: Record<string, unknown> | null;
 } {
@@ -2042,6 +2081,8 @@ function messagesFromCompactBody(
     return {
       messages: converted.messages,
       reasoningEffort: converted.reasoningEffort,
+      reasoningSummary: converted.reasoningSummary,
+      thinkingDisabled: converted.thinkingDisabled,
       tools: converted.tools,
       text: converted.text,
     };
@@ -2994,6 +3035,23 @@ function parseTools(raw: unknown): ToolSchema[] | undefined {
   return schemas;
 }
 
+function validateAnthropicMetadata(value: unknown): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    throw new ChatGPTOAuthInvalidRequestError("metadata must be an object");
+  }
+  assertRecordFields(value, new Set(["user_id"]), "metadata");
+  if (
+    value.user_id !== undefined
+    && value.user_id !== null
+    && typeof value.user_id !== "string"
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "metadata.user_id must be a string or null",
+    );
+  }
+}
+
 function rejectUnsupportedGenerationFeatures(
   body: Record<string, unknown>,
   opts: { anthropic?: boolean } = {},
@@ -3004,6 +3062,7 @@ function rejectUnsupportedGenerationFeatures(
       || field === "prompt_cache_options"
       || field === "multi_agent"
       || field === "programmatic_tool_calling"
+      || (opts.anthropic === true && field === "metadata")
     ) {
       continue;
     }
@@ -3068,7 +3127,13 @@ function rejectUnsupportedGenerationFeatures(
         const value = owner[field];
         if (
           Object.hasOwn(owner, field)
-          && !(opts.anthropic === true && field === "eager_input_streaming" && value === null)
+          && !(
+            opts.anthropic === true
+            && (
+              (field === "eager_input_streaming" && (value === null || typeof value === "boolean"))
+              || (field === "defer_loading" && value === false)
+            )
+          )
         ) {
           throw new ChatGPTOAuthInvalidRequestError(
             `programmatic tool ${field} is not supported`,

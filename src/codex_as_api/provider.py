@@ -460,10 +460,6 @@ class ChatGPTOAuthProvider:
             not isinstance(requested, str) or not requested or requested != requested.strip()
         ):
             raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string without surrounding whitespace")
-        if requested is not None and anthropic_facade and requested.startswith("claude-") and self.model is None:
-            raise ChatGPTOAuthInvalidRequestError(
-                "claude-* facade models require CODEX_AS_API_MODEL or config.toml model"
-            )
         catalog = snapshot or self.get_model_catalog()
         capability = resolve_model(
             catalog,
@@ -537,6 +533,8 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None = None,
         reasoning_mode: str | None = None,
         reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
@@ -562,6 +560,8 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             max_tokens=max_tokens,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
@@ -589,6 +589,8 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None = None,
         reasoning_mode: str | None = None,
         reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
@@ -624,6 +626,8 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             max_tokens=max_tokens,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
@@ -698,6 +702,8 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None = None,
         reasoning_mode: str | None = None,
         reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         max_tokens: int | None = None,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
@@ -725,6 +731,8 @@ class ChatGPTOAuthProvider:
                 reasoning_effort=reasoning_effort,
                 reasoning_mode=reasoning_mode,
                 reasoning_context=reasoning_context,
+                reasoning_summary=reasoning_summary,
+                allow_disabled_fallback=allow_disabled_fallback,
                 stop=stop,
                 prompt_cache_key=prompt_cache_key,
                 max_tokens=max_tokens,
@@ -1062,6 +1070,8 @@ class ChatGPTOAuthProvider:
         model: str | None = None,
         tools: Sequence[ToolSchema] | None = None,
         reasoning_effort: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         responses_lite: bool | str | None = None,
         previous_response_id: str | None = None,
         prompt_cache_key: str | None = None,
@@ -1102,6 +1112,8 @@ class ChatGPTOAuthProvider:
             payload,
             capability=capability,
             reasoning_effort=reasoning_effort,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             service_tier=service_tier,
             text=text,
             verbosity=verbosity,
@@ -1144,6 +1156,8 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None = None,
         reasoning_mode: str | None = None,
         reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
         max_tokens: int | None = None,
@@ -1167,6 +1181,8 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             stop=stop,
             prompt_cache_key=prompt_cache_key,
             max_tokens=max_tokens,
@@ -1193,6 +1209,8 @@ class ChatGPTOAuthProvider:
         reasoning_effort: str | None = None,
         reasoning_mode: str | None = None,
         reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
         stop: Sequence[str] | None = None,
         prompt_cache_key: str | None = None,
         max_tokens: int | None = None,
@@ -1274,6 +1292,8 @@ class ChatGPTOAuthProvider:
             reasoning_effort=reasoning_effort,
             reasoning_mode=reasoning_mode,
             reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
             text=text,
             verbosity=verbosity,
             service_tier=service_tier,
@@ -2048,6 +2068,8 @@ def _finalize_responses_payload(
     reasoning_effort: str | None,
     reasoning_mode: str | None = None,
     reasoning_context: str | None = None,
+    reasoning_summary: str | None = None,
+    allow_disabled_fallback: bool = False,
     text: dict[str, Any] | None = None,
     verbosity: str | None = None,
     service_tier: str | None = None,
@@ -2076,6 +2098,7 @@ def _finalize_responses_payload(
     effective_effort = resolve_model_reasoning_effort(
         capability,
         reasoning_effort if reasoning_effort is not None else capability.default_reasoning_level,
+        allow_disabled_fallback=allow_disabled_fallback and reasoning_effort is not None,
     )
     _set_reasoning_payload(
         payload,
@@ -2085,13 +2108,25 @@ def _finalize_responses_payload(
         include_encrypted_content=include_encrypted_content,
     )
     reasoning = payload.get("reasoning")
-    if capability.supports_reasoning_summary_parameter and capability.default_reasoning_summary != "none":
+    if reasoning_summary in {"summarized", "auto"}:
+        effective_summary: str | None = (
+            capability.default_reasoning_summary
+            if capability.default_reasoning_summary not in {None, "none"}
+            else "auto"
+        )
+    elif reasoning_summary in {"omitted", "none"}:
+        effective_summary = "none"
+    elif reasoning_summary is None:
+        effective_summary = capability.default_reasoning_summary
+    else:
+        raise ChatGPTOAuthInvalidRequestError("reasoning_summary must be 'auto', 'none', 'summarized', or 'omitted'")
+    if capability.supports_reasoning_summary_parameter and effective_summary not in {None, "none"}:
         if reasoning is None:
             reasoning = {}
             payload["reasoning"] = reasoning
         if not isinstance(reasoning, dict):
             raise ChatGPTOAuthInvalidRequestError("reasoning must be an object")
-        reasoning["summary"] = capability.default_reasoning_summary
+        reasoning["summary"] = effective_summary
         if include_encrypted_content:
             _ensure_reasoning_encrypted_content(payload)
     elif isinstance(reasoning, dict):
@@ -2193,6 +2228,8 @@ def _require_input_modalities(capability: ModelCapability, payload: dict[str, An
 def resolve_model_reasoning_effort(
     capability: ModelCapability,
     requested: str | None,
+    *,
+    allow_disabled_fallback: bool = False,
 ) -> str | None:
     if requested is None:
         return None
@@ -2210,6 +2247,23 @@ def resolve_model_reasoning_effort(
             return non_ultra[-1]
         raise ChatGPTOAuthInvalidRequestError("the requested model has no wire reasoning effort for ultra")
     if requested not in supported:
+        if requested == "none" and allow_disabled_fallback:
+            for candidate in ("none", "minimal", "persistent", "disabled", "low"):
+                if candidate in supported:
+                    return "disabled" if candidate == "persistent" else candidate
+            for candidate in supported:
+                if candidate != "ultra":
+                    return "disabled" if candidate == "persistent" else candidate
+            if (
+                capability.default_reasoning_level is not None
+                and capability.default_reasoning_level != "ultra"
+            ):
+                return (
+                    "disabled"
+                    if capability.default_reasoning_level == "persistent"
+                    else capability.default_reasoning_level
+                )
+            return None
         raise ChatGPTOAuthInvalidRequestError("reasoning_effort is not supported for the requested model")
     return "disabled" if requested == "persistent" else requested
 

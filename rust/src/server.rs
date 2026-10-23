@@ -17,8 +17,9 @@ use std::time::Duration;
 use tokio::task;
 
 use crate::anthropic_adapter::{
-    anthropic_request_to_internal, format_anthropic_error, internal_response_to_anthropic,
-    validate_anthropic_cache_controls, AnthropicStreamAdapter,
+    anthropic_request_to_internal, anthropic_thinking_controls, format_anthropic_error,
+    internal_response_to_anthropic_with_display, validate_anthropic_cache_controls,
+    AnthropicStreamAdapter,
 };
 use crate::auth;
 use crate::codex_config::CodexConfig;
@@ -26,8 +27,8 @@ use crate::messages::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::model_catalog::ModelInfo;
 use crate::o200k_tokenizer::count_ordinary;
 use crate::provider::{
-    parse_usage, resolve_reasoning_effort, validate_image_content_values, ChatGPTOAuthProvider,
-    CompactControls, GenerationControls, ProviderError, ResolvedModel,
+    parse_usage, resolve_reasoning_effort_with_fallback, validate_image_content_values,
+    ChatGPTOAuthProvider, CompactControls, GenerationControls, ProviderError, ResolvedModel,
 };
 use crate::strict_json;
 
@@ -556,6 +557,7 @@ const ANTHROPIC_COMPACT_FIELDS: &[&str] = &[
     "output_config",
     "output_format",
     "cache_control",
+    "metadata",
     "context_management",
     "max_tokens",
     "programmatic_tool_calling",
@@ -612,6 +614,7 @@ const ANTHROPIC_COUNT_FIELDS: &[&str] = &[
     "output_config",
     "output_format",
     "cache_control",
+    "metadata",
     "context_management",
     "multi_agent",
     "programmatic_tool_calling",
@@ -640,6 +643,7 @@ const ANTHROPIC_MESSAGE_FIELDS: &[&str] = &[
     "output_config",
     "output_format",
     "cache_control",
+    "metadata",
     "reasoning_effort",
     "reasoning",
     "prompt_cache_key",
@@ -1668,6 +1672,16 @@ fn effective_reasoning_effort_with_options(
     reasoning: Option<&Value>,
     model: &ModelInfo,
 ) -> Result<Option<String>, ProviderError> {
+    effective_reasoning_effort_with_fallback(state, requested, reasoning, model, false)
+}
+
+fn effective_reasoning_effort_with_fallback(
+    state: &AppState,
+    requested: Option<&str>,
+    reasoning: Option<&Value>,
+    model: &ModelInfo,
+    allow_disabled_fallback: bool,
+) -> Result<Option<String>, ProviderError> {
     if requested.is_some_and(|value| value.is_empty() || value != value.trim()) {
         return Err(ProviderError::InvalidRequest(
             "reasoning_effort must be a non-empty string when provided".to_string(),
@@ -1720,7 +1734,9 @@ fn effective_reasoning_effort_with_options(
         .or_else(|| configured.map(str::to_string))
         .or_else(|| model.default_reasoning_level.clone());
     let explicit = requested.is_some() || nested_effort.is_some();
-    match selected.map(|effort| resolve_reasoning_effort(model, &effort)) {
+    match selected.map(|effort| {
+        resolve_reasoning_effort_with_fallback(model, &effort, allow_disabled_fallback)
+    }) {
         Some(Err(_)) if configured.is_some() => Err(ProviderError::Request(
             "configured reasoning_effort is not supported by the live model".to_string(),
         )),
@@ -1759,6 +1775,8 @@ fn generation_controls(
     }
     Ok(GenerationControls {
         reasoning: reasoning.clone(),
+        reasoning_summary: None,
+        allow_disabled_reasoning_fallback: false,
         safety_identifier: None,
         prompt_cache_options: None,
         verbosity,
@@ -1893,14 +1911,36 @@ fn validate_anthropic_compatibility_scope(
     headers: &HeaderMap,
 ) -> Result<bool, ProviderError> {
     let is_claude_code = claude_code_session_id(headers)?.is_some();
-    validate_anthropic_cache_controls(body, is_claude_code)
+    validate_anthropic_cache_controls(body, true)
         .map_err(ProviderError::InvalidRequest)?;
-    if body.get("max_tokens").is_some_and(|value| !value.is_null()) && !is_claude_code {
-        return Err(ProviderError::InvalidRequest(
-            "max_tokens is accepted without forwarding only for Claude Code requests".to_string(),
-        ));
-    }
     Ok(is_claude_code)
+}
+
+fn validate_anthropic_metadata(body: &Value) -> Result<(), ProviderError> {
+    let Some(metadata) = body.get("metadata") else {
+        return Ok(());
+    };
+    if metadata.is_null() {
+        return Ok(());
+    }
+    let Some(object) = metadata.as_object() else {
+        return Err(ProviderError::InvalidRequest(
+            "metadata must be an object when provided".to_string(),
+        ));
+    };
+    if let Some(field) = object.keys().find(|field| field.as_str() != "user_id") {
+        return Err(ProviderError::InvalidRequest(format!(
+            "metadata.{field} is not supported"
+        )));
+    }
+    if let Some(user_id) = object.get("user_id") {
+        if !user_id.is_null() && !user_id.is_string() {
+            return Err(ProviderError::InvalidRequest(
+                "metadata.user_id must be a string when provided".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_anthropic_context_management(body: &Value) -> Result<(), ProviderError> {
@@ -2025,7 +2065,9 @@ fn reject_unsupported_generation_tool_features(
             for container in [object, function] {
                 match container.get(field) {
                     None => {}
-                    Some(Value::Null) if anthropic && field == "eager_input_streaming" => {}
+                    Some(Value::Null) | Some(Value::Bool(_))
+                        if anthropic && field == "eager_input_streaming" => {}
+                    Some(Value::Bool(false)) if anthropic && field == "defer_loading" => {}
                     Some(Value::Bool(_)) => {
                         return Err(ProviderError::InvalidRequest(format!(
                             "tool {field} is not supported by the Codex OAuth backend"
@@ -2246,12 +2288,6 @@ async fn resolve_anthropic_route_model(
     let requested = requested.to_string();
     task::spawn_blocking(move || {
         if requested.starts_with("claude-") {
-            if provider.model.trim().is_empty() {
-                return Err(ProviderError::InvalidRequest(
-                    "claude-* model facades require CODEX_AS_API_MODEL or config.toml model"
-                        .to_string(),
-                ));
-            }
             let snapshot = provider.model_catalog_snapshot()?;
             provider.configured_or_default_model_from_snapshot(snapshot)
         } else {
@@ -3089,6 +3125,7 @@ async fn compact(
             )));
         }
         validate_anthropic_compatibility_scope(&body, &headers).map_err(|error| respond(&error))?;
+        validate_anthropic_metadata(&body).map_err(|error| respond(&error))?;
         validate_anthropic_context_management(&body).map_err(|error| respond(&error))?;
         if body
             .get("stop_sequences")
@@ -3151,6 +3188,19 @@ async fn compact(
     }
     let (messages, tools, converted_reasoning_effort, converted_text, parallel_tool_calls) =
         messages_from_compact_body(&body, force_anthropic).map_err(|error| respond(&error))?;
+    let compact_thinking_controls = if force_anthropic
+        || body.get("system").is_some()
+        || body.get("thinking").is_some()
+        || body.get("tool_choice").is_some()
+        || body.get("stop_sequences").is_some()
+    {
+        Some(
+            anthropic_thinking_controls(&body)
+                .map_err(|message| respond(&ProviderError::InvalidRequest(message)))?,
+        )
+    } else {
+        None
+    };
     if force_anthropic && parallel_tool_calls == Some(true) {
         let error = ProviderError::InvalidRequest(
             "tool_choice.disable_parallel_tool_use=false cannot be represented by the compact endpoint"
@@ -3209,6 +3259,10 @@ async fn compact(
     } else {
         body.get("text").filter(|value| !value.is_null()).cloned()
     };
+    let allow_disabled_reasoning_fallback = compact_thinking_controls
+        .is_some_and(|controls| controls.disabled)
+        && top_level_reasoning_effort.is_none()
+        && nested_reasoning_effort.is_none();
     let compact_controls = CompactControls {
         previous_response_id,
         prompt_cache_key: if force_anthropic {
@@ -3223,6 +3277,9 @@ async fn compact(
         service_tier: compact_service_tier,
         text: compact_text,
         verbosity: optional_string_field(&body, "verbosity").map_err(|error| respond(&error))?,
+        reasoning_summary: compact_thinking_controls
+            .and_then(|controls| controls.reasoning_summary.map(str::to_string)),
+        allow_disabled_reasoning_fallback,
     };
     let requested_model = optional_string_field(&body, "model").map_err(|error| respond(&error))?;
     let resolved = if force_anthropic {
@@ -3237,11 +3294,12 @@ async fn compact(
     } else {
         resolve_route_model(&state, requested_model).await?
     };
-    let reasoning_effort = effective_reasoning_effort_with_options(
+    let reasoning_effort = effective_reasoning_effort_with_fallback(
         &state,
         requested_reasoning_effort.as_deref(),
         None,
         &resolved.model,
+        compact_controls.allow_disabled_reasoning_fallback,
     )
     .map_err(|error| respond(&error))?;
     let provider = state.provider.clone();
@@ -3291,6 +3349,7 @@ async fn anthropic_count_tokens(
     }
     validate_anthropic_compatibility_scope(&body, &headers)
         .map_err(|error| anthropic_provider_error_response(&error))?;
+    validate_anthropic_metadata(&body).map_err(|error| anthropic_provider_error_response(&error))?;
     if let Err(error) = validate_anthropic_context_management(&body) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -3394,6 +3453,7 @@ async fn anthropic_messages(
     }
     validate_anthropic_compatibility_scope(&body, &headers)
         .map_err(|error| anthropic_provider_error_response(&error))?;
+    validate_anthropic_metadata(&body).map_err(|error| anthropic_provider_error_response(&error))?;
     reject_unsupported_anthropic_controls(&body)
         .map_err(|error| anthropic_provider_error_response(&error))?;
     validate_anthropic_context_management(&body).map_err(|error| {
@@ -3447,6 +3507,13 @@ async fn anthropic_messages(
             )
                 .into_response()
         })?;
+    let thinking_controls = anthropic_thinking_controls(&body).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(format_anthropic_error(400, &message)),
+        )
+            .into_response()
+    })?;
 
     let explicit_reasoning_effort =
         optional_string_field(&body, "reasoning_effort").map_err(|error| {
@@ -3469,6 +3536,11 @@ async fn anthropic_messages(
         )
             .into_response());
     }
+    let has_explicit_effort = explicit_reasoning_effort.is_some()
+        || body
+            .get("reasoning")
+            .and_then(|value| value.get("effort"))
+            .is_some_and(|value| !value.is_null());
     let requested_reasoning_effort = explicit_reasoning_effort.or(converted_reasoning_effort);
     let reasoning = body
         .get("reasoning")
@@ -3488,7 +3560,7 @@ async fn anthropic_messages(
         )
             .into_response()
     })?;
-    let controls = generation_controls(
+    let mut controls = generation_controls(
         reasoning.clone(),
         optional_string_field(&body, "safety_identifier")
             .map_err(|error| anthropic_provider_error_response(&error))?,
@@ -3500,15 +3572,19 @@ async fn anthropic_messages(
         body.get("multi_agent"),
     )
     .map_err(|error| anthropic_provider_error_response(&error))?;
+    controls.reasoning_summary = thinking_controls.reasoning_summary.map(str::to_string);
+    controls.allow_disabled_reasoning_fallback =
+        thinking_controls.disabled && !has_explicit_effort;
 
     let resolved = resolve_anthropic_route_model(&state, &client_model)
         .await
         .map_err(|error| anthropic_provider_error_response(&error))?;
-    let reasoning_effort = effective_reasoning_effort_with_options(
+    let reasoning_effort = effective_reasoning_effort_with_fallback(
         &state,
         requested_reasoning_effort.as_deref(),
         reasoning.as_ref(),
         &resolved.model,
+        controls.allow_disabled_reasoning_fallback,
     )
     .map_err(|error| anthropic_provider_error_response(&error))?;
 
@@ -3577,8 +3653,13 @@ async fn anthropic_messages(
         let (sender, receiver) = tokio::sync::mpsc::channel::<Event>(32);
         let worker_sender = sender.clone();
         let worker_cancellation = cancellation.clone();
+        let thinking_display = thinking_controls.display;
         let worker = task::spawn_blocking(move || {
-            let mut adapter = AnthropicStreamAdapter::new(&client_model, &request_id);
+            let mut adapter = AnthropicStreamAdapter::with_thinking_display(
+                &client_model,
+                &request_id,
+                thinking_display,
+            );
             for chunk in adapter.start() {
                 send_sse_event_with_backpressure(
                     &worker_sender,
@@ -3692,9 +3773,15 @@ async fn anthropic_messages(
             }
         };
 
-        let out = internal_response_to_anthropic(&response, &client_model, &request_id).map_err(
-            |message| anthropic_provider_error_response(&ProviderError::UpstreamProtocol(message)),
-        )?;
+        let out = internal_response_to_anthropic_with_display(
+            &response,
+            &client_model,
+            &request_id,
+            thinking_controls.display,
+        )
+        .map_err(|message| {
+            anthropic_provider_error_response(&ProviderError::UpstreamProtocol(message))
+        })?;
         Ok(Json(out).into_response())
     }
 }

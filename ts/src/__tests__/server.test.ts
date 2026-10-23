@@ -25,7 +25,7 @@ import {
 } from "../provider.js";
 import type { CodexConfig } from "../codex-config.js";
 import { MessageRole } from "../messages.js";
-import type { ToolSchema } from "../messages.js";
+import type { Message, ToolSchema } from "../messages.js";
 import {
   DEFAULT_MODEL_CATALOG_TTL_MS,
   ModelCatalogCache,
@@ -145,12 +145,7 @@ function adaptMockProvider(
           "Anthropic requests require an explicit claude-* model facade",
         );
       }
-      if (configuredModel == null) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "Claude facade backend model is not configured",
-        );
-      }
-      return await (adapted.prepareModel as (model: string) => Promise<PreparedModel>)(configuredModel);
+      return await (adapted.prepareModel as (model?: string) => Promise<PreparedModel>)(configuredModel);
     };
   }
   if (typeof adapted.createChatStream !== "function" && typeof adapted.chatStream === "function") {
@@ -2987,6 +2982,40 @@ describe("Anthropic compatibility helper routes", () => {
     }
   });
 
+  it("maps disabled thinking to the lowest supported effort when none is unavailable", async () => {
+    const options: Record<string, unknown>[] = [];
+    const snapshot = testCatalogSnapshot();
+    const original = modelFromSnapshot(snapshot, "gpt-5.5")!;
+    const capability = { ...original, supportedReasoningEfforts: [
+      { effort: "high", description: "High" },
+      { effort: "low", description: "Low" },
+      { effort: "medium", description: "Medium" },
+    ] };
+    const provider = {
+      async prepareAnthropicModel() {
+        return { slug: capability.slug, accountId: "test-account", capability, snapshot };
+      },
+      async chat(_messages: unknown, opts: Record<string, unknown>) {
+        options.push(opts);
+        return { content: "title", tool_calls: [], finish_reason: "stop",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
+      },
+    };
+    await withServer(provider, async (baseUrl) => {
+      const send = (extra: Record<string, unknown>) => fetch(`${baseUrl}/v1/messages`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-5", max_tokens: 64,
+          messages: [{ role: "user", content: "title" }], ...extra }),
+      });
+      const response = await send({ thinking: { type: "disabled" } });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(options[0].reasoningEffort, "low");
+      // Explicit OpenAI extension effort remains an exact request, not a fallback hint.
+      const explicit = await send({ reasoning_effort: "none" });
+      assert.equal(explicit.status, 400);
+    });
+  });
+
   it("derives stable Claude cache affinity while explicit keys take precedence", async () => {
     const options: Record<string, unknown>[] = [];
     const provider = {
@@ -3023,7 +3052,10 @@ describe("Anthropic compatibility helper routes", () => {
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
           max_tokens: 64,
-          messages: [{ role: "user", content: "hello" }],
+          messages: [{ role: "user", content: [{
+            type: "text", text: "hello", cache_control: { type: "ephemeral", ttl: "5m" },
+          }] }],
+          cache_control: { type: "ephemeral" },
           ...(promptCacheKey == null
             ? {}
             : { prompt_cache_key: promptCacheKey }),
@@ -3039,7 +3071,7 @@ describe("Anthropic compatibility helper routes", () => {
         assert.equal(response.status, 200, await response.clone().text());
       }
       const withoutSession = await send();
-      assert.equal(withoutSession.status, 400);
+      assert.equal(withoutSession.status, 200, await withoutSession.clone().text());
       const invalidBlankSession = await send(" ", "explicit-cache-key-with-blank-session");
       assert.equal(invalidBlankSession.status, 400);
     });
@@ -3053,6 +3085,8 @@ describe("Anthropic compatibility helper routes", () => {
     assert.equal(options[2].promptCacheKey, hash("session-b"));
     assert.notEqual(options[2].promptCacheKey, options[0].promptCacheKey);
     assert.equal(options[3].promptCacheKey, "explicit-cache-key");
+    assert.equal(options[4].promptCacheKey, undefined);
+    assert.equal(options[4].ignoreMaxTokens, true);
     for (const opts of options) {
       assert.equal(opts.codexMetadata, false);
       assert.equal(Object.hasOwn(opts, "clientMetadata"), false);
@@ -3332,12 +3366,24 @@ describe("Anthropic compatibility helper routes", () => {
     assert.deepEqual(routedModels, ["gpt-5.6-sol", "gpt-5.6-sol"]);
   });
 
-  it("rejects a Claude facade when no backend is explicitly configured", async () => {
-    let chatCalls = 0;
+  it("routes a Claude facade to the catalog default model when no backend is explicitly configured", async () => {
+    let routedModel: string | undefined;
     const provider = {
-      async chat() {
-        chatCalls++;
-        throw new Error("provider must not be called");
+      async chat(_messages: unknown, opts: { model?: string }) {
+        routedModel = opts.model;
+        return {
+          content: "done",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cached_tokens: 0,
+          },
+          reasoning_content: null,
+          raw: null,
+        };
       },
     };
     await withServer(provider, async (baseUrl) => {
@@ -3350,11 +3396,12 @@ describe("Anthropic compatibility helper routes", () => {
           messages: [{ role: "user", content: "hello" }],
         }),
       });
-      assert.equal(response.status, 400);
-      const body = await response.json() as { error: { type: string } };
-      assert.equal(body.error.type, "invalid_request_error");
+      assert.equal(response.status, 200, await response.clone().text());
+      const body = await response.json() as { model: string };
+      assert.equal(body.model, "claude-sonnet-4-6");
+      // gpt-5.6-sol has the lowest visible catalog priority (10 vs 20).
+      assert.equal(routedModel, "gpt-5.6-sol");
     }, { model: null });
-    assert.equal(chatCalls, 0);
   });
 
   it("maps Anthropic speed and rejects conflicting service tiers", async () => {
@@ -3639,9 +3686,9 @@ describe("Anthropic compatibility helper routes", () => {
       { reasoning_effort: "low", output_config: { effort: "high" } },
       { tools: [{ name: "lookup", input_schema: {}, strict: "true" }] },
       { tools: [{ name: "lookup", input_schema: {}, defer_loading: true }] },
-      { tools: [{ name: "lookup", input_schema: {}, defer_loading: false }] },
-      { tools: [{ name: "lookup", input_schema: {}, eager_input_streaming: true }] },
-      { tools: [{ name: "lookup", input_schema: {}, eager_input_streaming: false }] },
+      { tools: [{ name: "lookup", input_schema: {}, defer_loading: null }] },
+      { tools: [{ name: "lookup", input_schema: {}, defer_loading: "false" }] },
+      { tools: [{ name: "lookup", input_schema: {}, eager_input_streaming: "true" }] },
       { tools: [{ name: "lookup", input_schema: {}, future_control: true }] },
       { messages: [{ role: "user", content: "hello", name: "ignored" }] },
       {
@@ -3678,6 +3725,7 @@ describe("Anthropic compatibility helper routes", () => {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             model: "claude-sonnet-4-6",
+            max_tokens: 64,
             messages: [{ role: "user", content: "hello" }],
             ...controls,
           }),
@@ -4305,16 +4353,27 @@ describe("Anthropic compatibility helper routes", () => {
       };
 
       const plain = await count({});
-      const invalid = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-5",
-          messages: [{ role: "user", content }],
-          metadata: { diagnostic: "x".repeat(4_000) },
-        }),
-      });
-      assert.equal(invalid.status, 400);
+      assert.equal(await count({ max_tokens: 1024 }), plain);
+      assert.equal(await count({ metadata: { user_id: "user-123" } }), plain);
+      assert.equal(await count({ metadata: { user_id: null } }), plain);
+      assert.equal(await count({ metadata: {} }), plain);
+      for (const badMetadata of [
+        { diagnostic: "x".repeat(4_000) },
+        { user_id: 123 },
+        null,
+        [],
+      ]) {
+        const invalid = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-5",
+            messages: [{ role: "user", content }],
+            metadata: badMetadata,
+          }),
+        });
+        assert.equal(invalid.status, 400);
+      }
       const invalidStream = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -4330,7 +4389,7 @@ describe("Anthropic compatibility helper routes", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
-          max_tokens: 1024,
+          max_tokens: 0,
           messages: [{ role: "user", content }],
         }),
       });
@@ -4347,6 +4406,180 @@ describe("Anthropic compatibility helper routes", () => {
       assert.equal(invalidStop.status, 400);
       assert.equal(plain, 1_012);
     });
+  });
+
+  it("supports client-neutral Anthropic hints, thinking display/replay, and Upstream summary mapping", async () => {
+    const auth = writeAuthFile();
+    const rawSummaryNone = rawModel("gpt-summary-none", {
+      supports_reasoning_summary_parameter: true,
+      default_reasoning_summary: "none",
+      supported_reasoning_levels: [
+        { effort: "low", description: "low" },
+        { effort: "medium", description: "medium" },
+        { effort: "high", description: "high" },
+      ],
+      default_reasoning_level: "low",
+    });
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const realProvider = new ChatGPTOAuthProvider({
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+        const provider = {
+          async catalogSnapshot() {
+            return realProvider.catalogSnapshot();
+          },
+          async prepareModel(requested?: string) {
+            return realProvider.prepareModel(requested);
+          },
+          async prepareAnthropicModel(clientModel?: string) {
+            return realProvider.prepareAnthropicModel(clientModel);
+          },
+          async chat(messages: Message[], opts: Record<string, unknown>) {
+            await realProvider.chat(messages, opts);
+            return {
+              content: "final answer",
+              tool_calls: [],
+              finish_reason: "stop" as const,
+              usage: {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+              },
+              reasoning_content: "summarized thought",
+              raw: null,
+            };
+          },
+          async createChatStream(messages: Message[], opts: Record<string, unknown>) {
+            await realProvider.chat(messages, opts);
+            return (async function* () {
+              yield { type: "reasoning_delta", text: "streamed thought" };
+              yield { type: "content", text: "streamed answer" };
+              yield {
+                type: "finish",
+                finish_reason: "stop",
+                usage: {
+                  input_tokens: 10,
+                  output_tokens: 5,
+                  total_tokens: 15,
+                  input_tokens_details: { cached_tokens: 0 },
+                },
+              };
+            })();
+          },
+          async compactMessages(messages: Message[], opts: Record<string, unknown>) {
+            return realProvider.compactMessages(messages, opts);
+          },
+        };
+
+        await withServer(provider, async (baseUrl) => {
+          const commonFields = {
+            model: "claude-sonnet-4-6",
+            max_tokens: 2048,
+            cache_control: { type: "ephemeral", ttl: "5m" },
+            metadata: { user_id: "user-abc" },
+            tools: [{
+              name: "lookup",
+              input_schema: { type: "object" },
+              eager_input_streaming: true,
+              defer_loading: false,
+              cache_control: { type: "ephemeral" },
+            }],
+            messages: [
+              { role: "user", content: "question 1" },
+              {
+                role: "assistant",
+                content: [
+                  { type: "thinking", thinking: "prior thought" },
+                  { type: "redacted_thinking", data: "redacted" },
+                  { type: "text", text: "answer 1", cache_control: { type: "ephemeral" } },
+                ],
+              },
+              { role: "user", content: "question 2" },
+            ],
+          };
+
+          const summarizedRes = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...commonFields,
+              thinking: { type: "enabled", budget_tokens: 1024, display: "summarized" },
+            }),
+          });
+          assert.equal(summarizedRes.status, 200, await summarizedRes.clone().text());
+          const summarizedBody = await summarizedRes.json() as Record<string, unknown>;
+          assert.equal(summarizedBody.codex_reasoning, "summarized thought");
+          assert.deepEqual(summarizedBody.content, [
+            { type: "thinking", thinking: "summarized thought" },
+            { type: "text", text: "final answer", citations: null },
+          ]);
+
+          const omittedStreamRes = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...commonFields,
+              stream: true,
+              thinking: { type: "adaptive", display: "omitted" },
+            }),
+          });
+          assert.equal(omittedStreamRes.status, 200, await omittedStreamRes.clone().text());
+          const omittedSse = await omittedStreamRes.text();
+          assert.equal(omittedSse.includes("thinking_delta"), false);
+          assert.equal(omittedSse.includes("codex_reasoning_delta"), false);
+          assert.equal(omittedSse.includes("streamed answer"), true);
+
+          const disabledRes = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...commonFields,
+              thinking: { type: "disabled" },
+            }),
+          });
+          assert.equal(disabledRes.status, 200, await disabledRes.clone().text());
+          const disabledBody = await disabledRes.json() as Record<string, unknown>;
+          assert.equal(Object.hasOwn(disabledBody, "codex_reasoning"), false);
+          assert.deepEqual(disabledBody.content, [
+            { type: "text", text: "final answer", citations: null },
+          ]);
+
+          const compactRes = await fetch(`${baseUrl}/v1/messages/compact`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              ...commonFields,
+              thinking: { type: "disabled" },
+            }),
+          });
+          assert.equal(compactRes.status, 200, await compactRes.clone().text());
+
+          assert.equal(requests.length, 4);
+          assert.deepEqual(requests[0].body.reasoning, {
+            effort: "high",
+            summary: "auto",
+            context: "all_turns",
+          });
+          assert.deepEqual(requests[1].body.reasoning, {
+            effort: "medium",
+            context: "all_turns",
+          });
+          assert.deepEqual(requests[2].body.reasoning, {
+            effort: "low",
+            context: "all_turns",
+          });
+          assert.deepEqual(requests[3].body.reasoning, {
+            effort: "low",
+            context: "all_turns",
+          });
+        }, { model: null, authPath: auth.authPath });
+      }, { models: [rawSummaryNone] });
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
   });
 
   it("rejects OpenAI-only null controls on Anthropic routes before provider transport", async () => {

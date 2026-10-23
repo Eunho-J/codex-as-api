@@ -250,11 +250,9 @@ it; continuation uses the complete provider Response items saved behind
 
 ### `POST /v1/messages`
 
-Claude Code compatibility endpoint using the Anthropic Messages shape. It supports streaming (`stream: true`) and non-streaming only for requests carrying one valid `x-claude-code-session-id` header. A live Codex model ID routes directly. A recognized `claude-*` facade ID requires an explicit `CODEX_AS_API_MODEL` or Codex config model that is present in the same fresh catalog; it is not silently routed to a default. Other unknown IDs fail. The response preserves the client-supplied model name.
+Anthropic Messages compatibility endpoint for any client, including Claude Code and Scheherazade. It supports streaming (`stream: true`) and non-streaming without a client-identification header. A live Codex model ID routes directly. A `claude-*` facade ID uses the configured Codex backend model, or the authenticated catalog default when no backend model is configured. Other unknown IDs fail. The response preserves the client-supplied model name.
 
-This compatibility endpoint is scoped to Claude Code requests. The proxy accepts
-and strips the non-forwarded `max_tokens` and `cache_control` compatibility
-fields only when one valid `x-claude-code-session-id` header is present.
+`max_tokens` is a required positive compatibility hint: the private Codex OAuth transport does not expose a matching output-token cap. Valid ephemeral `cache_control` hints are accepted and stripped for every client; their TTL and breakpoint semantics are not forwarded. An optional `x-claude-code-session-id` provides stable hashed cache affinity, not permission to use the endpoint. `metadata.user_id` is accepted as client metadata and is not forwarded.
 
 ```bash
 curl http://localhost:18080/v1/messages \
@@ -291,7 +289,7 @@ curl -N http://localhost:18080/v1/messages \
   }'
 ```
 
-Codex reasoning summaries are not Anthropic signed-thinking blocks. A non-streaming response exposes real upstream reasoning only through the top-level `codex_reasoning` proxy extension. A stream emits `event: codex_reasoning_delta` with `type: "codex_reasoning_delta"`. The proxy never fabricates `thinking`, `thinking_delta`, or `signature_delta` data.
+With `thinking.display: "summarized"` (the enabled/adaptive default), real Codex reasoning summaries are returned as unsigned Anthropic `thinking` blocks and streamed `thinking_delta` content, alongside the existing `codex_reasoning` / `codex_reasoning_delta` extensions. `display: "omitted"` and disabled thinking suppress reasoning output. No Anthropic signature is fabricated. Valid thinking blocks in replayed assistant history are checked and stripped before Codex input; ordinary text and tool calls are preserved.
 
 Hosted Anthropic `web_search` declarations are rejected with HTTP 400 on
 Messages, token-counting, and compact requests. OpenAI Responses cannot supply
@@ -311,10 +309,7 @@ the completion is nonterminal or final usage is absent; a stream that has
 already started emits an Anthropic `error` event and never emits a successful
 `message_stop`. The final response includes every required usage field, using
 `null` only where the Anthropic type permits it, plus required container,
-citation, context-management, and direct-caller fields. To preserve Claude
-Code's realtime behavior, `message_start` is sent immediately without guessed
-input-token counts; this narrow stream-start shape is Claude Code compatibility
-behavior, not generic Anthropic API parity.
+citation, context-management, and direct-caller fields. `message_start` is sent immediately with numeric zero counters in `message.usage`; these are provisional, not measured counts. The final `message_delta.usage` replaces them with authoritative cumulative totals, including disjoint cache buckets.
 
 Generated `tool_use` blocks with `caller: {"type":"direct"}` and empty
 assistant content arrays can be replayed through the request adapter. Malformed,
@@ -330,9 +325,9 @@ different jobs:
 | `client_metadata.session_id` | Forwarded to Codex, used as the default `prompt_cache_key`, and required when Codex metadata mode is enabled | Not used or forwarded |
 | `client_metadata.thread_id` | Codex metadata thread identity; defaults to `session_id` for a root request and preserves an explicit child thread | Not used or synthesized |
 | `prompt_cache_key` | Explicit value wins; otherwise a non-empty `client_metadata.session_id` is used; otherwise omitted | Optional proxy extension; explicit value wins, otherwise the Claude Code session header is hashed |
-| `x-claude-code-session-id` | Not used | Required for the non-forwarded `max_tokens` and `cache_control` compatibility fields; its exact value also supplies hashed cache affinity |
+| `x-claude-code-session-id` | Not used | Optional cache-affinity header; its exact value supplies a hashed default key |
 | `previous_response_id` | Resolves a known entry from the 256-chain process-local history and replays full input/output over HTTP; never forwarded | Non-null values return Anthropic-style HTTP 400 because normal Messages is stateless |
-| `cache_control` | Not an OpenAI Chat control | Accepted only with the Claude Code session header, validated, then stripped before Codex transport |
+| `cache_control` | Not an OpenAI Chat control | Accepted for every client, validated, then stripped before Codex transport |
 
 Anthropic `cache_control` is a cache-boundary annotation, not an identifier.
 This proxy accepts only `{"type":"ephemeral"}` with optional `ttl: "5m"` or
@@ -344,15 +339,13 @@ responses do not expose the Chat-only `response_id`. The custom
 `previous_response_id` support.
 
 The Anthropic type permits `cache_control: null`; the proxy treats that exact
-value as omission. A non-null cache-control object is validated in full and is
-accepted only on a Claude Code request.
+value as omission. A non-null cache-control object is validated in full for every client.
 
 ### `POST /v1/messages/count_tokens`
 
-Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route counts text locally and returns context-window metadata for the effective backend model. Normalized model-visible messages, tool calls, tool-result metadata, reasoning, and tool schemas are counted once. Request-envelope fields and the approved Claude Code `max_tokens` compatibility hint are excluded; other unsupported generation controls fail instead of becoming no-ops. Image inputs use a separate fixed estimate so inline base64 data is not counted as text.
+Anthropic-compatible token counting helper. Codex OAuth does not expose a count-only endpoint equivalent to Anthropic's native API, so this route counts text locally and returns context-window metadata for the effective backend model. Normalized model-visible messages, tool calls, tool-result metadata, reasoning, and tool schemas are counted once. Request-envelope fields and the `max_tokens` compatibility hint are excluded; other unsupported generation controls fail instead of becoming no-ops. Image inputs use a separate fixed estimate so inline base64 data is not counted as text.
 
-`max_tokens` and `cache_control` remain Claude Code-only compatibility hints on
-this route and require `x-claude-code-session-id` when present.
+`max_tokens` and `cache_control` are optional client-neutral compatibility hints on this route; no Claude Code header is required.
 
 Text estimation uses a bundled port of official `tiktoken` `o200k_base` `encode_ordinary`: the same Unicode pre-tokenization regex, byte-pair merge algorithm, and merge-rank data are implemented in Python, TypeScript, and Rust. It is a local estimator, not model metadata and not a substitute for a provider count API. The project does not depend on a `tiktoken` package or download encoding data at runtime. The last upstream synchronization check was **2026-07-14**, against [`tiktoken` 0.13.0 at `08a5f3b`](https://github.com/openai/tiktoken/tree/08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa); the bundled rank file SHA-256 is `446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`.
 
@@ -371,7 +364,7 @@ curl http://localhost:18080/v1/messages/count_tokens \
 
 ### `POST /v1/messages/compact`
 
-Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content. Live GPT model IDs select the matching backend model, and Claude Code effort and Fast Mode controls use the same mappings as `/v1/messages`. Its required non-forwarded `max_tokens` and any `cache_control` hints require one valid `x-claude-code-session-id` header.
+Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content. Live GPT model IDs select the matching backend model, and Claude Code effort and Fast Mode controls use the same mappings as `/v1/messages`. Its required non-forwarded `max_tokens` and any valid `cache_control` hints are accepted for every client; the optional Claude Code session header only supplies cache affinity.
 
 ### `POST /v1/images/generations`
 
@@ -511,7 +504,7 @@ Requests can instead use the Responses-shaped effort/context object:
 - Responses Lite uses `all_turns` as the Codex wire default. An explicitly different context is rejected instead of silently overwritten; use `responses_lite: false` when the backend route supports classic Responses and another context is required.
 - Remote compact keeps its existing private Codex `reasoning_effort` field but does not accept public `reasoning.mode` or `reasoning.context`.
 
-Anthropic `thinking` values map as `enabled → high`, `adaptive → medium`, and `disabled → none`. Claude Code's `output_config.effort` takes precedence over adaptive or enabled thinking and supports `low`, `medium`, `high`, `xhigh`, and `max`. Call-level `thinking.disabled` takes precedence over ambient `output_config.effort` for representable client-side auxiliary calls such as WebFetch; hosted Anthropic WebSearch is rejected before transport because its lifecycle cannot be translated losslessly. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro, non-null public cache policy/breakpoints, and any supplied `safety_identifier` fail explicitly on the private Codex provider.
+Anthropic `thinking` values map as `enabled → high` and `adaptive → medium`. Disabled thinking selects `none` when available, otherwise the lowest supported catalog effort, and suppresses reasoning output; it does not claim to eliminate a model's internal reasoning. `output_config.effort` takes precedence over adaptive or enabled thinking and supports `low`, `medium`, `high`, `xhigh`, and `max`. Call-level disabled thinking takes precedence over ambient `output_config.effort` for auxiliary calls such as WebFetch. Explicit unsupported effort requests still fail. Hosted Anthropic WebSearch is rejected because its lifecycle cannot be translated losslessly. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro, non-null public cache policy/breakpoints, and any supplied `safety_identifier` fail explicitly on the private Codex provider.
 
 Anthropic's `JSONOutputFormat` carries a schema but no name. When Claude Code
 sends that official shape, the proxy follows pinned Codex 0.153.3 and supplies
@@ -785,9 +778,9 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:18080 ANTHROPIC_AUTH_TOKEN=unused \
   claude --model gpt-5.6-luna --effort medium
 ```
 
-Live Codex IDs are sent to the matching backend model. Built-in Claude/Fable/Opus/Sonnet/Haiku IDs are not Codex models, so recognized `claude-*` IDs require the explicitly configured `CODEX_AS_API_MODEL`; the proxy preserves the selected client name in the Anthropic response.
+Live Codex IDs are sent to the matching backend model. Built-in Claude/Fable/Opus/Sonnet/Haiku IDs are not Codex models, so recognized `claude-*` IDs use the configured Codex model or authenticated catalog default; the proxy preserves the selected client name in the Anthropic response.
 
-`ANTHROPIC_BASE_URL` applies to the whole Claude Code process. Therefore the built-in rows remain available in the picker, but they also pass through codex-as-api and use the explicitly configured Codex backend; the rows do not call Anthropic models in that process. To use an actual Anthropic model and GPT in parallel, keep the gateway variables out of global settings, start the GPT process with the inline command above, and start a second process normally:
+`ANTHROPIC_BASE_URL` applies to the whole Claude Code process. Therefore the built-in rows remain available in the picker, but they also pass through codex-as-api and use the configured or catalog-default Codex backend; the rows do not call Anthropic models in that process. To use an actual Anthropic model and GPT in parallel, keep the gateway variables out of global settings, start the GPT process with the inline command above, and start a second process normally:
 
 ```bash
 claude --model sonnet
@@ -797,7 +790,7 @@ If the gateway variables are already in `~/.claude/settings.json`, shell-level `
 
 Claude Code gateway discovery cannot expose raw `gpt-*` IDs because Claude Code filters discovered IDs to `claude*` and `anthropic*`. The official single custom-model option avoids a misleading facade ID. This integration is an Anthropic Messages-compatible bridge; Anthropic explicitly does not support routing Claude Code to non-Claude models through third-party gateways. See the official [model configuration](https://code.claude.com/docs/en/model-config), [gateway connection](https://code.claude.com/docs/en/llm-gateway-connect), and [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol) references.
 
-The current bridge accepts Claude Code's exact no-op thinking cleanup (`clear_thinking_20251015` with `keep: "all"`). Context edits that would change history, task budgets, enabled beta tool fields such as `strict` or `defer_loading`, malformed output formats, and unsupported image source types return HTTP 400 because the Codex OAuth transport has no lossless equivalent. Valid base64 and URL image blocks plus `tool_result.is_error` are preserved during translation.
+The bridge accepts Claude Code's no-op thinking cleanup (`clear_thinking_20251015` with `keep: "all"`), validates and ignores boolean `eager_input_streaming`, and accepts `defer_loading: false`. Context edits that would change history, task budgets, enabled strict/deferred tool execution, malformed output formats, and unsupported image source types return HTTP 400. Valid base64 and URL image blocks plus `tool_result.is_error` are preserved during translation.
 
 ## Architecture
 

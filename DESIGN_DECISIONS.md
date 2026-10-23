@@ -137,9 +137,9 @@ User words, verbatim:
   additional local filter.
 - Do not maintain public GPT model aliases. Requests use exact slugs from the
   fresh authenticated snapshot.
-  Recognized `claude-*` compatibility names require an explicitly configured
-  backend model from the same snapshot; arbitrary unknown names and missing
-  configured models fail.
+  Recognized `claude-*` compatibility names use the configured backend model
+  from the same snapshot, or its catalog default when no backend is configured;
+  arbitrary unknown names and unavailable configured models fail.
 - Namespace process-local `previous_response_id` history by authenticated account
   so one account's content cannot be replayed under another account.
 - Accept only the official nested `tokens` layout for managed ChatGPT auth.
@@ -157,16 +157,15 @@ User words, verbatim:
   explicit `null`. Accept `null` only for fields whose supported Anthropic type
   is nullable or for a separately documented private-transport no-op; reject
   it for non-nullable optional fields before transport.
-- Keep the narrowly documented Claude Code compatibility handling for Anthropic
-  `max_tokens` and validated `cache_control`, managed-ChatGPT OAuth refresh-once
-  behavior, and protocol-correct in-stream error events after response headers
-  have begun.
+- Accept Anthropic `max_tokens` and validated `cache_control` as client-neutral
+  compatibility hints. Keep managed-ChatGPT OAuth refresh-once behavior and
+  protocol-correct in-stream error events after response headers have begun.
 - Reject Anthropic hosted WebSearch instead of fabricating its server-tool
   provenance from OpenAI hosted-search output. Require authoritative final
   usage and a real `response.completed`; derive terminal status from emitted
   tool calls and pinned Codex's `end_turn` semantics, where only explicit
-  `false` is nonterminal. Preserve immediate Claude Code `message_start`
-  delivery without guessing token counts.
+  `false` is nonterminal. Send `message_start` immediately with provisional
+  numeric zero usage, then authoritative cumulative usage in `message_delta`.
 - Implement and verify the same behavior in Python, TypeScript, and Rust, then
   publish one versioned release to every configured registry and GitHub target.
 
@@ -248,3 +247,37 @@ not on the ChatGPT backend host.
 - `ts/src/realtime.ts`, `ts/src/server.ts`, `ts/src/index.ts`, `ts/package.json`
 - `ts/src/__tests__/realtime.test.ts`
 - `README.md`, `ts/README.md`, `RELEASES.md`, package metadata
+
+## D-005 — Client-neutral Anthropic compatibility (0.8.3)
+
+Status: APPROVED FOR IMPLEMENTATION (2026-10-24)
+
+The user reported valid Scheherazade requests being rejected and asked for an
+independent Gemini 4 review, removal of unnecessary proxy restrictions, and a
+0.8.3 release. The review identified client-identity gates, missing initial
+stream usage, display handling, and disabled-thinking effort mapping.
+
+### Decision
+
+- Client identity does not determine whether valid Anthropic hints are accepted.
+  Validate `max_tokens`, ephemeral `cache_control`, and client metadata for every
+  client. The optional Claude session header only supplies cache affinity.
+- Initial stream usage has numeric provisional zeros; final cumulative usage is
+  authoritative. Preserve the disjoint cache accounting fixed in 0.8.2.
+- Treat thinking display as an output choice: actual summary in standard
+  thinking blocks/deltas for summarized, no reasoning output for omitted or
+  disabled. Do not invent provider signatures. Validate and strip replayed
+  thinking/redacted-thinking history when translating to Codex.
+- Derived disabled-thinking effort uses the least reasoning supported by the
+  selected catalog row. Explicit OpenAI effort requests retain exact validation.
+- A Claude facade uses the configured Codex model, or the live catalog default
+  if no backend is configured. Unknown non-facade models remain errors.
+- Client-side tool streaming/loading hints do not become backend capabilities.
+  Accept supported advisory hints without claiming native Anthropic lifecycle
+  equivalence. Keep real execution/protocol validation and account isolation.
+
+### Verification
+
+The release requires the same request/response policies in Python, TypeScript,
+and Rust, plus a smoke test through Scheherazade's installed engine serializer
+and SSE consumer. A successful reviewer report is not a substitute for tests.

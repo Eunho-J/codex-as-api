@@ -12,6 +12,31 @@ pub type AnthropicInternalRequest = (
     Option<bool>,
 );
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplayMode {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnthropicThinkingControls {
+    pub display: ThinkingDisplayMode,
+    pub reasoning_summary: Option<&'static str>,
+    pub disabled: bool,
+}
+
+pub fn anthropic_thinking_controls(body: &Value) -> Result<AnthropicThinkingControls, String> {
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_number)
+        .and_then(crate::strict_json::as_js_safe_integer);
+    match body.get("thinking").filter(|value| !value.is_null()) {
+        None => Ok(AnthropicThinkingControls::default()),
+        Some(thinking) => Ok(convert_thinking_controls(thinking, max_tokens)?.1),
+    }
+}
+
 pub fn anthropic_request_to_internal(body: &Value) -> Result<AnthropicInternalRequest, String> {
     body.as_object()
         .ok_or_else(|| "Anthropic request body must be an object".to_string())?;
@@ -234,18 +259,13 @@ fn validate_message_content_cache_controls(
 fn validate_cache_control_at(
     value: &Value,
     location: &str,
-    allow_cache_control: bool,
+    _allow_cache_control: bool,
 ) -> Result<(), String> {
     let Some(cache_control) = value.get("cache_control") else {
         return Ok(());
     };
     if cache_control.is_null() {
         return Ok(());
-    }
-    if !allow_cache_control {
-        return Err(format!(
-            "{location} is accepted without forwarding only for Claude Code requests"
-        ));
     }
     let object = cache_control
         .as_object()
@@ -592,6 +612,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
             let mut text_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut tool_call_ids: HashSet<String> = HashSet::new();
+            let mut saw_thinking_block = false;
 
             for (block_index, block) in arr.iter().enumerate() {
                 let object = block.as_object().ok_or_else(|| {
@@ -680,10 +701,39 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                             arguments,
                         });
                     }
-                    "thinking" | "redacted_thinking" => {
-                        return Err(format!(
-                            "assistant {block_type} history cannot be represented losslessly by the Codex OAuth backend"
-                        ));
+                    "thinking" => {
+                        reject_unknown_fields(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                            &["type", "thinking", "signature", "cache_control"],
+                        )?;
+                        if object.get("thinking").and_then(Value::as_str).is_none() {
+                            return Err(format!(
+                                "assistant thinking block {block_index} requires string thinking"
+                            ));
+                        }
+                        if object
+                            .get("signature")
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                        {
+                            return Err(format!(
+                                "assistant thinking block {block_index} signature must be a string when provided"
+                            ));
+                        }
+                        saw_thinking_block = true;
+                    }
+                    "redacted_thinking" => {
+                        reject_unknown_fields(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                            &["type", "data", "cache_control"],
+                        )?;
+                        if object.get("data").and_then(Value::as_str).is_none() {
+                            return Err(format!(
+                                "assistant redacted_thinking block {block_index} requires string data"
+                            ));
+                        }
+                        saw_thinking_block = true;
                     }
                     "server_tool_use"
                     | "web_search_tool_result"
@@ -702,7 +752,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                 }
             }
 
-            if text_parts.is_empty() && tool_calls.is_empty() {
+            if text_parts.is_empty() && tool_calls.is_empty() && !saw_thinking_block {
                 return Err(
                     "assistant message content did not contain a representable content block"
                         .to_string(),
@@ -819,19 +869,20 @@ fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {
             Some(Value::Bool(true)) => {}
             Some(_) => return Err("tool.strict must be a boolean when provided".to_string()),
         }
-        if tool.contains_key("defer_loading") {
-            return Err(
-                "tool.defer_loading is not supported by the Codex OAuth backend".to_string(),
-            );
+        match tool.get("defer_loading") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                return Err(
+                    "tool.defer_loading is not supported by the Codex OAuth backend".to_string(),
+                );
+            }
+            Some(_) => {
+                return Err("tool.defer_loading must be a boolean when provided".to_string());
+            }
         }
         for field in ["eager_input_streaming"] {
             match tool.get(field) {
-                None | Some(Value::Null) => {}
-                Some(Value::Bool(_)) => {
-                    return Err(format!(
-                        "tool.{field} is not supported by the Codex OAuth backend"
-                    ));
-                }
+                None | Some(Value::Null) | Some(Value::Bool(_)) => {}
                 Some(_) => {
                     return Err(format!("tool.{field} must be a boolean when provided"));
                 }
@@ -902,7 +953,10 @@ fn convert_tool_choice(tc: &Value) -> Result<(Value, Option<bool>), String> {
     Ok((choice, parallel_tool_calls))
 }
 
-fn convert_thinking(thinking: &Value, max_tokens: Option<i64>) -> Result<Option<String>, String> {
+fn convert_thinking_controls(
+    thinking: &Value,
+    max_tokens: Option<i64>,
+) -> Result<(Option<String>, AnthropicThinkingControls), String> {
     let object = thinking
         .as_object()
         .ok_or_else(|| "thinking must be an object".to_string())?;
@@ -913,11 +967,19 @@ fn convert_thinking(thinking: &Value, max_tokens: Option<i64>) -> Result<Option<
     match thinking_type {
         "enabled" => {
             reject_unknown_fields(object, "thinking", &["type", "budget_tokens", "display"])?;
-            match object.get("display") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(value)) if value == "omitted" => {}
-                Some(_) => return Err("thinking.display must be omitted or null".to_string()),
-            }
+            let display = match object.get("display") {
+                None | Some(Value::Null) => ThinkingDisplayMode::Summarized,
+                Some(Value::String(value)) if value == "summarized" => {
+                    ThinkingDisplayMode::Summarized
+                }
+                Some(Value::String(value)) if value == "omitted" => ThinkingDisplayMode::Omitted,
+                Some(_) => {
+                    return Err(
+                        "thinking.display must be omitted, null, \"summarized\", or \"omitted\""
+                            .to_string(),
+                    )
+                }
+            };
             let budget_tokens = object
                 .get("budget_tokens")
                 .and_then(Value::as_number)
@@ -935,25 +997,62 @@ fn convert_thinking(thinking: &Value, max_tokens: Option<i64>) -> Result<Option<
             if max_tokens.is_some_and(|max_tokens| budget_tokens >= max_tokens) {
                 return Err("thinking.budget_tokens must be less than max_tokens".to_string());
             }
-            Ok(Some("high".to_string()))
+            Ok((
+                Some("high".to_string()),
+                AnthropicThinkingControls {
+                    display,
+                    reasoning_summary: Some(match display {
+                        ThinkingDisplayMode::Summarized => "auto",
+                        ThinkingDisplayMode::Omitted => "none",
+                    }),
+                    disabled: false,
+                },
+            ))
         }
         "adaptive" => {
             reject_unknown_fields(object, "thinking", &["type", "display"])?;
-            match object.get("display") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(value)) if value == "omitted" => {}
-                Some(_) => {
-                    return Err("thinking.display must be omitted, null, or \"omitted\"".to_string())
+            let display = match object.get("display") {
+                None | Some(Value::Null) => ThinkingDisplayMode::Summarized,
+                Some(Value::String(value)) if value == "summarized" => {
+                    ThinkingDisplayMode::Summarized
                 }
-            }
-            Ok(Some("medium".to_string()))
+                Some(Value::String(value)) if value == "omitted" => ThinkingDisplayMode::Omitted,
+                Some(_) => {
+                    return Err(
+                        "thinking.display must be omitted, null, \"summarized\", or \"omitted\""
+                            .to_string(),
+                    )
+                }
+            };
+            Ok((
+                Some("medium".to_string()),
+                AnthropicThinkingControls {
+                    display,
+                    reasoning_summary: Some(match display {
+                        ThinkingDisplayMode::Summarized => "auto",
+                        ThinkingDisplayMode::Omitted => "none",
+                    }),
+                    disabled: false,
+                },
+            ))
         }
         "disabled" => {
             reject_unknown_fields(object, "thinking", &["type"])?;
-            Ok(Some("none".to_string()))
+            Ok((
+                Some("none".to_string()),
+                AnthropicThinkingControls {
+                    display: ThinkingDisplayMode::Omitted,
+                    reasoning_summary: Some("none"),
+                    disabled: true,
+                },
+            ))
         }
         _ => Err("thinking.type must be one of: enabled, adaptive, disabled".to_string()),
     }
+}
+
+fn convert_thinking(thinking: &Value, max_tokens: Option<i64>) -> Result<Option<String>, String> {
+    Ok(convert_thinking_controls(thinking, max_tokens)?.0)
 }
 
 fn convert_reasoning_effort(body: &Value) -> Result<Option<String>, String> {
@@ -1160,9 +1259,34 @@ pub fn internal_response_to_anthropic(
     model: &str,
     request_id: &str,
 ) -> Result<Value, String> {
+    internal_response_to_anthropic_with_display(
+        response,
+        model,
+        request_id,
+        ThinkingDisplayMode::Summarized,
+    )
+}
+
+pub fn internal_response_to_anthropic_with_display(
+    response: &AssistantResponse,
+    model: &str,
+    request_id: &str,
+    display: ThinkingDisplayMode,
+) -> Result<Value, String> {
     let mut content: Vec<Value> = Vec::new();
 
     reject_unrepresentable_response_events(response.raw.as_ref())?;
+
+    let reasoning_summary = match display {
+        ThinkingDisplayMode::Summarized => response
+            .reasoning_content
+            .as_ref()
+            .filter(|reasoning| !reasoning.is_empty()),
+        ThinkingDisplayMode::Omitted => None,
+    };
+    if let Some(reasoning) = reasoning_summary {
+        content.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
 
     if !response.content.is_empty() {
         content.push(json!({"type": "text", "text": response.content, "citations": null}));
@@ -1198,11 +1322,7 @@ pub fn internal_response_to_anthropic(
     let object = result
         .as_object_mut()
         .expect("Anthropic response literal must be an object");
-    if let Some(reasoning) = response
-        .reasoning_content
-        .as_ref()
-        .filter(|reasoning| !reasoning.is_empty())
-    {
+    if let Some(reasoning) = reasoning_summary {
         object.insert("codex_reasoning".to_string(), json!(reasoning));
     }
     let usage = response
@@ -1345,6 +1465,7 @@ fn map_stop_reason(
 pub struct AnthropicStreamAdapter {
     model: String,
     request_id: String,
+    display: ThinkingDisplayMode,
     started: bool,
     block_index: u32,
     current_block: Option<&'static str>,
@@ -1354,9 +1475,18 @@ pub struct AnthropicStreamAdapter {
 
 impl AnthropicStreamAdapter {
     pub fn new(model: &str, request_id: &str) -> Self {
+        Self::with_thinking_display(model, request_id, ThinkingDisplayMode::Summarized)
+    }
+
+    pub fn with_thinking_display(
+        model: &str,
+        request_id: &str,
+        display: ThinkingDisplayMode,
+    ) -> Self {
         Self {
             model: model.to_string(),
             request_id: request_id.to_string(),
+            display,
             started: false,
             block_index: 0,
             current_block: None,
@@ -1393,10 +1523,38 @@ impl AnthropicStreamAdapter {
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("{typ} event requires string text"))?
                     .to_string();
-                out.push(sse(
-                    "codex_reasoning_delta",
-                    &json!({"type": "codex_reasoning_delta", "delta": text}),
-                ));
+                if self.display == ThinkingDisplayMode::Summarized {
+                    if current_block != Some("thinking") {
+                        if current_block.is_some() {
+                            out.push(sse(
+                                "content_block_stop",
+                                &json!({"type": "content_block_stop", "index": block_index}),
+                            ));
+                            block_index += 1;
+                        }
+                        out.push(sse(
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }),
+                        ));
+                        current_block = Some("thinking");
+                    }
+                    out.push(sse(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "thinking_delta", "thinking": text},
+                        }),
+                    ));
+                    out.push(sse(
+                        "codex_reasoning_delta",
+                        &json!({"type": "codex_reasoning_delta", "delta": text}),
+                    ));
+                }
             }
 
             "content" => {
@@ -1577,6 +1735,13 @@ fn message_start_sse(model: &str, request_id: &str) -> String {
                 "context_management": null,
                 "stop_reason": null,
                 "stop_sequence": null,
+                // Provisional; message_delta carries authoritative cumulative usage.
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
             },
         }),
     )
@@ -1787,20 +1952,38 @@ mod strict_adapter_tests {
     }
 
     #[test]
-    fn assistant_thinking_history_is_rejected_instead_of_fabricated() {
+    fn assistant_thinking_history_is_validated_and_stripped() {
         for block in [
             json!({"type": "thinking", "thinking": "opaque"}),
+            json!({"type": "thinking", "thinking": "opaque", "signature": "sig_1"}),
             json!({"type": "redacted_thinking", "data": "opaque"}),
         ] {
             let request = json!({
                 "messages": [{"role": "assistant", "content": [block]}]
+            });
+            let (messages, _, _, _, _, _, _) = anthropic_request_to_internal(&request).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, MessageRole::Assistant);
+            assert!(messages[0].content.is_empty());
+        }
+        for invalid_block in [
+            json!({"type": "thinking"}),
+            json!({"type": "thinking", "thinking": 123}),
+            json!({"type": "thinking", "thinking": "opaque", "signature": 123}),
+            json!({"type": "thinking", "thinking": "opaque", "extra": true}),
+            json!({"type": "redacted_thinking"}),
+            json!({"type": "redacted_thinking", "data": 123}),
+            json!({"type": "redacted_thinking", "data": "opaque", "extra": true}),
+        ] {
+            let request = json!({
+                "messages": [{"role": "assistant", "content": [invalid_block]}]
             });
             assert!(anthropic_request_to_internal(&request).is_err());
         }
     }
 
     #[test]
-    fn non_stream_reasoning_uses_only_proxy_extension() {
+    fn non_stream_reasoning_emits_unsigned_thinking_and_proxy_extension_unless_omitted() {
         let response = AssistantResponse {
             content: "answer".to_string(),
             tool_calls: vec![],
@@ -1818,16 +2001,30 @@ mod strict_adapter_tests {
         };
         let value = internal_response_to_anthropic(&response, "claude-facade", "msg-1").unwrap();
         assert_eq!(value["codex_reasoning"], "real reasoning");
-        assert!(value["content"]
+        assert_eq!(
+            value["content"][0],
+            json!({"type": "thinking", "thinking": "real reasoning"})
+        );
+        assert_eq!(value["content"][1]["type"], "text");
+        assert!(!has_key(&value, "signature"));
+
+        let omitted = internal_response_to_anthropic_with_display(
+            &response,
+            "claude-facade",
+            "msg-1",
+            ThinkingDisplayMode::Omitted,
+        )
+        .unwrap();
+        assert!(omitted.get("codex_reasoning").is_none());
+        assert!(omitted["content"]
             .as_array()
             .unwrap()
             .iter()
             .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
-        assert!(!has_key(&value, "signature"));
     }
 
     #[test]
-    fn stream_reasoning_is_a_proxy_extension_without_thinking_or_signature() {
+    fn stream_reasoning_emits_unsigned_thinking_delta_and_proxy_extension_unless_omitted() {
         let chunks = anthropic_stream_adapter(
             &[
                 json!({"type": "reasoning_delta", "text": "real"}),
@@ -1861,15 +2058,32 @@ mod strict_adapter_tests {
                 && value.get("type").and_then(Value::as_str) == Some("codex_reasoning_delta")
                 && value.get("delta").and_then(Value::as_str) == Some("real")
         }));
-        assert!(parsed.iter().all(|(_, value)| {
-            value.get("type").and_then(Value::as_str) != Some("thinking_delta")
-                && !has_key(value, "signature")
+        assert!(parsed.iter().any(|(event, value)| {
+            *event == "content_block_delta"
+                && value["delta"]["type"] == "thinking_delta"
+                && value["delta"]["thinking"] == "real"
         }));
+        assert!(parsed.iter().all(|(_, value)| !has_key(value, "signature")));
         let start = parsed
             .iter()
             .find(|(event, _)| *event == "message_start")
             .expect("stream must begin with message_start");
-        assert!(start.1["message"].get("usage").is_none());
+        assert_eq!(start.1["message"]["usage"], json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }));
+
+        let mut omitted_adapter = AnthropicStreamAdapter::with_thinking_display(
+            "claude-facade",
+            "msg-1",
+            ThinkingDisplayMode::Omitted,
+        );
+        assert!(omitted_adapter
+            .push(&json!({"type": "reasoning_delta", "text": "real"}))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1893,7 +2107,7 @@ mod strict_adapter_tests {
             .unwrap();
         assert!(reasoning
             .iter()
-            .all(|event| !event.contains("content_block_start")));
+            .all(|event| !event.contains("\"type\":\"text\"")));
         assert!(finished
             .iter()
             .all(|event| !event.contains("content_block_start")));
@@ -2362,14 +2576,18 @@ mod tests {
     }
 
     #[test]
-    fn test_assistant_thinking_block_is_rejected() {
+    fn test_assistant_thinking_block_is_validated_and_stripped() {
         let body = json!({
             "messages": [{"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "Let me think..."},
+                {"type": "thinking", "thinking": "Let me think...", "signature": "sig_abc"},
+                {"type": "redacted_thinking", "data": "encrypted"},
                 {"type": "text", "text": "Answer."},
             ]}],
         });
-        assert!(anthropic_request_to_internal(&body).is_err());
+        let (msgs, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, MessageRole::Assistant);
+        assert_eq!(msgs[0].content, "Answer.");
     }
 
     #[test]
@@ -2485,6 +2703,8 @@ mod tests {
                 "name": "get_weather",
                 "description": "",
                 "strict": true,
+                "defer_loading": false,
+                "eager_input_streaming": true,
                 "input_schema": {"type": "object"},
             }],
         });
@@ -2493,21 +2713,47 @@ mod tests {
         assert!(tool.strict);
         assert_eq!(tool.description.as_deref(), Some(""));
 
-        for field in ["defer_loading", "eager_input_streaming"] {
-            for value in [false, true] {
-                let mut tool = json!({
+        for eager in [json!(false), json!(true), json!(null)] {
+            let body = json!({
+                "messages": [],
+                "tools": [{
                     "name": "get_weather",
+                    "eager_input_streaming": eager,
                     "input_schema": {"type": "object"},
-                });
-                tool.as_object_mut()
-                    .unwrap()
-                    .insert(field.to_string(), json!(value));
-                let body = json!({"messages": [], "tools": [tool]});
-                assert_eq!(
-                    anthropic_request_to_internal(&body).unwrap_err(),
-                    format!("tool.{field} is not supported by the Codex OAuth backend")
-                );
-            }
+                }],
+            });
+            assert!(anthropic_request_to_internal(&body).is_ok());
+        }
+
+        let defer_true = json!({
+            "messages": [],
+            "tools": [{
+                "name": "get_weather",
+                "defer_loading": true,
+                "input_schema": {"type": "object"},
+            }],
+        });
+        assert_eq!(
+            anthropic_request_to_internal(&defer_true).unwrap_err(),
+            "tool.defer_loading is not supported by the Codex OAuth backend"
+        );
+
+        for (field, value) in [
+            ("defer_loading", json!("false")),
+            ("eager_input_streaming", json!("true")),
+        ] {
+            let mut tool = json!({
+                "name": "get_weather",
+                "input_schema": {"type": "object"},
+            });
+            tool.as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            let body = json!({"messages": [], "tools": [tool]});
+            assert_eq!(
+                anthropic_request_to_internal(&body).unwrap_err(),
+                format!("tool.{field} must be a boolean when provided")
+            );
         }
     }
 
@@ -2632,16 +2878,38 @@ mod tests {
 
     #[test]
     fn test_enabled_thinking_budget_is_below_max_tokens_and_display_is_lossless() {
-        let valid = json!({
-            "messages": [],
-            "max_tokens": 2048,
-            "thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}
-        });
-        assert!(anthropic_request_to_internal(&valid).is_ok());
+        for (display, expected_mode, expected_summary) in [
+            (None, ThinkingDisplayMode::Summarized, Some("auto")),
+            (
+                Some(json!("summarized")),
+                ThinkingDisplayMode::Summarized,
+                Some("auto"),
+            ),
+            (
+                Some(json!("omitted")),
+                ThinkingDisplayMode::Omitted,
+                Some("none"),
+            ),
+        ] {
+            let mut thinking = json!({"type": "enabled", "budget_tokens": 1024});
+            if let Some(display) = display {
+                thinking["display"] = display;
+            }
+            let valid = json!({
+                "messages": [],
+                "max_tokens": 2048,
+                "thinking": thinking
+            });
+            assert!(anthropic_request_to_internal(&valid).is_ok());
+            let controls = anthropic_thinking_controls(&valid).unwrap();
+            assert_eq!(controls.display, expected_mode);
+            assert_eq!(controls.reasoning_summary, expected_summary);
+            assert!(!controls.disabled);
+        }
         for thinking in [
             json!({"type": "enabled", "budget_tokens": 2048}),
             json!({"type": "enabled", "budget_tokens": 4096}),
-            json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"}),
+            json!({"type": "enabled", "budget_tokens": 1024, "display": "invalid"}),
         ] {
             let body = json!({
                 "messages": [],
@@ -2666,11 +2934,31 @@ mod tests {
         let body = json!({"messages": [], "thinking": {"type": "adaptive"}});
         let (_, _, _, _, effort, _) = anthropic_request_to_internal(&body).unwrap();
         assert_eq!(effort, Some("medium".to_string()));
+        let controls = anthropic_thinking_controls(&body).unwrap();
+        assert_eq!(controls.display, ThinkingDisplayMode::Summarized);
+        assert_eq!(controls.reasoning_summary, Some("auto"));
     }
 
     #[test]
     fn test_thinking_adaptive_rejects_unrepresentable_display_modes() {
-        for display in [json!("summarized"), json!(""), json!(false), json!({})] {
+        for (display, expected_mode, expected_summary) in [
+            (
+                json!("summarized"),
+                ThinkingDisplayMode::Summarized,
+                Some("auto"),
+            ),
+            (json!("omitted"), ThinkingDisplayMode::Omitted, Some("none")),
+        ] {
+            let body = json!({
+                "messages": [],
+                "thinking": {"type": "adaptive", "display": display}
+            });
+            assert!(anthropic_request_to_internal(&body).is_ok());
+            let controls = anthropic_thinking_controls(&body).unwrap();
+            assert_eq!(controls.display, expected_mode);
+            assert_eq!(controls.reasoning_summary, expected_summary);
+        }
+        for display in [json!(""), json!("full"), json!(false), json!({})] {
             let body = json!({
                 "messages": [],
                 "thinking": {"type": "adaptive", "display": display}
@@ -3088,10 +3376,11 @@ mod tests {
         let out = internal_response_to_anthropic(&resp, "claude-3", "msg_r").unwrap();
         let content = out["content"].as_array().unwrap();
         assert_eq!(out["codex_reasoning"], "My reasoning.");
-        assert_eq!(content[0]["type"], "text");
-        assert!(content
-            .iter()
-            .all(|block| block["type"].as_str() != Some("thinking")));
+        assert_eq!(
+            content[0],
+            json!({"type": "thinking", "thinking": "My reasoning."})
+        );
+        assert_eq!(content[1]["type"], "text");
     }
 
     #[test]
@@ -3280,7 +3569,15 @@ mod tests {
         let chunks = anthropic_stream_adapter(&events, "claude-3", "msg_s1");
         let parsed = get_sse_events(&chunks);
         assert_eq!(parsed[0].0, "message_start");
-        assert!(parsed[0].1["message"].get("usage").is_none());
+        assert_eq!(
+            parsed[0].1["message"]["usage"],
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            })
+        );
         assert!(parsed[0].1["message"]["container"].is_null());
         assert!(parsed[0].1["message"]["context_management"].is_null());
         assert_eq!(parsed[1].0, "content_block_start");
@@ -3330,17 +3627,28 @@ mod tests {
         ];
         let chunks = anthropic_stream_adapter(&events, "m", "id");
         let parsed = get_sse_events(&chunks);
-        assert_eq!(parsed[1].0, "codex_reasoning_delta");
+        assert_eq!(parsed[1].0, "content_block_start");
         assert_eq!(
-            parsed[1].1,
+            parsed[1].1["content_block"],
+            json!({"type": "thinking", "thinking": ""})
+        );
+        assert_eq!(parsed[2].0, "content_block_delta");
+        assert_eq!(
+            parsed[2].1["delta"],
+            json!({"type": "thinking_delta", "thinking": "thinking..."})
+        );
+        assert_eq!(parsed[3].0, "codex_reasoning_delta");
+        assert_eq!(
+            parsed[3].1,
             json!({"type": "codex_reasoning_delta", "delta": "thinking..."})
         );
-        assert_eq!(parsed[2].0, "content_block_start");
-        assert_eq!(parsed[2].1["content_block"]["type"], "text");
-        assert!(parsed.iter().all(|(_, data)| {
-            data["content_block"]["type"] != "thinking"
-                && data["delta"]["type"] != "signature_delta"
-        }));
+        assert_eq!(parsed[4].0, "content_block_stop");
+        assert_eq!(parsed[4].1["index"], 0);
+        assert_eq!(parsed[5].0, "content_block_start");
+        assert_eq!(parsed[5].1["content_block"]["type"], "text");
+        assert!(parsed
+            .iter()
+            .all(|(_, data)| data["delta"]["type"] != "signature_delta"));
     }
 
     #[test]
@@ -3484,7 +3792,15 @@ mod tests {
         let chunks = anthropic_stream_adapter(&events, "m", "id");
         let parsed = get_sse_events(&chunks);
         let msg_start = parsed.iter().find(|(e, _)| e == "message_start").unwrap();
-        assert!(msg_start.1["message"].get("usage").is_none());
+        assert_eq!(
+            msg_start.1["message"]["usage"],
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            })
+        );
         let msg_delta = parsed.iter().find(|(e, _)| e == "message_delta").unwrap();
         assert_eq!(msg_delta.1["usage"]["input_tokens"], 99);
         assert_eq!(msg_delta.1["usage"]["output_tokens"], 7);

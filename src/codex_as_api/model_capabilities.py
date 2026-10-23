@@ -289,11 +289,12 @@ def resolve_model(
     except ChatGPTOAuthInvalidRequestError as exc:
         raise ChatGPTOAuthCatalogUnavailableError("configured model is unusable") from exc
     if candidate is not None and anthropic_facade and candidate.startswith("claude-"):
-        if configured_model is None:
-            raise ChatGPTOAuthInvalidRequestError(
-                "claude-* facade models require CODEX_AS_API_MODEL or config.toml model"
-            )
-        return configured_capability(configured_model)
+        if configured_model is not None:
+            return configured_capability(configured_model)
+        capability = snapshot.default_model()
+        if not capability.slug.strip() or capability.slug != capability.slug.strip():
+            raise ChatGPTOAuthCatalogUnavailableError("default model publishes an unusable slug")
+        return capability
     if candidate is not None:
         return snapshot.model(candidate)
     if configured_model is not None:

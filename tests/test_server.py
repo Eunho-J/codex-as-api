@@ -4619,40 +4619,70 @@ def test_messages_count_tokens_counts_each_image_once(client):
     assert resp.json()["input_tokens"] == 8513
 
 
-def test_messages_count_tokens_rejects_unrepresentable_assistant_thinking(client):
-    payload = {
-        "model": "claude-sonnet-4-5",
-        "messages": [
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "plan"},
-                    {"type": "text", "text": "checking"},
-                    {
-                        "type": "tool_use",
-                        "id": "call_123",
-                        "name": "lookup",
-                        "input": {"query": "docs"},
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "call_123",
-                        "content": "result",
-                    }
-                ],
-            },
-        ],
-    }
+def test_messages_count_tokens_strips_valid_assistant_thinking_and_rejects_malformed(client):
+    base_messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "checking"},
+                {
+                    "type": "tool_use",
+                    "id": "call_123",
+                    "name": "lookup",
+                    "input": {"query": "docs"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_123",
+                    "content": "result",
+                }
+            ],
+        },
+    ]
+    with_thinking_messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig-1"},
+                {"type": "thinking", "thinking": "unsigned plan"},
+                {"type": "redacted_thinking", "data": "encrypted"},
+                *base_messages[0]["content"],
+            ],
+        },
+        base_messages[1],
+    ]
 
-    resp = client.post("/v1/messages/count_tokens", json=payload)
+    base_resp = client.post(
+        "/v1/messages/count_tokens",
+        json={"model": "claude-sonnet-4-5", "messages": base_messages},
+    )
+    thinking_resp = client.post(
+        "/v1/messages/count_tokens",
+        json={"model": "claude-sonnet-4-5", "messages": with_thinking_messages},
+    )
+    malformed_resp = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": 123}],
+                }
+            ],
+        },
+    )
 
-    assert resp.status_code == 400
-    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert base_resp.status_code == 200
+    assert thinking_resp.status_code == 200
+    assert thinking_resp.json()["input_tokens"] == base_resp.json()["input_tokens"]
+    assert malformed_resp.status_code == 400
+    assert malformed_resp.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_messages_count_tokens_reports_effective_request_model_context(client, monkeypatch):
@@ -5297,7 +5327,7 @@ def test_anthropic_messages_uses_session_cache_affinity_without_codex_metadata(
     assert "response_id" not in explicit.json()
 
 
-def test_anthropic_messages_without_session_rejects_unforwarded_max_tokens(
+def test_anthropic_messages_without_session_accepts_max_tokens_and_omits_implicit_cache_key(
     client,
     recording_backend: RecordingBackend,
 ):
@@ -5315,15 +5345,23 @@ def test_anthropic_messages_without_session_rejects_unforwarded_max_tokens(
             },
         )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
-    assert recording_backend.catalog_requests.empty()
-    assert recording_backend.requests.empty()
+    assert response.status_code == 200, response.text
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert "prompt_cache_key" not in outbound
 
 
 @pytest.mark.parametrize(
     ("route", "payload"),
     [
+        (
+            "/v1/messages",
+            {
+                "model": "gpt-5.6-sol",
+                "max_tokens": 1024,
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ),
         (
             "/v1/messages/count_tokens",
             {
@@ -5345,12 +5383,13 @@ def test_anthropic_messages_without_session_rejects_unforwarded_max_tokens(
             {
                 "model": "gpt-5.6-sol",
                 "max_tokens": 1024,
+                "cache_control": {"type": "ephemeral"},
                 "messages": [{"role": "user", "content": "hello"}],
             },
         ),
     ],
 )
-def test_anthropic_noop_compatibility_fields_require_claude_code_session(
+def test_anthropic_noop_compatibility_fields_work_without_claude_code_session(
     client,
     recording_backend: RecordingBackend,
     route,
@@ -5361,10 +5400,11 @@ def test_anthropic_noop_compatibility_fields_require_claude_code_session(
     with TestClient(client.app, raise_server_exceptions=False) as no_session_client:
         response = no_session_client.post(route, json=payload)
 
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
-    assert recording_backend.catalog_requests.empty()
-    assert recording_backend.requests.empty()
+    assert response.status_code == 200, response.text
+    if route != "/v1/messages/count_tokens":
+        outbound = recording_backend.requests.get(timeout=1)["body"]
+        assert not _has_nested_key(outbound, "cache_control")
+        assert "prompt_cache_key" not in outbound
 
 
 @pytest.mark.parametrize("route", ["/v1/messages", "/v1/messages/count_tokens", "/v1/messages/compact"])
@@ -5582,13 +5622,14 @@ def test_anthropic_latest_claude_code_shape_routes_known_gpt_effort_and_fast_mod
     outbound = recording_backend.requests.get(timeout=1)["body"]
     assert outbound["model"] == "gpt-5.6-sol"
     assert outbound["reasoning"]["effort"] == "max"
+    assert outbound["reasoning"]["summary"] == "none"
     assert outbound["service_tier"] == "priority"
     assert "output_config" not in outbound
     assert "context_management" not in outbound
     assert "speed" not in outbound
 
 
-def test_anthropic_disabled_thinking_fails_when_live_model_lacks_none_effort(
+def test_anthropic_disabled_thinking_falls_back_to_lowest_catalog_effort_while_explicit_effort_stays_strict(
     client,
     recording_backend: RecordingBackend,
     monkeypatch,
@@ -5599,7 +5640,7 @@ def test_anthropic_disabled_thinking_fails_when_live_model_lacks_none_effort(
         json={
             "model": "gpt-5.6-sol",
             "max_tokens": 1024,
-            "stream": True,
+            "stream": False,
             "system": "system",
             "messages": [{"role": "user", "content": "look up docs"}],
             "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
@@ -5608,8 +5649,42 @@ def test_anthropic_disabled_thinking_fails_when_live_model_lacks_none_effort(
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.status_code == 200, response.text
+    outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert outbound["reasoning"] == {"effort": "low", "summary": "none"}
+
+    compact_resp = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "look up docs"}],
+            "thinking": {"type": "disabled"},
+        },
+    )
+    assert compact_resp.status_code == 200, compact_resp.text
+    compact_outbound = recording_backend.requests.get(timeout=1)["body"]
+    assert compact_outbound["reasoning"]["effort"] == "low"
+    assert compact_outbound["reasoning"]["summary"] == "none"
+
+    for explicit_payload in (
+        {"reasoning_effort": "none"},
+        {"reasoning": {"effort": "none"}},
+        {"thinking": {"type": "disabled"}, "reasoning_effort": "none"},
+        {"thinking": {"type": "disabled"}, "reasoning": {"effort": "none"}},
+    ):
+        explicit_resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 1024,
+                "system": "system",
+                "messages": [{"role": "user", "content": "look up docs"}],
+                **explicit_payload,
+            },
+        )
+        assert explicit_resp.status_code == 400
+        assert explicit_resp.json()["error"]["type"] == "invalid_request_error"
     assert recording_backend.requests.empty()
 
 
@@ -5738,7 +5813,7 @@ def test_anthropic_stream_does_not_block_concurrent_claude_code_requests(
     assert events[2]["delta"] == {"type": "text_delta", "text": "early"}
 
 
-def test_anthropic_builtin_claude_model_uses_explicit_configured_backend(
+def test_anthropic_builtin_claude_model_uses_explicit_configured_backend_or_catalog_default(
     client,
     recording_backend: RecordingBackend,
 ):
@@ -5758,6 +5833,201 @@ def test_anthropic_builtin_claude_model_uses_explicit_configured_backend(
     assert response.status_code == 200, response.text
     assert response.json()["model"] == "claude-fable-5"
     assert recording_backend.requests.get(timeout=1)["body"]["model"] == "gpt-5.5"
+
+    server_mod._provider.model = None
+    unconfigured_messages = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-fable-5",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert unconfigured_messages.status_code == 200, unconfigured_messages.text
+    assert unconfigured_messages.json()["model"] == "claude-fable-5"
+    assert recording_backend.requests.get(timeout=1)["body"]["model"] == "gpt-5.6-sol"
+
+    unconfigured_count = client.post(
+        "/v1/messages/count_tokens",
+        json={
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert unconfigured_count.status_code == 200, unconfigured_count.text
+    assert unconfigured_count.json()["context_window"] == 258_400
+
+    unconfigured_compact = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "claude-fable-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert unconfigured_compact.status_code == 200, unconfigured_compact.text
+    assert recording_backend.requests.get(timeout=1)["body"]["model"] == "gpt-5.6-sol"
+
+
+@pytest.mark.parametrize("route", ["/v1/messages", "/v1/messages/count_tokens", "/v1/messages/compact"])
+def test_anthropic_routes_accept_metadata_and_beta_tool_flags_and_reject_invalid_values(
+    client,
+    recording_backend: RecordingBackend,
+    route,
+):
+    valid = client.post(
+        route,
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "metadata": {"user_id": "claude-code-user"},
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "prior thought", "signature": "sig-1"},
+                        {"type": "redacted_thinking", "data": "redacted"},
+                        {"type": "text", "text": "prior answer"},
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "eager_input_streaming": True,
+                    "defer_loading": False,
+                }
+            ],
+        },
+    )
+    assert valid.status_code == 200, valid.text
+    if route != "/v1/messages/count_tokens":
+        outbound = recording_backend.requests.get(timeout=1)["body"]
+        assert "metadata" not in outbound
+        assert not _has_nested_key(outbound, "eager_input_streaming")
+        assert not _has_nested_key(outbound, "defer_loading")
+
+    for invalid_patch in (
+        {"metadata": {"user_id": 123}},
+        {"metadata": {"extra": "value"}},
+        {"tools": [{"name": "lookup", "input_schema": {"type": "object"}, "defer_loading": True}]},
+        {"tools": [{"name": "lookup", "input_schema": {"type": "object"}, "eager_input_streaming": "true"}]},
+    ):
+        invalid = client.post(
+            route,
+            json={
+                "model": "gpt-5.6-sol",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hello"}],
+                **invalid_patch,
+            },
+        )
+        assert invalid.status_code == 400
+    assert recording_backend.requests.empty()
+
+
+def test_anthropic_messages_thinking_display_summarized_vs_omitted_and_replay(
+    client,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+
+    captured_summaries: list[str | None] = []
+
+    def fake_sse(_path, payload, extra_headers=None):  # noqa: ANN001
+        del extra_headers
+        captured_summaries.append(payload.get("reasoning", {}).get("summary"))
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "step 1"}
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "final answer"}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-thinking",
+                "output": [],
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 3,
+                    "total_tokens": 7,
+                    "input_tokens_details": {"cached_tokens": 0},
+                },
+            },
+        }
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", fake_sse)
+
+    summarized = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024, "display": "summarized"},
+            "messages": [{"role": "user", "content": "solve"}],
+        },
+    )
+    assert summarized.status_code == 200, summarized.text
+    summarized_body = summarized.json()
+    assert summarized_body["content"] == [
+        {"type": "thinking", "thinking": "step 1"},
+        {"type": "text", "text": "final answer", "citations": None},
+    ]
+    assert summarized_body["codex_reasoning"] == "step 1"
+
+    replayed = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 2048,
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "messages": [
+                {"role": "user", "content": "solve"},
+                {"role": "assistant", "content": summarized_body["content"]},
+                {"role": "user", "content": "follow up"},
+            ],
+        },
+    )
+    assert replayed.status_code == 200, replayed.text
+    replayed_body = replayed.json()
+    assert replayed_body["content"] == [{"type": "text", "text": "final answer", "citations": None}]
+    assert "codex_reasoning" not in replayed_body
+
+    stream_summarized = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 2048,
+            "stream": True,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "messages": [{"role": "user", "content": "solve"}],
+        },
+    )
+    assert stream_summarized.status_code == 200
+    assert '"type": "thinking_delta"' in stream_summarized.text
+    assert '"type": "codex_reasoning_delta"' in stream_summarized.text
+
+    stream_omitted = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 2048,
+            "stream": True,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "solve"}],
+        },
+    )
+    assert stream_omitted.status_code == 200
+    assert '"type": "thinking_delta"' not in stream_omitted.text
+    assert '"type": "codex_reasoning_delta"' not in stream_omitted.text
+    assert captured_summaries == ["auto", "none", "auto", "none"]
 
 
 @pytest.mark.parametrize(

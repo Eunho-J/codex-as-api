@@ -26,6 +26,7 @@ def anthropic_request_to_internal(
     max_tokens: int | None = None,
     output_format: dict[str, Any] | None = None,
     output_config: object = None,
+    metadata: object = None,
 ) -> tuple[
     list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
 ]:
@@ -37,6 +38,7 @@ def anthropic_request_to_internal(
         raise ValueError("model must be a non-empty string")
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a non-empty array")
+    validate_anthropic_metadata(metadata)
     if stop_sequences is not None and (
         not isinstance(stop_sequences, list) or any(not isinstance(value, str) or not value for value in stop_sequences)
     ):
@@ -274,9 +276,28 @@ def _convert_assistant_message(content: object, out: list[Message]) -> None:
                     arguments=json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
                 )
             )
+        elif block_type == "thinking":
+            _reject_unknown_fields(
+                block,
+                {"type", "thinking", "signature"},
+                f"Anthropic assistant content block {index}",
+            )
+            thinking_text = block.get("thinking")
+            if not isinstance(thinking_text, str):
+                raise ValueError(f"Anthropic assistant thinking block {index} requires string thinking")
+            signature = block.get("signature")
+            if signature is not None and not isinstance(signature, str):
+                raise ValueError(f"Anthropic assistant thinking block {index} signature must be a string")
+        elif block_type == "redacted_thinking":
+            _reject_unknown_fields(
+                block,
+                {"type", "data"},
+                f"Anthropic assistant content block {index}",
+            )
+            data = block.get("data")
+            if not isinstance(data, str):
+                raise ValueError(f"Anthropic assistant redacted_thinking block {index} requires string data")
         elif block_type in {
-            "thinking",
-            "redacted_thinking",
             "server_tool_use",
             "web_search_tool_result",
         }:
@@ -309,11 +330,17 @@ def _convert_tools(tools: object) -> list[ToolSchema]:
         if "allowed_callers" in tool or "output_schema" in tool:
             raise ValueError(f"Anthropic tool {index} uses Programmatic Tool Calling fields that cannot be preserved")
         if "defer_loading" in tool:
-            raise ValueError(f"Anthropic tool {index} field defer_loading is not supported by the Codex OAuth backend")
+            defer_loading = tool.get("defer_loading")
+            if defer_loading is not None and not isinstance(defer_loading, bool):
+                raise ValueError(f"Anthropic tool {index} defer_loading must be a boolean")
+            if defer_loading is True:
+                raise ValueError(
+                    f"Anthropic tool {index} field defer_loading is not supported by the Codex OAuth backend"
+                )
         for field in ("eager_input_streaming",):
             value = tool.get(field)
-            if value is not None:
-                raise ValueError(f"Anthropic tool {index} field {field} is not supported by the Codex OAuth backend")
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"Anthropic tool {index} {field} must be a boolean")
         name = tool.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"Anthropic tool {index} requires a non-empty name")
@@ -449,6 +476,33 @@ def anthropic_parallel_tool_calls(
     return not value
 
 
+def validate_anthropic_metadata(metadata: object) -> None:
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    _reject_unknown_fields(metadata, {"user_id"}, "metadata")
+    user_id = metadata.get("user_id")
+    if user_id is not None and not isinstance(user_id, str):
+        raise ValueError("metadata.user_id must be a string")
+
+
+def resolve_anthropic_thinking_options(
+    thinking: dict[str, Any] | None,
+    max_tokens: int | None = None,
+) -> tuple[str, str | None, bool]:
+    """Return (thinking_display, reasoning_summary, thinking_disabled) for a thinking object."""
+    if thinking is None:
+        return "summarized", None, False
+    _convert_thinking(thinking, max_tokens)
+    thinking_type = thinking.get("type")
+    if thinking_type == "disabled":
+        return "omitted", "none", True
+    display = "omitted" if thinking.get("display") == "omitted" else "summarized"
+    reasoning_summary = "none" if display == "omitted" else "auto"
+    return display, reasoning_summary, False
+
+
 def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -> str | None:
     if thinking is None:
         return None
@@ -458,8 +512,8 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "enabled":
         _reject_unknown_fields(thinking, {"type", "budget_tokens", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and display != "omitted":
-            raise ValueError("thinking.display must be 'omitted' when provided")
+        if display is not None and display not in {"summarized", "omitted"}:
+            raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
         budget_tokens = thinking.get("budget_tokens")
         parsed_budget_tokens = as_js_safe_integer(budget_tokens)
         if parsed_budget_tokens is None or parsed_budget_tokens < 1024:
@@ -470,8 +524,8 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "adaptive":
         _reject_unknown_fields(thinking, {"type", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and display != "omitted":
-            raise ValueError("thinking.display must be 'omitted' when provided")
+        if display is not None and display not in {"summarized", "omitted"}:
+            raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
         return "medium"
     if thinking_type == "disabled":
         _reject_unknown_fields(thinking, {"type"}, "thinking")
@@ -648,10 +702,17 @@ def internal_response_to_anthropic(
     response: AssistantResponse,
     model: str,
     request_id: str,
+    *,
+    thinking_display: str = "summarized",
 ) -> dict[str, Any]:
+    if thinking_display not in {"summarized", "omitted"}:
+        raise ValueError("thinking_display must be 'summarized' or 'omitted'")
     content: list[dict[str, Any]] = []
 
     _reject_unrepresentable_response_events(response.raw)
+
+    if thinking_display == "summarized" and response.reasoning_content:
+        content.append({"type": "thinking", "thinking": response.reasoning_content})
 
     if response.content:
         content.append({"type": "text", "text": response.content, "citations": None})
@@ -688,7 +749,7 @@ def internal_response_to_anthropic(
         "stop_sequence": None,
         "usage": usage_dict,
     }
-    if response.reasoning_content:
+    if thinking_display == "summarized" and response.reasoning_content:
         result["codex_reasoning"] = response.reasoning_content
     return result
 
@@ -800,10 +861,14 @@ def anthropic_stream_adapter(
     event_stream: Iterator[dict[str, Any]],
     model: str,
     request_id: str,
+    *,
+    thinking_display: str = "summarized",
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
+    if thinking_display not in {"summarized", "omitted"}:
+        raise ValueError("thinking_display must be 'summarized' or 'omitted'")
     yield _message_start_sse(model, request_id)
-    yield from _render_anthropic_stream_events(event_stream)
+    yield from _render_anthropic_stream_events(event_stream, thinking_display=thinking_display)
 
 
 def _message_start_sse(model: str, request_id: str) -> str:
@@ -821,6 +886,13 @@ def _message_start_sse(model: str, request_id: str) -> str:
                 "context_management": None,
                 "stop_reason": None,
                 "stop_sequence": None,
+                # Provisional; message_delta carries authoritative cumulative usage.
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
             },
         },
     )
@@ -944,7 +1016,11 @@ def _validate_usage_counter_object(
             raise ChatGPTOAuthProtocolError(f"provider usage {field}.{name} must be a non-negative integer")
 
 
-def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterator[str]:
+def _render_anthropic_stream_events(
+    events: Iterator[dict[str, Any]],
+    *,
+    thinking_display: str = "summarized",
+) -> Iterator[str]:
     block_index = 0
     current_block: str | None = None
     has_tool_calls = False
@@ -958,6 +1034,29 @@ def _render_anthropic_stream_events(events: Iterator[dict[str, Any]]) -> Iterato
             text = event.get("text")
             if not isinstance(text, str):
                 raise ChatGPTOAuthProtocolError(f"provider {typ} event requires string text")
+            if thinking_display == "omitted":
+                continue
+            if current_block != "thinking":
+                if current_block is not None:
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                    block_index += 1
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    },
+                )
+                current_block = "thinking"
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "thinking_delta", "thinking": text},
+                },
+            )
             yield _sse(
                 "codex_reasoning_delta",
                 {

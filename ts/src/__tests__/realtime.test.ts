@@ -156,7 +156,7 @@ describe("realtime call creation", () => {
       assert.equal(request.headers["session-id"], "session-fixed");
       assert.equal(request.headers["thread-id"], "session-fixed");
       assert.equal(request.headers["chatgpt-account-id"], "account-123");
-      assert.match(String(request.headers.authorization), /^Bearer /u);
+      assert.equal(String(request.headers.authorization).startsWith("Bearer "), true);
       assert.equal(request.headers["content-type"], "application/json");
       assert.equal(typeof request.headers.version, "string");
 
@@ -221,7 +221,7 @@ describe("realtime call creation", () => {
         (err: unknown) => {
           assert.ok(err instanceof ChatGPTOAuthUpstreamError);
           assert.equal(err.status, 403);
-          assert.match(err.message, /Voice session access denied\./u);
+          assert.equal(err.message.includes("Voice session access denied."), true);
           return true;
         },
       );
@@ -257,7 +257,7 @@ describe("realtime helpers", () => {
       process.env.CODEX_AS_API_REALTIME_BASE_URL = "http://127.0.0.1:9999/backend-api/codex/";
       assert.equal(resolveRealtimeBaseUrl(), "http://127.0.0.1:9999/backend-api/codex");
       delete process.env.CODEX_AS_API_REALTIME_BASE_URL;
-      assert.match(resolveRealtimeBaseUrl(), /^https:\/\/chatgpt\.com\/backend-api\/codex$/u);
+      assert.equal(resolveRealtimeBaseUrl(), "https://chatgpt.com/backend-api/codex");
       process.env.CODEX_AS_API_REALTIME_BASE_URL = "ftp://example.com";
       assert.throws(() => resolveRealtimeBaseUrl(), ChatGPTOAuthInvalidRequestError);
     } finally {
@@ -332,7 +332,7 @@ describe("POST /v1/realtime/calls", () => {
     const sessionId = response.headers.get("x-session-id");
     assert.equal(response.headers.get("session-id"), sessionId);
     assert.equal(response.headers.get("thread-id"), sessionId);
-    assert.match(await response.text(), /^v=0/u);
+    assert.equal((await response.text()).startsWith("v=0"), true);
   });
 
   it("rejects unknown request fields", async () => {
@@ -343,7 +343,7 @@ describe("POST /v1/realtime/calls", () => {
     });
     assert.equal(response.status, 400);
     const body = await response.json() as { error: { message: string } };
-    assert.match(body.error.message, /does not support field "model"/u);
+    assert.equal(body.error.message.includes('does not support field "model"'), true);
   });
 
   it("surfaces upstream failures as JSON errors", async () => {

@@ -38,10 +38,7 @@ required. The last upstream synchronization check was 2026-07-14 against
 
 For configuration, supported endpoints, model behavior, and examples, see the [canonical GitHub documentation](https://github.com/Eunho-J/codex-as-api#readme).
 
-`/v1/messages` and `/v1/messages/compact` are Claude Code compatibility
-endpoints using the Anthropic Messages shape, not general Anthropic API
-proxies. Both require one valid `x-claude-code-session-id` header because the
-private Codex transport cannot apply Anthropic's required `max_tokens` control.
+`/v1/messages`, `/v1/messages/count_tokens`, and `/v1/messages/compact` accept Anthropic-shaped requests from any client. No Claude Code header is required. `max_tokens` and validated ephemeral `cache_control` are compatibility hints; Codex OAuth does not expose the matching output cap or cache TTL/breakpoints. The optional Claude Code session header supplies cache affinity only.
 
 ## Identifier and cache behavior
 
@@ -88,8 +85,7 @@ Hosted Anthropic WebSearch is rejected on Messages, token-counting, and compact
 requests. OpenAI hosted search results do not carry the Anthropic provenance and
 encrypted lifecycle data required for a lossless Messages response, and classic
 Responses does not change that limitation. WebFetch remains a client-side
-auxiliary request; call-level `thinking.disabled` wins over ambient effort and is
-forwarded as Codex reasoning effort `none`.
+auxiliary request; call-level disabled thinking wins over ambient effort and uses the selected model's least reasoning level (`none` when supported, otherwise the lowest advertised level). Explicit unsupported OpenAI effort requests still return 400.
 
 Final responses require authoritative provider usage and a real
 `response.completed` event. Function calls map to `tool_use`; otherwise a
@@ -97,22 +93,22 @@ missing, `null`, or `true` `end_turn` maps to `end_turn`, matching pinned Codex,
 where only explicit `false` requests another sampling turn. A nonterminal
 completion without a representable client tool call fails; after streaming
 headers it produces an Anthropic `error` event without a successful
-`message_stop`. The gateway preserves Claude Code's immediate `message_start`
-and does not invent input-token counts there, so this stream-start behavior is
-not generic Anthropic API parity.
+`message_stop`. The immediate `message_start` includes provisional numeric zero
+usage counters so standard stream consumers can initialize; final cumulative
+usage supplies the authoritative counts.
 
 Generated direct-caller tool blocks and empty assistant content arrays can be
 replayed. Malformed, null, or server-tool caller variants fail before transport.
 
 If managed settings define an `availableModels` allowlist, include the exact custom option ID, such as `gpt-5.6-sol`, or Claude Code will hide or reject the GPT row.
 
-The base URL applies to the entire Claude Code process. Built-in `claude-*` rows therefore require an explicit `CODEX_AS_API_MODEL` that exists in the fresh catalog; they do not contact Anthropic while the gateway variables are active. Unknown names are not routed to a default. Keep these variables out of global settings when a second, direct-Anthropic Claude Code process is required. See the [full Claude Code guide](https://github.com/Eunho-J/codex-as-api#using-with-claude-code) for routing details and current compatibility limits.
+The base URL applies to the entire Claude Code process. Built-in `claude-*` rows use the configured `CODEX_AS_API_MODEL` or the fresh catalog default; they do not contact Anthropic while the gateway variables are active. Unknown non-facade names are not routed to a default. Keep these variables out of global settings when a second, direct-Anthropic Claude Code process is required. See the [full Claude Code guide](https://github.com/Eunho-J/codex-as-api#using-with-claude-code) for routing details and current compatibility limits.
 
-Real Codex reasoning is exposed as the top-level `codex_reasoning` extension or
-the custom `codex_reasoning_delta` SSE event. The gateway does not fabricate
-Anthropic `thinking` blocks or signatures. `reasoning_content` is response-only;
-Chat request messages reject it rather than dropping an unrepresentable replay
-field.
+Summarized thinking exposes actual Codex summaries as unsigned `thinking`
+blocks / `thinking_delta` content and the existing `codex_reasoning` extensions.
+Omitted and disabled thinking suppress reasoning output. No signature is
+fabricated. Valid Anthropic thinking history is validated and stripped during
+replay. OpenAI Chat `reasoning_content` remains response-only.
 
 ## Realtime voice (ChatGPT Live)
 

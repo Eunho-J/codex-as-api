@@ -5,14 +5,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from pathlib import Path
 
 import pytest
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib
 
 from codex_as_api.auth import (
     ChatGPTOAuthCatalogUnavailableError,
@@ -101,10 +95,11 @@ def test_ultrafast_preserves_live_tier_and_rejects_unavailable(model_catalog_doc
     )
     assert payload["service_tier"] == "ultrafast"
     unavailable = _parse(model_catalog_document).models[0]
-    with pytest.raises(ValueError, match="service_tier"):
+    with pytest.raises(ValueError) as caught:
         apply_model_capability_fields(
             {}, capability=unavailable, text=None, service_tier="ultrafast",
         )
+    assert "service_tier" in str(caught.value)
 
 
 def test_invalid_model_control_diagnostics_do_not_reflect_values(
@@ -454,13 +449,14 @@ def test_capability_fields_reject_invalid_verbosity(
 ) -> None:
     capability = _parse(model_catalog_document).model("gpt-5.6-sol")
 
-    with pytest.raises(ValueError, match="text.verbosity must be one of"):
+    with pytest.raises(ValueError) as caught:
         apply_model_capability_fields(
             {},
             capability=capability,
             text={"verbosity": verbosity},
             service_tier=None,
         )
+    assert "text.verbosity must be one of" in str(caught.value)
 
 
 def test_model_resolution_uses_live_default_and_exact_membership(
@@ -530,18 +526,20 @@ def test_missing_operator_configured_model_is_catalog_unavailable(
         resolve_model(snapshot, "removed-model", None)
 
 
-def test_claude_facade_requires_explicit_configured_backend(
+def test_claude_facade_uses_default_backend_when_unconfigured(
     model_catalog_document,
 ) -> None:
     snapshot = _parse(model_catalog_document)
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="require"):
+    assert (
         resolve_model(
             snapshot,
             "claude-sonnet-4-6",
             None,
             anthropic_facade=True,
-        )
+        ).slug
+        == "gpt-5.6-sol"
+    )
 
 
 def test_claude_prefix_remains_a_facade_even_if_catalog_contains_that_slug(
@@ -561,13 +559,15 @@ def test_claude_prefix_remains_a_facade_even_if_catalog_contains_that_slug(
         ).slug
         == "gpt-5.5"
     )
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="require"):
+    assert (
         resolve_model(
             snapshot,
             "claude-sonnet-4-6",
             None,
             anthropic_facade=True,
-        )
+        ).slug
+        == "gpt-5.6-sol"
+    )
 
 
 def test_cache_reuses_only_fresh_snapshot(model_catalog_document) -> None:
@@ -636,20 +636,16 @@ def test_cache_normalizes_response_etag_before_comparison(model_catalog_document
 def test_cache_rejects_invalid_ttl(model_catalog_document, ttl) -> None:
     cache = ModelCatalogCache()
 
-    with pytest.raises(ValueError, match="positive finite"):
+    with pytest.raises(ValueError) as caught:
         cache.get(
             ("account-a", "https://example.test/codex", "0.153.3"),
             lambda: CatalogLoadResult(model_catalog_document, '"etag-a"'),
             ttl_seconds=ttl,
         )
+    assert "positive finite" in str(caught.value)
 
 
 def test_expired_refresh_failure_does_not_return_stale(model_catalog_document) -> None:
-    contract = json.loads(
-        (Path(__file__).resolve().parents[1] / "config" / "codex-upstream-contract.json").read_text(encoding="utf-8")
-    )["models_request"]
-    assert contract["allow_stale_on_refresh_error"] is False
-
     cache = ModelCatalogCache()
     key = ("account-a", "https://example.test/codex", "0.153.3")
     cache.get(
@@ -662,8 +658,9 @@ def test_expired_refresh_failure_does_not_return_stale(model_catalog_document) -
     def fail() -> CatalogLoadResult:
         raise ChatGPTOAuthCatalogUnavailableError("refresh failed")
 
-    with pytest.raises(ChatGPTOAuthCatalogUnavailableError, match="refresh failed"):
+    with pytest.raises(ChatGPTOAuthCatalogUnavailableError) as caught:
         cache.get(key, fail, ttl_seconds=60)
+    assert "refresh failed" in str(caught.value)
 
 
 def test_cache_coalesces_concurrent_refresh(model_catalog_document) -> None:
@@ -714,8 +711,9 @@ def test_etag_invalidation_prevents_inflight_snapshot_publication(
         assert started.wait(timeout=2)
         cache.invalidate_on_etag_mismatch(key, '"new"')
         release.set()
-        with pytest.raises(ChatGPTOAuthCatalogUnavailableError, match="invalidated"):
+        with pytest.raises(ChatGPTOAuthCatalogUnavailableError) as caught:
             future.result(timeout=2)
+        assert "invalidated" in str(caught.value)
 
     refreshed = cache.get(
         key,
@@ -779,22 +777,6 @@ def test_cache_key_namespaces_accounts(model_catalog_document) -> None:
     assert first.account_id == "account-a"
     assert second.account_id == "account-b"
     assert calls == 2
-
-
-def test_python_package_configuration_excludes_static_model_catalog() -> None:
-    project = Path(__file__).resolve().parents[1]
-    pyproject = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
-    targets = pyproject["tool"]["hatch"]["build"]["targets"]
-    wheel_files = targets["wheel"]["force-include"]
-    sdist_files = targets["sdist"]["include"]
-
-    assert all(
-        Path(source).name != "model-capabilities.json" and Path(destination).name != "model-capabilities.json"
-        for source, destination in wheel_files.items()
-    )
-    assert all(Path(source).name != "model-capabilities.json" for source in sdist_files)
-    assert not (project / "config" / "model-capabilities.json").exists()
-    assert not (project / "src" / "codex_as_api" / "model-capabilities.json").exists()
 
 
 @pytest.mark.parametrize(

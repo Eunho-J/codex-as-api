@@ -2158,7 +2158,7 @@ def test_codex_cli_headers_include_official_originator_and_versioned_user_agent(
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.153.3 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.8.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.8.3")
 
 
 def test_codex_cli_headers_reject_unpinned_version():
@@ -2881,7 +2881,7 @@ def test_provider_headers_include_codex_cli_headers(auth_json_factory):
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.153.3 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.8.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.8.3")
     assert headers["Authorization"].startswith("Bearer ")
 
 
