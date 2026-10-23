@@ -20,6 +20,15 @@
   inventing backend semantics, and use the live catalog default for unconfigured
   `claude-*` facade routing.
 
+### Official test quality
+
+- Replace regex diagnostic assertions with literal returned-error checks and
+  remove source-presence, filesystem-permission and worker-liveness oracles.
+  Retain actual input/output, persistence-content and cancellation-state cases.
+- Repair stale client-gate expectations and positive controls, including valid
+  null cache hints, live-default Claude facade routing and mixed thinking/tool
+  replay. Validate all three runtimes with their standard regression runners.
+
 ## v0.8.2
 
 ### Hotfix: disjoint Anthropic cache usage (all runtimes)
