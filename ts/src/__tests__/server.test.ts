@@ -593,7 +593,10 @@ describe("server error handling", () => {
         });
         assert.equal(response.status, 401);
         const text = await response.text();
-        assert.match(text, /rerun codex login/);
+        assert.equal(
+          text.includes("ChatGPT OAuth credentials are unavailable; rerun codex login"),
+          true,
+        );
         assert.equal(text.includes(secret), false);
       }
     });
@@ -619,7 +622,10 @@ describe("server error handling", () => {
         });
         assert.equal(response.status, 200);
         const text = await response.text();
-        assert.match(text, /rerun codex login/);
+        assert.equal(
+          text.includes("ChatGPT OAuth credentials are unavailable; rerun codex login"),
+          true,
+        );
         assert.equal(text.includes(secret), false);
       }
     });
@@ -647,7 +653,7 @@ describe("server error handling", () => {
         });
         assert.equal(response.status, 500);
         const text = await response.text();
-        assert.match(text, /internal server error/);
+        assert.equal(text.includes("internal server error"), true);
         assert.equal(text.includes(secret), false);
       }
     });
@@ -673,7 +679,7 @@ describe("server error handling", () => {
         });
         assert.equal(response.status, 200);
         const text = await response.text();
-        assert.match(text, /internal server error/);
+        assert.equal(text.includes("internal server error"), true);
         assert.equal(text.includes(secret), false);
       }
     });
@@ -729,7 +735,7 @@ describe("server error handling", () => {
           });
           assert.equal(response.status, testCase.status);
           const text = await response.text();
-          assert.match(text, new RegExp(testCase.publicMessage));
+          assert.equal(text.includes(testCase.publicMessage), true);
           assert.equal(text.includes(secret), false);
         }
       });
@@ -755,7 +761,7 @@ describe("server error handling", () => {
           });
           assert.equal(response.status, 200);
           const text = await response.text();
-          assert.match(text, new RegExp(testCase.publicMessage));
+          assert.equal(text.includes(testCase.publicMessage), true);
           assert.equal(text.includes(secret), false);
         }
       });
@@ -859,7 +865,7 @@ describe("server error handling", () => {
       assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
       const body = await response.json() as { error: { type: string; message: string } };
       assert.equal(body.error.type, "invalid_request_error");
-      assert.match(body.error.message, /stop is not supported/);
+      assert.equal(body.error.message, "stop is not supported by the private Codex OAuth transport");
     });
     assert.equal(transportCalls, 0);
   });
@@ -1009,9 +1015,30 @@ describe("server error handling", () => {
 
       assert.equal(res.status, 200);
       const body = await res.text();
-      assert.match(body, /partial/);
-      assert.match(body, /exceeds the context window/);
-      assert.doesNotMatch(body, /data: \[DONE\]/);
+      assert.equal(body.includes("partial"), true);
+      assert.equal(body.includes("exceeds the context window"), true);
+      assert.equal(body.includes("data: [DONE]"), false);
+      const chunks = body
+        .trim()
+        .split("\n\n")
+        .map((block) => {
+          assert.equal(block.startsWith("data: "), true);
+          return JSON.parse(block.slice(6)) as Record<string, unknown>;
+        });
+      assert.equal(
+        chunks.some((chunk) => {
+          const choices = chunk.choices as Array<{ delta?: { content?: string } }> | undefined;
+          return choices?.[0]?.delta?.content === "partial";
+        }),
+        true,
+      );
+      assert.deepEqual(chunks.at(-1), {
+        error: {
+          message: "OpenAI protocol response failed: Your input exceeds the context window of this model.",
+          type: "invalid_request_error",
+          code: "invalid_request_error",
+        },
+      });
     });
   });
 
@@ -1042,10 +1069,33 @@ describe("server error handling", () => {
 
       assert.equal(res.status, 200);
       const body = await res.text();
-      assert.match(body, /event: message_start/);
-      assert.match(body, /partial/);
-      assert.match(body, /event: error/);
-      assert.match(body, /exceeds the context window/);
+      assert.equal(body.includes("event: message_start"), true);
+      assert.equal(body.includes("partial"), true);
+      assert.equal(body.includes("event: error"), true);
+      assert.equal(body.includes("exceeds the context window"), true);
+      const events = body
+        .trim()
+        .split("\n\n")
+        .map((block) => {
+          const [eventLine, dataLine] = block.split("\n");
+          assert.ok(eventLine?.startsWith("event: "));
+          assert.ok(dataLine?.startsWith("data: "));
+          return {
+            event: eventLine.slice(7),
+            data: JSON.parse(dataLine.slice(6)) as Record<string, unknown>,
+          };
+        });
+      assert.equal(events[0]?.event, "message_start");
+      assert.deepEqual(events.at(-1), {
+        event: "error",
+        data: {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "OpenAI protocol response failed: Your input exceeds the context window of this model.",
+          },
+        },
+      });
     });
   });
 
@@ -1174,7 +1224,10 @@ describe("server error handling", () => {
             assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
             const body = await response.json() as { error: { type: string; message: string } };
             assert.equal(body.error.type, "invalid_request_error");
-            assert.match(body.error.message, /cannot be represented losslessly/);
+            assert.equal(
+              body.error.message,
+              "Anthropic hosted web_search cannot be represented losslessly by this facade",
+            );
           }
         }, { model: "gpt-5.6-sol" });
       }
@@ -1210,7 +1263,10 @@ describe("server error handling", () => {
       assert.equal(res.status, 400);
       const body = await res.json() as { error: { type: string; message: string } };
       assert.equal(body.error.type, "invalid_request_error");
-      assert.match(body.error.message, /exceeds the context window/);
+      assert.equal(
+        body.error.message,
+        "OpenAI protocol response failed: Your input exceeds the context window of this model.",
+      );
     });
   });
 });
@@ -1497,7 +1553,7 @@ describe("server model defaults", () => {
           const response = await fetch(`${baseUrl}/v1/models`);
           assert.equal(response.status, 401);
           const text = await response.text();
-          assert.match(text, /rerun codex login/);
+          assert.equal(text.includes("rerun codex login"), true);
           assert.equal(text.includes(directory), false);
           assert.equal(text.includes(authJsonPath), false);
         }, { authPath: authJsonPath });
@@ -2758,8 +2814,8 @@ describe("Anthropic final response contract", () => {
         });
         assert.equal(response.status, 200);
         const text = await response.text();
-        assert.match(text, /event: message_start/);
-        assert.match(text, /event: error/);
+        assert.equal(text.includes("event: message_start"), true);
+        assert.equal(text.includes("event: error"), true);
         assert.equal(text.includes("event: message_stop"), false);
       });
     }
@@ -4565,14 +4621,17 @@ describe("Anthropic compatibility helper routes", () => {
           });
           assert.deepEqual(requests[1].body.reasoning, {
             effort: "medium",
+            summary: "none",
             context: "all_turns",
           });
           assert.deepEqual(requests[2].body.reasoning, {
             effort: "low",
+            summary: "none",
             context: "all_turns",
           });
           assert.deepEqual(requests[3].body.reasoning, {
             effort: "low",
+            summary: "none",
             context: "all_turns",
           });
         }, { model: null, authPath: auth.authPath });

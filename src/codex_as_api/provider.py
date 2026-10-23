@@ -2120,7 +2120,9 @@ def _finalize_responses_payload(
         effective_summary = capability.default_reasoning_summary
     else:
         raise ChatGPTOAuthInvalidRequestError("reasoning_summary must be 'auto', 'none', 'summarized', or 'omitted'")
-    if capability.supports_reasoning_summary_parameter and effective_summary not in {None, "none"}:
+    if capability.supports_reasoning_summary_parameter and (
+        effective_summary not in {None, "none"} or reasoning_summary in {"omitted", "none"}
+    ):
         if reasoning is None:
             reasoning = {}
             payload["reasoning"] = reasoning

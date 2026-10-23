@@ -199,8 +199,9 @@ def test_rejects_wheel_without_the_exact_console_script(tmp_path: Path) -> None:
             "[console_scripts]\ncodex-as-api = codex_as_api.server:wrong\n",
         )
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="console scripts must match"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_wheel(wheel, "0.7.0")
+    assert "console scripts must match" in str(caught.value)
 
 
 def test_rejects_npm_tarball_without_the_repository_license(tmp_path: Path) -> None:
@@ -231,8 +232,9 @@ def test_rejects_npm_tarball_without_the_repository_license(tmp_path: Path) -> N
             (SCRIPT_PATH.parents[1] / "THIRD_PARTY_NOTICES.md").read_bytes(),
         )
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="package/LICENSE"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_npm_tarball(npm, "codex-as-api", "0.7.0")
+    assert "package/LICENSE" in str(caught.value)
 
 
 def test_rejects_sdist_without_release_validator_scripts(tmp_path: Path) -> None:
@@ -244,11 +246,9 @@ def test_rejects_sdist_without_release_validator_scripts(tmp_path: Path) -> None
             core_metadata("codex-as-api", "0.7.0"),
         )
 
-    with pytest.raises(
-        check_release_artifacts.ArtifactIdentityError,
-        match="scripts/check_no_static_model_catalog.py",
-    ):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_sdist(sdist, "0.7.0")
+    assert "scripts/check_no_static_model_catalog.py" in str(caught.value)
 
 
 def test_rejects_sdist_without_generated_rust_notices(tmp_path: Path) -> None:
@@ -266,8 +266,9 @@ def test_rejects_sdist_without_generated_rust_notices(tmp_path: Path) -> None:
                 b"#!/usr/bin/env python3\n",
             )
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="rust/THIRD_PARTY_NOTICES.md"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_sdist(sdist, "0.7.0")
+    assert "rust/THIRD_PARTY_NOTICES.md" in str(caught.value)
 
 
 @pytest.mark.parametrize("platform", ["linux", "macos", "windows"])
@@ -289,8 +290,9 @@ def test_rejects_rust_archive_without_license_files(tmp_path: Path) -> None:
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("codex-as-api", b"release-binary")
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="exact Rust archive members"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_rust_archive(archive, "linux", "0.7.0")
+    assert "exact Rust archive members" in str(caught.value)
 
 
 def test_rejects_npm_tarball_with_a_missing_export_target(tmp_path: Path) -> None:
@@ -305,8 +307,9 @@ def test_rejects_npm_tarball_with_a_missing_export_target(tmp_path: Path) -> Non
             output.addfile(member, content)
     rewritten.replace(npm)
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="package/dist/index.js"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_npm_tarball(npm, "codex-as-api", "0.7.0")
+    assert "package/dist/index.js" in str(caught.value)
 
 
 def test_rejects_rust_archive_with_non_executable_bytes(tmp_path: Path) -> None:
@@ -318,5 +321,6 @@ def test_rejects_rust_archive_with_non_executable_bytes(tmp_path: Path) -> None:
         for filename, source_path in check_release_artifacts.RUST_REQUIRED_TEXT_SOURCES.items():
             output.writestr(filename, source_path.read_bytes())
 
-    with pytest.raises(check_release_artifacts.ArtifactIdentityError, match="ELF executable"):
+    with pytest.raises(check_release_artifacts.ArtifactIdentityError) as caught:
         check_release_artifacts.validate_rust_archive(archive, "linux", "0.7.0")
+    assert "ELF executable" in str(caught.value)

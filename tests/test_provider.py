@@ -129,12 +129,13 @@ def test_image_capability_scans_only_responses_message_content():
 def test_responses_payload_rejects_unmapped_max_tokens():
     provider = ChatGPTOAuthProvider()
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="max_tokens"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001 - regression test for backend payload
             _provider_messages(),
             model="gpt-5.5",
             max_tokens=1024,
         )
+    assert "max_tokens" in str(caught.value)
 
 
 @pytest.mark.parametrize("stop", ["", [], [""], ["", ""]])
@@ -146,8 +147,9 @@ def test_chat_stream_rejects_explicit_empty_stop_without_forwarding(stop, monkey
 
     monkeypatch.setattr(provider, "_post_sse", forbidden_sse)
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="stop is not supported"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.5", stop=stop))
+    assert "stop is not supported" in str(caught.value)
 
 
 def test_chat_stream_rejects_non_empty_stop_before_transport(monkeypatch):
@@ -161,8 +163,9 @@ def test_chat_stream_rejects_non_empty_stop_before_transport(monkeypatch):
 
     monkeypatch.setattr(provider, "_post_sse", forbidden_sse)
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="stop is not supported"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.5", stop=["END"]))
+    assert "stop is not supported" in str(caught.value)
 
     assert transport_calls == 0
 
@@ -174,12 +177,13 @@ def test_chat_stream_rejects_non_empty_stop_before_transport(monkeypatch):
 def test_responses_payload_rejects_original_image_detail_for_unsupported_model(model: str):
     provider = ChatGPTOAuthProvider()
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="image detail"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages_with_image_detail("original"),
             model=model,
             responses_lite=False,
         )
+    assert "image detail" in str(caught.value)
 
 
 def test_responses_payload_rejects_unknown_model_before_capability_checks():
@@ -402,13 +406,14 @@ def test_gpt_5_6_payloads_apply_catalog_reasoning_defaults(
 def test_standard_reasoning_mode_is_rejected_instead_of_silently_omitted():
     provider = ChatGPTOAuthProvider()
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="not supported"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages(),
             model="gpt-5.6-sol",
             reasoning_mode="standard",
             responses_lite=False,
         )
+    assert "not supported" in str(caught.value)
 
 
 def test_responses_payload_responses_lite_auto_uses_capability_table():
@@ -540,12 +545,13 @@ def test_nested_text_verbosity_is_validated_without_top_level_verbosity():
     )
 
     assert payload["text"] == {"verbosity": "high"}
-    with pytest.raises(ChatGPTOAuthError, match="text.verbosity must be one of"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages(),
             model="gpt-5.5",
             text={"verbosity": "verbose"},
         )
+    assert "text.verbosity must be one of" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -621,12 +627,13 @@ def test_verbosity_requires_live_model_support(
         lambda _requested=None: (model_catalog_snapshot, capability),
     )
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="verbosity"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages(),
             model="gpt-5.5",
             verbosity="high",
         )
+    assert "verbosity" in str(caught.value)
 
 
 def test_responses_payload_parallel_tool_calls_uses_transport_mode(model_catalog_snapshot):
@@ -646,13 +653,14 @@ def test_responses_payload_parallel_tool_calls_uses_transport_mode(model_catalog
 
     assert payload["parallel_tool_calls"] is True
     assert lite_payload["parallel_tool_calls"] is False
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="Responses Lite"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages(),
             model="gpt-5.6-sol",
             parallel_tool_calls=True,
             responses_lite=True,
         )
+    assert "Responses Lite" in str(caught.value)
 
 
 def test_live_input_modalities_gate_only_present_content(
@@ -679,11 +687,12 @@ def test_live_input_modalities_gate_only_present_content(
 
     payload = provider._responses_payload(image_messages, model="image-only")  # noqa: SLF001
     assert payload["input"][0]["content"][0]["type"] == "input_image"
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="text input"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider._responses_payload(  # noqa: SLF001
             [Message(role=MessageRole.USER, content="text")],
             model="image-only",
         )
+    assert "text input" in str(caught.value)
 
     audio_only = replace(base, input_modalities=("audio",))
     monkeypatch.setattr(
@@ -719,8 +728,9 @@ def test_image_generation_requires_live_image_capability(
         lambda _requested=None: (model_catalog_snapshot, text_only),
     )
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="image generation"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider.generate_image("Draw", model="text-only")
+    assert "image generation" in str(caught.value)
 
 
 def test_responses_payload_client_metadata_mode_overlays_reserved_keys(auth_json_factory):
@@ -821,13 +831,14 @@ def test_responses_payload_prompt_cache_key_precedence_and_session_fallback():
     assert explicit["prompt_cache_key"] == "explicit-cache"
     assert "prompt_cache_key" not in absent
     for reserved_key in ("session_id", "thread_id"):
-        with pytest.raises(ChatGPTOAuthInvalidRequestError, match=reserved_key):
+        with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
             provider._responses_payload(  # noqa: SLF001
                 _provider_messages(),
                 model="gpt-5.5",
                 prompt_cache_key="explicit-cache",
                 client_metadata={reserved_key: "   ", "opaque": ""},
             )
+        assert reserved_key in str(caught.value)
 
     opaque_empty = provider._responses_payload(  # noqa: SLF001
         _provider_messages(),
@@ -936,8 +947,9 @@ def test_chat_stream_rejects_duplicate_tool_call_ids(monkeypatch):
 
     monkeypatch.setattr(provider, "_post_sse", duplicate_post_sse)
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="duplicate call_id"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "duplicate call_id" in str(caught.value)
 
 
 def test_chat_rejects_duplicate_tool_call_ids(monkeypatch):
@@ -949,8 +961,9 @@ def test_chat_rejects_duplicate_tool_call_ids(monkeypatch):
 
     monkeypatch.setattr(provider, "_post_sse", duplicate_post_sse)
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="duplicate call_id"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         provider.chat(_provider_messages(), model="gpt-5.6-sol")
+    assert "duplicate call_id" in str(caught.value)
 
 
 def _custom_tool_call_sse():
@@ -969,16 +982,18 @@ def test_chat_stream_rejects_custom_tool_call_output(monkeypatch):
     provider = ChatGPTOAuthProvider()
     monkeypatch.setattr(provider, "_post_sse", lambda *_args, **_kwargs: _custom_tool_call_sse())
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="custom_tool_call"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "custom_tool_call" in str(caught.value)
 
 
 def test_chat_rejects_custom_tool_call_output(monkeypatch):
     provider = ChatGPTOAuthProvider()
     monkeypatch.setattr(provider, "_post_sse", lambda *_args, **_kwargs: _custom_tool_call_sse())
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="custom_tool_call"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         provider.chat(_provider_messages(), model="gpt-5.6-sol")
+    assert "custom_tool_call" in str(caught.value)
 
 
 def test_chat_stream_rejects_eof_before_response_completed(monkeypatch):
@@ -990,8 +1005,9 @@ def test_chat_stream_rejects_eof_before_response_completed(monkeypatch):
 
     monkeypatch.setattr(provider, "_post_sse", truncated_post_sse)
 
-    with pytest.raises(ChatGPTOAuthError, match=r"ended before response\.completed"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "ended before response.completed" in str(caught.value)
 
 
 def test_chat_stream_stops_reading_after_response_completed(monkeypatch):
@@ -1265,12 +1281,13 @@ def test_response_chain_store_requires_compaction_only_for_known_hash_mismatches
         account_id="account-a",
         current_comp_hash=None,
     )
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="requires compaction"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         store.resolve(
             "resp-hashed",
             account_id="account-a",
             current_comp_hash="family-b",
         )
+    assert "requires compaction" in str(caught.value)
 
 
 def test_previous_response_comp_hash_is_wired_through_prepare_and_commit(
@@ -1314,13 +1331,14 @@ def test_previous_response_comp_hash_is_wired_through_prepare_and_commit(
     assert compatible_request.payload["model"] == "gpt-5.4"
 
     incompatible = replace(model_catalog_snapshot.model("gpt-5.4"), comp_hash="family-b")
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="requires compaction"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         provider.preflight_chat(
             _provider_messages(),
             previous_response_id="resp-wired",
             responses_lite=False,
             _resolved_model=(model_catalog_snapshot, incompatible),
         )
+    assert "requires compaction" in str(caught.value)
     assert transport_calls == 1
 
 
@@ -1336,8 +1354,9 @@ def test_output_item_collector_rejects_eof_before_response_completed(monkeypatch
 
     monkeypatch.setattr(provider, "_post_sse", truncated_post_sse)
 
-    with pytest.raises(ChatGPTOAuthError, match=r"ended before response\.completed"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         provider._collect_response_output_items({})  # noqa: SLF001
+    assert "ended before response.completed" in str(caught.value)
 
 
 def test_output_item_collector_uses_done_items_and_ignores_completed_output(monkeypatch):
@@ -1431,8 +1450,9 @@ def test_chat_stream_rejects_malformed_response_completed(response, monkeypatch)
 
     monkeypatch.setattr(provider, "_post_sse", malformed_post_sse)
 
-    with pytest.raises(ChatGPTOAuthError, match="response with a non-empty id"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "response with a non-empty id" in str(caught.value)
 
 
 @pytest.mark.parametrize("item", [None, [], "not-an-object"])
@@ -1505,8 +1525,9 @@ def test_chat_stream_rejects_valid_image_generation_items_in_normal_chat(monkeyp
 
     monkeypatch.setattr(provider, "_post_sse", image_post_sse)
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="cannot be represented by normal chat"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "cannot be represented by normal chat" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1526,8 +1547,9 @@ def test_chat_stream_rejects_malformed_text_deltas(event, monkeypatch):
         lambda *_args, **_kwargs: iter([event]),
     )
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="delta"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "delta" in str(caught.value)
 
 
 def test_empty_upstream_deltas_are_valid_strings():
@@ -1574,8 +1596,9 @@ def test_done_reasoning_rejects_non_string_encrypted_content(encrypted_content):
         },
     }
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="encrypted_content"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event(event)
+    assert "encrypted_content" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1700,12 +1723,13 @@ def test_response_item_optional_fields_accept_pinned_nullable_values_and_additiv
     ],
 )
 def test_response_item_optional_fields_reject_malformed_known_values(item, field):
-    with pytest.raises(ChatGPTOAuthProtocolError, match=field):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event({"type": "response.output_item.done", "item": item})
+    assert field in str(caught.value)
 
 
 def test_added_response_item_applies_common_optional_field_validation():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="metadata_passthrough"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event(
             {
                 "type": "response.output_item.added",
@@ -1717,6 +1741,7 @@ def test_added_response_item_applies_common_optional_field_validation():
                 },
             }
         )
+    assert "metadata_passthrough" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1755,8 +1780,9 @@ def test_added_response_item_applies_common_optional_field_validation():
     ],
 )
 def test_known_unsupported_semantic_event_types_fail_immediately(event_type):
-    with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported semantic type"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event({"type": event_type})
+    assert "unsupported semantic type" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1771,13 +1797,14 @@ def test_known_unsupported_semantic_event_types_fail_immediately(event_type):
     ],
 )
 def test_unknown_added_semantic_items_fail_immediately(item_type):
-    with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported type"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event(
             {
                 "type": "response.output_item.added",
                 "item": {"type": item_type},
             }
         )
+    assert "unsupported type" in str(caught.value)
 
 
 @pytest.mark.parametrize("event_type", ["response.content_part.added", "response.content_part.done"])
@@ -1862,8 +1889,9 @@ def test_streamed_text_must_match_done_item_text(monkeypatch):
     ]
     monkeypatch.setattr(provider, "_post_sse", lambda *_args, **_kwargs: iter(events))
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="does not match"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "does not match" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -1899,8 +1927,9 @@ def test_streamed_reasoning_families_must_match_done_items(
     ]
     monkeypatch.setattr(provider, "_post_sse", lambda *_args, **_kwargs: iter(events))
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match=message):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert message in str(caught.value)
     with pytest.raises(ChatGPTOAuthInvalidRequestError):
         provider._response_chains.resolve("response-reasoning-mismatch", account_id="test-account")
 
@@ -2079,8 +2108,9 @@ def test_completed_rejects_malformed_end_turn(monkeypatch, end_turn):
         ),
     )
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="end_turn"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "end_turn" in str(caught.value)
 
 
 def test_chat_stream_rejects_streamed_text_without_matching_done_item(
@@ -2095,8 +2125,9 @@ def test_chat_stream_rejects_streamed_text_without_matching_done_item(
 
     monkeypatch.setattr(provider, "_post_sse", completed)
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="does not match"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert "does not match" in str(caught.value)
 
 
 @pytest.mark.parametrize("output", [None, []])
@@ -2149,8 +2180,9 @@ def test_output_item_collector_rejects_malformed_response_completed(monkeypatch)
 
     monkeypatch.setattr(provider, "_post_sse", malformed_post_sse)
 
-    with pytest.raises(ChatGPTOAuthError, match="response with a non-empty id"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         provider._collect_response_output_items({})  # noqa: SLF001
+    assert "response with a non-empty id" in str(caught.value)
 
 
 def test_codex_cli_headers_include_official_originator_and_versioned_user_agent():
@@ -2162,8 +2194,9 @@ def test_codex_cli_headers_include_official_originator_and_versioned_user_agent(
 
 
 def test_codex_cli_headers_reject_unpinned_version():
-    with pytest.raises(ValueError, match="pinned"):
+    with pytest.raises(ValueError) as caught:
         codex_cli_headers_for_version("not-a-version")
+    assert "pinned" in str(caught.value)
 
 
 def test_codex_cli_version_defaults_to_pinned_upstream_contract(monkeypatch):
@@ -2189,23 +2222,27 @@ def test_packaged_upstream_contract_takes_precedence_over_source_checkout(
 def test_codex_cli_version_override_fails_loudly(monkeypatch):
     monkeypatch.setenv("CODEX_AS_API_CODEX_CLI_VERSION", "9.8.7")
 
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError) as caught:
         resolve_codex_cli_version()
+    assert "not supported" in str(caught.value)
 
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError) as caught:
         ChatGPTOAuthProvider()
+    assert "not supported" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_provider_rejects_empty_explicit_auth_path(value):
-    with pytest.raises(ValueError, match="auth_json_path"):
+    with pytest.raises(ValueError) as caught:
         ChatGPTOAuthProvider(auth_json_path=value)
+    assert "auth_json_path" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_provider_rejects_empty_explicit_model(value):
-    with pytest.raises(ValueError, match="model"):
+    with pytest.raises(ValueError) as caught:
         ChatGPTOAuthProvider(model=value)
+    assert "model" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2215,7 +2252,7 @@ def test_provider_rejects_empty_explicit_model(value):
         ChatGPTOAuthCatalogUnavailableError("catalog unavailable"),
     ],
 )
-def test_resolve_model_rejects_invalid_and_unconfigured_claude_models_before_catalog_fetch(
+def test_resolve_model_rejects_invalid_models_before_catalog_fetch_and_fetches_catalog_for_claude_facade(
     monkeypatch,
     catalog_failure,
 ):
@@ -2232,9 +2269,11 @@ def test_resolve_model_rejects_invalid_and_unconfigured_claude_models_before_cat
     for requested in ["", " x ", 123]:
         with pytest.raises(ChatGPTOAuthInvalidRequestError):
             provider.resolve_model(requested)  # type: ignore[arg-type]
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match=r"claude-\*"):
-        provider.resolve_model("claude-sonnet", anthropic_facade=True)
     assert fetch_count == 0
+    with pytest.raises(type(catalog_failure)) as caught:
+        provider.resolve_model("claude-sonnet", anthropic_facade=True)
+    assert caught.value is catalog_failure
+    assert fetch_count == 1
 
 
 @pytest.mark.parametrize(
@@ -2256,8 +2295,9 @@ def test_resolve_model_rejects_invalid_and_unconfigured_claude_models_before_cat
     ],
 )
 def test_provider_rejects_unsafe_or_invalid_base_url(value):
-    with pytest.raises(ValueError, match="base_url"):
+    with pytest.raises(ValueError) as caught:
         ChatGPTOAuthProvider(base_url=value)
+    assert "base_url" in str(caught.value)
 
 
 def test_provider_allows_percent_encoded_base_url_path():
@@ -2270,15 +2310,16 @@ def test_provider_rejects_unsafe_refresh_endpoint_at_initialization(monkeypatch)
         "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
         "https://user:secret@auth.openai.com/oauth/token",
     )
-    with pytest.raises(ChatGPTOAuthRefreshError, match="CODEX_REFRESH_TOKEN_URL_OVERRIDE"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         ChatGPTOAuthProvider()
+    assert "CODEX_REFRESH_TOKEN_URL_OVERRIDE" in str(caught.value)
 
 
 @pytest.mark.parametrize("subagent", ["has space", "line\nbreak", "tab\tvalue", "한글"])
 def test_provider_rejects_header_unsafe_subagent_before_transport(subagent):
     provider = ChatGPTOAuthProvider()
 
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="visible ASCII") as caught:
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         list(
             provider.chat_stream(
                 _provider_messages(),
@@ -2286,6 +2327,7 @@ def test_provider_rejects_header_unsafe_subagent_before_transport(subagent):
                 subagent=subagent,
             )
         )
+    assert "visible ASCII" in str(caught.value)
     assert subagent not in str(caught.value)
 
 
@@ -2375,12 +2417,15 @@ def test_transport_boundaries_do_not_reclassify_programming_errors(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bug")),
     )
 
-    with pytest.raises(RuntimeError, match="bug"):
+    with pytest.raises(RuntimeError) as caught:
         provider._fetch_model_catalog(token, "0.153.3")  # noqa: SLF001
-    with pytest.raises(RuntimeError, match="bug"):
+    assert "bug" in str(caught.value)
+    with pytest.raises(RuntimeError) as caught:
         provider._request_json("/responses", {})  # noqa: SLF001
-    with pytest.raises(RuntimeError, match="bug"):
+    assert "bug" in str(caught.value)
+    with pytest.raises(RuntimeError) as caught:
         list(provider._post_sse("/responses", {}))  # noqa: SLF001
+    assert "bug" in str(caught.value)
 
 
 def test_transport_boundaries_classify_url_errors(monkeypatch):
@@ -2657,8 +2702,9 @@ def test_json_response_rejects_nonstandard_json_numbers(monkeypatch):
     provider = ChatGPTOAuthProvider()
     monkeypatch.setattr(provider, "_request_json", lambda *_args, **_kwargs: b'{"value":NaN}')
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="invalid JSON"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         provider._post_json("/responses", {})  # noqa: SLF001
+    assert "invalid JSON" in str(caught.value)
 
 
 def test_catalog_refresh_rejects_an_authenticated_account_switch(monkeypatch):
@@ -2691,8 +2737,9 @@ def test_catalog_refresh_rejects_an_authenticated_account_switch(monkeypatch):
         lambda _token: refreshed,
     )
 
-    with pytest.raises(ChatGPTOAuthRefreshError, match="account changed"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         provider._fetch_model_catalog(initial, "0.153.3")  # noqa: SLF001
+    assert "account changed" in str(caught.value)
     assert requests == 1
 
 
@@ -2707,12 +2754,13 @@ def test_response_request_rejects_account_switch_as_auth_refresh_failure(monkeyp
     )
     monkeypatch.setattr(provider_module, "token_for_request", lambda _path: switched)
 
-    with pytest.raises(ChatGPTOAuthRefreshError, match="account changed after model catalog preflight"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         provider._request_json(  # noqa: SLF001
             "/responses",
             {},
             catalog_key=("account", provider.base_url, "0.153.3"),
         )
+    assert "account changed after model catalog preflight" in str(caught.value)
 
 
 def test_authenticated_catalog_and_response_requests_do_not_follow_redirects(
@@ -2870,8 +2918,9 @@ def test_http_error_body_read_failures_preserve_upstream_status(monkeypatch):
     ],
 )
 def test_provider_rejects_non_positive_or_non_finite_timeouts(field, value):
-    with pytest.raises(ValueError, match="positive finite"):
+    with pytest.raises(ValueError) as caught:
         ChatGPTOAuthProvider(**{field: value})
+    assert "positive finite" in str(caught.value)
 
 
 def test_provider_headers_include_codex_cli_headers(auth_json_factory):
@@ -2905,8 +2954,9 @@ def test_set_reasoning_payload_none_is_noop():
 
 @pytest.mark.parametrize("mode", ["standard", "pro"])
 def test_set_reasoning_payload_modes_are_rejected(mode):
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="not supported"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         _set_reasoning_payload({}, None, reasoning_mode=mode)
+    assert "not supported" in str(caught.value)
 
 
 def test_set_reasoning_payload_preserves_case_for_custom_values():
@@ -2996,8 +3046,9 @@ def test_set_reasoning_payload_empty_string_raises():
 @pytest.mark.parametrize("reasoning", [None, "medium", [], 1])
 def test_set_reasoning_payload_rejects_existing_non_object(reasoning):
     payload = {"reasoning": reasoning}
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="reasoning must be an object"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         _set_reasoning_payload(payload, "high")
+    assert "reasoning must be an object" in str(caught.value)
     assert payload["reasoning"] == reasoning
 
 
@@ -3009,14 +3060,16 @@ def test_set_reasoning_payload_preserves_existing_fields():
 
 def test_set_reasoning_payload_rejects_existing_mode():
     payload = {"reasoning": {"mode": "standard"}}
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="not supported"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         _set_reasoning_payload(payload, "high")
+    assert "not supported" in str(caught.value)
 
 
 def test_set_reasoning_payload_rejects_non_array_include():
     payload = {"include": "reasoning.encrypted_content"}
-    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="include must be an array"):
+    with pytest.raises(ChatGPTOAuthInvalidRequestError) as caught:
         _set_reasoning_payload(payload, "high")
+    assert "include must be an array" in str(caught.value)
 
 
 def test_set_reasoning_payload_all_known_wire_efforts():
@@ -3106,8 +3159,9 @@ def test_image_generation_rejects_endpoint_incompatible_output_items(monkeypatch
     }
     monkeypatch.setattr(provider, "_collect_response_output_items", lambda *_args, **_kwargs: [image, unexpected])
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported output item"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         provider.generate_image("draw", model="gpt-5.5", responses_lite=False)
+    assert "unsupported output item" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3123,13 +3177,14 @@ def test_image_inspection_rejects_endpoint_incompatible_output_items(monkeypatch
     message = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "visible"}]}
     monkeypatch.setattr(provider, "_collect_response_output_items", lambda *_args, **_kwargs: [message, unexpected])
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported output item"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         provider.inspect_images(
             "inspect",
             model="gpt-5.5",
             images=[{"image_url": "data:image/png;base64,AAAA"}],
             responses_lite=False,
         )
+    assert "unsupported output item" in str(caught.value)
 
 
 def test_classic_compact_omits_instructions_without_base_system_message(monkeypatch):
@@ -3160,12 +3215,13 @@ def test_classic_compact_omits_instructions_without_base_system_message(monkeypa
 def test_responses_lite_rejects_non_auto_tool_choice(tool_choice):
     provider = ChatGPTOAuthProvider()
 
-    with pytest.raises(ChatGPTOAuthError, match="exact string 'auto'"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         provider._responses_payload(  # noqa: SLF001
             _provider_messages(),
             model="gpt-5.6-sol",
             tool_choice=tool_choice,
         )
+    assert "exact string 'auto'" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -3194,8 +3250,9 @@ def test_tool_call_rejects_custom_tool_call():
         "call_id": "cid-2",
         "input": "{}",
     }
-    with pytest.raises(ChatGPTOAuthProtocolError, match="custom_tool_call"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _tool_call_from_response_item(item)
+    assert "custom_tool_call" in str(caught.value)
 
 
 def test_tool_call_non_tool_type_returns_none():
@@ -3205,8 +3262,9 @@ def test_tool_call_non_tool_type_returns_none():
 
 def test_tool_call_missing_name_is_protocol_error():
     item = {"type": "function_call", "call_id": "cid-3", "arguments": "{}"}
-    with pytest.raises(ChatGPTOAuthProtocolError, match="name"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _tool_call_from_response_item(item)
+    assert "name" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3261,8 +3319,9 @@ def test_tool_call_preserves_raw_arguments(arguments):
 
 @pytest.mark.parametrize("item_type", ["output_text", "text"])
 def test_text_from_items_rejects_stale_top_level_text_aliases(item_type):
-    with pytest.raises(ChatGPTOAuthProtocolError, match="unsupported"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _text_from_response_items([{"type": item_type, "text": "hello"}])
+    assert "unsupported" in str(caught.value)
 
 
 def test_text_from_message_with_content_list():
@@ -3284,8 +3343,9 @@ def test_text_from_message_rejects_string_content_parts():
             "content": ["part one", "part two"],
         }
     ]
-    with pytest.raises(ChatGPTOAuthProtocolError, match="must be an object"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _text_from_response_items(items)
+    assert "must be an object" in str(caught.value)
 
 
 def test_text_from_items_ignores_non_text_types():
@@ -3326,8 +3386,9 @@ def test_usage_from_response_input_output_tokens():
 def test_usage_from_response_rejects_chat_completion_token_aliases():
     value = {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="token aliases"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response(value)
+    assert "token aliases" in str(caught.value)
 
 
 def test_usage_from_response_cached_tokens_from_details():
@@ -3367,8 +3428,9 @@ def test_usage_from_response_rejects_cached_input_tokens_alias():
         "input_tokens_details": {"cached_tokens": 0},
         "cached_input_tokens": 25,
     }
-    with pytest.raises(ChatGPTOAuthProtocolError, match="token aliases"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response(value)
+    assert "token aliases" in str(caught.value)
 
 
 def test_usage_from_response_rejects_cache_read_input_tokens_alias():
@@ -3379,8 +3441,9 @@ def test_usage_from_response_rejects_cache_read_input_tokens_alias():
         "input_tokens_details": {"cached_tokens": 0},
         "cache_read_input_tokens": 15,
     }
-    with pytest.raises(ChatGPTOAuthProtocolError, match="token aliases"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response(value)
+    assert "token aliases" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3400,8 +3463,9 @@ def test_usage_from_response_rejects_public_token_aliases(alias):
         alias: 0,
     }
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="token aliases"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response(value)
+    assert "token aliases" in str(caught.value)
 
 
 def test_usage_from_response_accepts_absent_usage():
@@ -3410,13 +3474,15 @@ def test_usage_from_response_accepts_absent_usage():
 
 @pytest.mark.parametrize("value", ["text", 42])
 def test_usage_from_response_non_dict_is_protocol_error(value):
-    with pytest.raises(ChatGPTOAuthProtocolError, match="must be an object"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response(value)
+    assert "must be an object" in str(caught.value)
 
 
 def test_usage_from_response_missing_tokens_is_protocol_error():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="requires"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _usage_from_response({"total_tokens": 10})
+    assert "requires" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3665,8 +3731,9 @@ def test_compaction_marker_rejects_non_object_items():
         )
     )
 
-    with pytest.raises(ChatGPTOAuthError, match="marker item 1 must be an object"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _messages_to_response_items([Message(role=MessageRole.SYSTEM, content=marker)])
+    assert "marker item 1 must be an object" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3734,8 +3801,9 @@ def test_compacted_history_validates_common_response_item_fields_for_all_accepte
 def test_compaction_marker_rejects_invalid_json():
     marker = REMOTE_COMPACTION_MARKER + "\nnot-json"
 
-    with pytest.raises(ChatGPTOAuthError, match="marker contains invalid JSON"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _messages_to_response_items([Message(role=MessageRole.SYSTEM, content=marker)])
+    assert "marker contains invalid JSON" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -3749,8 +3817,13 @@ def test_compaction_marker_rejects_invalid_json():
     ],
 )
 def test_compacted_history_rejects_malformed_message_items(malformed):
-    with pytest.raises(ChatGPTOAuthError, match="remote compact output (?:item|message item) 0"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _filter_compacted_history_items([malformed])
+    diagnostic = str(caught.value)
+    assert (
+        "remote compact output item 0" in diagnostic
+        or "remote compact output message item 0" in diagnostic
+    )
 
 
 @pytest.mark.parametrize(
@@ -3818,8 +3891,9 @@ def test_compacted_history_rejects_invalid_image_detail():
         "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "full"}],
     }
 
-    with pytest.raises(ChatGPTOAuthError, match="content part 0 is invalid"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _filter_compacted_history_items([image])
+    assert "content part 0 is invalid" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -4022,22 +4096,25 @@ def test_validate_image_content_items_valid():
 
 
 def test_validate_image_content_items_non_dict_raises():
-    with pytest.raises(ChatGPTOAuthError, match="must be an object"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _validate_image_content_items(["not a dict"])
+    assert "must be an object" in str(caught.value)
 
 
 def test_validate_image_content_items_missing_url_raises():
-    with pytest.raises(ChatGPTOAuthError, match="requires image_url"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _validate_image_content_items([{"other": "field"}])
+    assert "requires image_url" in str(caught.value)
 
 
 def test_validate_image_content_items_non_data_url_raises():
-    with pytest.raises(ChatGPTOAuthError, match="data:image"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _validate_image_content_items([{"image_url": "https://example.com/img.png"}])
+    assert "data:image" in str(caught.value)
 
 
 def test_validate_image_content_items_rejects_unknown_fields():
-    with pytest.raises(ChatGPTOAuthError, match="unsupported fields"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _validate_image_content_items(
             [
                 {
@@ -4046,6 +4123,7 @@ def test_validate_image_content_items_rejects_unknown_fields():
                 }
             ]
         )
+    assert "unsupported fields" in str(caught.value)
 
 
 def test_validate_image_content_items_empty_list():
@@ -4094,7 +4172,7 @@ def test_image_generation_from_item_omits_absent_optional_fields(optional_value)
 
 @pytest.mark.parametrize("item_id", [123, False])
 def test_image_generation_from_item_rejects_invalid_present_id(item_id):
-    with pytest.raises(ChatGPTOAuthError, match="id must be a string or null"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _image_generation_from_item(
             {
                 "type": "image_generation_call",
@@ -4103,10 +4181,11 @@ def test_image_generation_from_item_rejects_invalid_present_id(item_id):
                 "result": "data:image/png;base64,ABC",
             }
         )
+    assert "id must be a string or null" in str(caught.value)
 
 
 def test_image_generation_from_item_rejects_non_string_revised_prompt():
-    with pytest.raises(ChatGPTOAuthError, match="revised_prompt must be a string or null"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _image_generation_from_item(
             {
                 "type": "image_generation_call",
@@ -4115,6 +4194,7 @@ def test_image_generation_from_item_rejects_non_string_revised_prompt():
                 "revised_prompt": 123,
             }
         )
+    assert "revised_prompt must be a string or null" in str(caught.value)
 
 
 def test_image_generation_from_item_wrong_type_returns_none():
@@ -4129,8 +4209,9 @@ def test_image_generation_from_item_preserves_empty_plain_string_fields():
 
 def test_image_generation_from_item_none_result_raises():
     item = {"type": "image_generation_call", "id": "img-3", "status": "", "result": None}
-    with pytest.raises(ChatGPTOAuthError, match="string result"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _image_generation_from_item(item)
+    assert "string result" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -4156,20 +4237,23 @@ def test_decode_sse_block_no_data_lines_returns_none():
 
 def test_decode_sse_block_invalid_json_raises():
     lines = ["data: {invalid json"]
-    with pytest.raises(ChatGPTOAuthError, match="must contain valid JSON"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _decode_sse_block(lines)
+    assert "must contain valid JSON" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["NaN", "1e400", '"\\ud800"'])
 def test_decode_sse_block_rejects_nonstandard_json_values(value):
-    with pytest.raises(ChatGPTOAuthProtocolError, match="must contain valid JSON"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _decode_sse_block([f'data: {{"type":"ping","value":{value}}}'])
+    assert "must contain valid JSON" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["[]", '"event"', "42", "null"])
 def test_decode_sse_block_rejects_non_object_json(value):
-    with pytest.raises(ChatGPTOAuthError, match="SSE event JSON must be an object"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         _decode_sse_block([f"data: {value}"])
+    assert "SSE event JSON must be an object" in str(caught.value)
 
 
 def test_decode_sse_block_strips_data_prefix():

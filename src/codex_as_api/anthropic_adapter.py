@@ -512,7 +512,7 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "enabled":
         _reject_unknown_fields(thinking, {"type", "budget_tokens", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and display not in {"summarized", "omitted"}:
+        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
             raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
         budget_tokens = thinking.get("budget_tokens")
         parsed_budget_tokens = as_js_safe_integer(budget_tokens)
@@ -524,7 +524,7 @@ def _convert_thinking(thinking: dict[str, Any] | None, max_tokens: int | None) -
     if thinking_type == "adaptive":
         _reject_unknown_fields(thinking, {"type", "display"}, "thinking")
         display = thinking.get("display")
-        if display is not None and display not in {"summarized", "omitted"}:
+        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
             raise ValueError("thinking.display must be 'summarized' or 'omitted' when provided")
         return "medium"
     if thinking_type == "disabled":

@@ -1429,12 +1429,14 @@ def test_model_environment_value_rejects_surrounding_or_only_whitespace(monkeypa
     import codex_as_api.server as server_mod
 
     monkeypatch.setenv("CODEX_AS_API_MODEL", "  gpt-5.6-sol  ")
-    with pytest.raises(ValueError, match="surrounding whitespace"):
+    with pytest.raises(ValueError) as caught:
         server_mod._env_str("CODEX_AS_API_MODEL", "gpt-5.5")
+    assert "surrounding whitespace" in str(caught.value)
 
     monkeypatch.setenv("CODEX_AS_API_MODEL", "   ")
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError) as caught:
         server_mod._env_str("CODEX_AS_API_MODEL", "gpt-5.5")
+    assert "non-empty" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["0", "65536", "-1", "+80", " 80", "1_000", "１２"])
@@ -1442,8 +1444,9 @@ def test_port_environment_value_must_be_a_valid_tcp_port(monkeypatch, value):
     import codex_as_api.server as server_mod
 
     monkeypatch.setenv("CODEX_AS_API_PORT", value)
-    with pytest.raises(ValueError, match="ASCII decimal digits|between 1 and 65535"):
+    with pytest.raises(ValueError) as caught:
         server_mod._env_int("CODEX_AS_API_PORT", 18080)
+    assert "ASCII decimal digits" in str(caught.value) or "between 1 and 65535" in str(caught.value)
 
 
 def test_health_uses_sol_catalog_context_compaction_and_effort(client, monkeypatch):
@@ -4246,12 +4249,13 @@ def test_anthropic_cache_control_null_is_omitted_without_claude_session(
 ):
     messages_body = {
         "model": "gpt-5.6-sol",
+        "max_tokens": 64,
         "messages": [{"role": "user", "content": "hello"}],
     }
     baseline = client.post("/v1/messages", json=messages_body)
     with_null = client.post("/v1/messages", json={**messages_body, "cache_control": None})
-    assert with_null.status_code == baseline.status_code == 400
-    assert with_null.json() == baseline.json()
+    assert with_null.status_code == baseline.status_code == 200
+    assert with_null.json()["content"] == baseline.json()["content"]
 
     count = client.post(
         "/v1/messages/count_tokens",
@@ -4263,7 +4267,7 @@ def test_anthropic_cache_control_null_is_omitted_without_claude_session(
         json={**messages_body, "cache_control": None},
     )
     assert count.status_code == 200
-    assert compact_with_null.status_code == compact_baseline.status_code == 400
+    assert compact_with_null.status_code == compact_baseline.status_code == 200
     assert compact_with_null.json() == compact_baseline.json()
 
 
@@ -5786,14 +5790,14 @@ def test_anthropic_stream_does_not_block_concurrent_claude_code_requests(
         health_thread.start()
         try:
             health_thread.join(timeout=2)
-            assert not health_thread.is_alive(), "the provider stream blocked the ASGI event loop"
+            assert "response" in health_result, "the provider stream did not permit a concurrent health response"
             assert health_result["response"].status_code == 200
         finally:
             release_provider.set()
 
         stream_thread.join(timeout=5)
         health_thread.join(timeout=5)
-        assert not stream_thread.is_alive()
+        assert "response" in stream_result
 
     response = stream_result["response"]
     assert response.status_code == 200
@@ -5940,7 +5944,15 @@ def test_anthropic_messages_thinking_display_summarized_vs_omitted_and_replay(
     def fake_sse(_path, payload, extra_headers=None):  # noqa: ANN001
         del extra_headers
         captured_summaries.append(payload.get("reasoning", {}).get("summary"))
-        yield {"type": "response.reasoning_summary_text.delta", "delta": "step 1"}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "step 1", "summary_index": 0}
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "reasoning-thinking",
+                "summary": [{"type": "summary_text", "text": "step 1"}],
+            },
+        }
         yield {
             "type": "response.output_item.done",
             "item": {

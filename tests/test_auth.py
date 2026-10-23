@@ -200,8 +200,9 @@ def test_auth_claims_missing_key_returns_empty(make_jwt):
 
 def test_auth_claims_non_dict_value_raises(make_jwt):
     token = make_jwt({"https://api.openai.com/auth": "bad"})
-    with pytest.raises(ChatGPTOAuthMissingError, match="auth claim"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         _auth_claims(token)
+    assert "auth claim" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +272,9 @@ def test_load_token_data_rejects_nonstandard_json_numbers(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text('{"tokens":{"access_token":NaN}}')
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="invalid JSON"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(str(p))
+    assert "invalid JSON" in str(caught.value)
 
 
 def test_load_token_data_invalid_utf8_is_authentication_error(tmp_path):
@@ -329,8 +331,9 @@ def test_load_token_data_root_not_dict_raises(tmp_path):
 def test_load_token_data_missing_tokens_raises(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text(json.dumps({}))
-    with pytest.raises(ChatGPTOAuthError, match="file-backed ChatGPT OAuth tokens are required"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         load_token_data(str(p))
+    assert "file-backed ChatGPT OAuth tokens are required" in str(caught.value)
 
 
 def test_load_token_data_rejects_root_token_fields(tmp_path, make_jwt):
@@ -355,8 +358,9 @@ def test_load_token_data_rejects_root_token_fields(tmp_path, make_jwt):
         )
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="file-backed ChatGPT OAuth tokens"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(str(p))
+    assert "file-backed ChatGPT OAuth tokens" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -369,8 +373,9 @@ def test_load_token_data_rejects_mixed_nested_and_root_credentials(
 ):
     path = auth_json_factory(extra={root_key: "unsupported-root-value"})
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="mixes canonical tokens"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert "mixes canonical tokens" in str(caught.value)
 
 
 def test_load_token_data_rejects_present_null_tokens_instead_of_using_root_fields(
@@ -390,32 +395,36 @@ def test_load_token_data_rejects_present_null_tokens_instead_of_using_root_field
         )
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="tokens must be an object"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(p)
+    assert "tokens must be an object" in str(caught.value)
 
 
 def test_load_token_data_pat_only_has_specific_error(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text(json.dumps({"personal_access_token": "pat-only"}))
 
-    with pytest.raises(ChatGPTOAuthError, match="personal_access_token-only auth is not supported"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         load_token_data(str(p))
+    assert "personal_access_token-only auth is not supported" in str(caught.value)
 
 
 def test_load_token_data_agent_identity_only_has_specific_error(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text(json.dumps({"agent_identity": {"id": "agent-only"}}))
 
-    with pytest.raises(ChatGPTOAuthError, match="agent_identity-only auth is not supported"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         load_token_data(str(p))
+    assert "agent_identity-only auth is not supported" in str(caught.value)
 
 
 def test_load_token_data_bedrock_only_has_specific_error(tmp_path):
     p = tmp_path / "auth.json"
     p.write_text(json.dumps({"bedrock_api_key": "bedrock-only"}))
 
-    with pytest.raises(ChatGPTOAuthError, match="bedrock_api_key-only auth is not supported"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         load_token_data(str(p))
+    assert "bedrock_api_key-only auth is not supported" in str(caught.value)
 
 
 def test_load_token_data_missing_access_token_raises(tmp_path, make_jwt):
@@ -450,8 +459,9 @@ def test_load_token_data_rejects_header_unsafe_access_token(
     unsafe_token = document["tokens"]["access_token"]
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="access_token is invalid") as caught:
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert "access_token is invalid" in str(caught.value)
     assert unsafe_token not in str(caught.value)
 
 
@@ -472,8 +482,9 @@ def test_load_token_data_rejects_header_unsafe_final_account_id(tmp_path, make_j
         )
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="account id is invalid") as caught:
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert "account id is invalid" in str(caught.value)
     assert account_id not in str(caught.value)
 
 
@@ -498,8 +509,9 @@ def test_load_token_data_invalid_auth_mode_raises(tmp_path, auth_json_factory):
 )
 def test_load_token_data_rejects_non_managed_auth_modes(auth_json_factory, auth_mode):
     path = auth_json_factory(extra={"auth_mode": auth_mode})
-    with pytest.raises(ChatGPTOAuthMissingError, match="auth_mode is unsupported"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert "auth_mode is unsupported" in str(caught.value)
 
 
 def test_external_auth_mode_is_rejected_before_refresh_transport(monkeypatch, auth_json_factory):
@@ -508,8 +520,9 @@ def test_external_auth_mode_is_rejected_before_refresh_transport(monkeypatch, au
         "codex_as_api.auth._urlopen_no_redirect",
         lambda *_args, **_kwargs: pytest.fail("external auth must not reach managed refresh transport"),
     )
-    with pytest.raises(ChatGPTOAuthMissingError, match="auth_mode is unsupported"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         refresh_token(path)
+    assert "auth_mode is unsupported" in str(caught.value)
 
 
 @pytest.mark.parametrize("auth_mode", [None, "chatgpt"])
@@ -577,8 +590,9 @@ def test_load_token_data_rejects_invalid_or_conflicting_fedramp_claims(
         },
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="fedramp"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert "fedramp" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -607,8 +621,9 @@ def test_load_token_data_rejects_invalid_or_conflicting_metadata_claims(
         },
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match=message):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         load_token_data(path)
+    assert message in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -728,8 +743,9 @@ def test_refresh_rejects_explicit_null_optional_token(monkeypatch, tmp_path, mak
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match=f"invalid {name}"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         refresh_token(auth_path)
+    assert f"invalid {name}" in str(caught.value)
 
 
 def test_refresh_rejects_header_unsafe_access_token_before_persist(
@@ -752,8 +768,9 @@ def test_refresh_rejects_header_unsafe_access_token_before_persist(
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
     before = auth_path.read_text(encoding="utf-8")
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="invalid access_token") as caught:
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         refresh_token(auth_path)
+    assert "invalid access_token" in str(caught.value)
     assert "bad token" not in str(caught.value)
     assert auth_path.read_text(encoding="utf-8") == before
 
@@ -810,8 +827,9 @@ def test_refresh_rejects_root_credential_layout_without_request(monkeypatch, tmp
         lambda *_args, **_kwargs: pytest.fail("invalid root credentials must not reach refresh transport"),
     )
 
-    with pytest.raises(ChatGPTOAuthMissingError, match="file-backed ChatGPT OAuth tokens"):
+    with pytest.raises(ChatGPTOAuthMissingError) as caught:
         refresh_token(auth_path)
+    assert "file-backed ChatGPT OAuth tokens" in str(caught.value)
 
 
 def test_refresh_rejects_account_switch_before_request(monkeypatch, tmp_path, make_jwt):
@@ -833,8 +851,9 @@ def test_refresh_rejects_account_switch_before_request(monkeypatch, tmp_path, ma
         lambda *_args, **_kwargs: pytest.fail("account switch must fail before refresh transport"),
     )
 
-    with pytest.raises(ChatGPTOAuthRefreshError, match="account changed"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         refresh_after_unauthorized(observed)
+    assert "account changed" in str(caught.value)
 
 
 def test_refresh_uses_latest_same_account_refresh_token(monkeypatch, tmp_path, make_jwt):
@@ -942,8 +961,9 @@ def test_refresh_compare_and_set_rejects_other_credential_change(monkeypatch, tm
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
 
-    with pytest.raises(ChatGPTOAuthRefreshError, match="changed while token refresh was in flight"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         refresh_token(auth_path)
+    assert "changed while token refresh was in flight" in str(caught.value)
 
 
 def test_refresh_revalidates_exact_document_before_mutation(monkeypatch, tmp_path, make_jwt):
@@ -976,8 +996,9 @@ def test_refresh_revalidates_exact_document_before_mutation(monkeypatch, tmp_pat
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
 
-    with pytest.raises(ChatGPTOAuthRefreshError, match="account changed"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         refresh_token(auth_path)
+    assert "account changed" in str(caught.value)
     assert json.loads(auth_path.read_text(encoding="utf-8")) == account_b
 
 
@@ -997,8 +1018,9 @@ def test_load_and_refresh_reject_account_claim_mismatches(monkeypatch, tmp_path,
             }
         )
     )
-    with pytest.raises(ChatGPTOAuthError, match="account ids do not match"):
+    with pytest.raises(ChatGPTOAuthError) as caught:
         load_token_data(auth_path)
+    assert "account ids do not match" in str(caught.value)
 
     auth_path.write_text(
         json.dumps(
@@ -1023,8 +1045,9 @@ def test_load_and_refresh_reject_account_claim_mismatches(monkeypatch, tmp_path,
             return json.dumps({"access_token": make_jwt({"exp": 9999999999, **new_claims})}).encode()
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
-    with pytest.raises(ChatGPTOAuthRefreshError, match="does not match current account"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         refresh_token(auth_path)
+    assert "does not match current account" in str(caught.value)
 
 
 def test_refresh_error_redacts_account_id(monkeypatch, auth_json_factory):
@@ -1101,8 +1124,9 @@ def test_refresh_malformed_success_is_protocol_error(monkeypatch, auth_json_fact
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
 
-    with pytest.raises(ChatGPTOAuthProtocolError, match="invalid JSON"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         refresh_token(auth_path)
+    assert "invalid JSON" in str(caught.value)
 
 
 def test_refresh_local_persistence_failure_is_internal(monkeypatch, auth_json_factory, make_jwt):
@@ -1248,8 +1272,9 @@ def test_refresh_endpoint_environment_is_strict_and_path_and_port_are_allowed(mo
 )
 def test_refresh_endpoint_environment_rejects_unsafe_values(monkeypatch, endpoint):
     monkeypatch.setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", endpoint)
-    with pytest.raises(ChatGPTOAuthRefreshError, match="CODEX_REFRESH_TOKEN_URL_OVERRIDE"):
+    with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         validate_auth_environment()
+    assert "CODEX_REFRESH_TOKEN_URL_OVERRIDE" in str(caught.value)
 
 
 def test_refresh_endpoint_allows_percent_encoded_path(monkeypatch):
@@ -1284,8 +1309,9 @@ def test_refresh_request_does_not_follow_redirect(monkeypatch, auth_json_factory
             f"http://127.0.0.1:{server.server_port}/oauth/token",
         )
         observed = load_token_data(auth_json_factory(account_id="acc-redirect"))
-        with pytest.raises(ChatGPTOAuthUpstreamError, match="HTTP 307") as caught:
+        with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
             refresh_after_unauthorized(observed)
+        assert "HTTP 307" in str(caught.value)
         assert caught.value.status == 307
         assert redirected_requests == []
     finally:

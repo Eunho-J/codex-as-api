@@ -9,16 +9,18 @@ from codex_as_api.codex_config import load_codex_config, resolve_codex_home
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_resolve_codex_home_rejects_empty_explicit_path(value) -> None:
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError) as caught:
         resolve_codex_home(value)
+    assert "non-empty" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", ["", "   "])
 def test_resolve_codex_home_rejects_empty_environment(monkeypatch, value) -> None:
     monkeypatch.setenv("CODEX_HOME", value)
 
-    with pytest.raises(ValueError, match="CODEX_HOME"):
+    with pytest.raises(ValueError) as caught:
         resolve_codex_home()
+    assert "CODEX_HOME" in str(caught.value)
 
 
 def test_load_codex_config_parses_reasoning_and_context_settings(tmp_path) -> None:
@@ -50,8 +52,9 @@ def test_load_codex_config_rejects_empty_reasoning_effort(tmp_path, value) -> No
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="model_reasoning_effort must be a non-empty string"):
+    with pytest.raises(ValueError) as caught:
         load_codex_config(str(tmp_path))
+    assert "model_reasoning_effort must be a non-empty string" in str(caught.value)
 
 
 @pytest.mark.parametrize("key", ["model", "model_reasoning_effort"])
@@ -61,8 +64,9 @@ def test_load_codex_config_rejects_identifier_surrounding_whitespace(tmp_path, k
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="surrounding whitespace"):
+    with pytest.raises(ValueError) as caught:
         load_codex_config(str(tmp_path))
+    assert "surrounding whitespace" in str(caught.value)
 
 
 def test_load_codex_config_ignores_inactive_profile_reasoning_effort(tmp_path) -> None:
@@ -94,8 +98,9 @@ def test_load_codex_config_rejects_non_string_root_reasoning_effort(tmp_path) ->
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="model_reasoning_effort must be a string"):
+    with pytest.raises(ValueError) as caught:
         load_codex_config(str(tmp_path))
+    assert "model_reasoning_effort must be a string" in str(caught.value)
 
 
 def test_load_codex_config_ignores_wrong_type_inside_inactive_profile(tmp_path) -> None:
@@ -121,8 +126,10 @@ def test_load_codex_config_surfaces_read_failures_with_path(tmp_path, monkeypatc
 
     monkeypatch.setattr(Path, "read_text", denied_read_text)
 
-    with pytest.raises(RuntimeError, match=rf"failed to read Codex config {config_path}.*denied"):
+    with pytest.raises(RuntimeError) as caught:
         load_codex_config(str(tmp_path))
+    assert f"failed to read Codex config {config_path}" in str(caught.value)
+    assert "denied" in str(caught.value)
 
 
 @pytest.mark.parametrize("field", ["model_context_window", "model_auto_compact_token_limit"])
@@ -133,8 +140,9 @@ def test_load_codex_config_requires_javascript_safe_integers(tmp_path, field) ->
     assert getattr(config, field) == 9_007_199_254_740_991
 
     config_path.write_text(f"{field} = 9007199254740992\n", encoding="utf-8")
-    with pytest.raises(ValueError, match=rf"{field} must be a JavaScript-safe integer"):
+    with pytest.raises(ValueError) as caught:
         load_codex_config(str(tmp_path))
+    assert f"{field} must be a JavaScript-safe integer" in str(caught.value)
 
 
 def test_load_codex_config_preserves_zero_auto_compact_limit(tmp_path) -> None:

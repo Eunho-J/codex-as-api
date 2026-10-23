@@ -2331,7 +2331,7 @@ function finalizeResponsesPayload(
   let configuredSummary: string | undefined;
   if (opts.capability.supportsReasoningSummaryParameter) {
     if (opts.reasoningSummary === "none") {
-      configuredSummary = undefined;
+      configuredSummary = "none";
     } else if (opts.reasoningSummary === "auto") {
       configuredSummary = opts.capability.defaultReasoningSummary !== "none"
         ? opts.capability.defaultReasoningSummary

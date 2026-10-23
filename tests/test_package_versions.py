@@ -107,8 +107,9 @@ def test_validate_package_names_rejects_wrong_published_identity(tmp_path: Path,
     write_release_metadata(tmp_path)
     (tmp_path / path).write_text(replacement, encoding="utf-8")
 
-    with pytest.raises(check_package_versions.VersionCheckError, match="package names are inconsistent"):
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
         check_package_versions.validate_package_names(check_package_versions.collect_package_names(tmp_path))
+    assert "package names are inconsistent" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -133,15 +134,17 @@ def test_validate_versions_rejects_mismatched_tracked_metadata(tmp_path: Path, p
     write_release_metadata(tmp_path)
     (tmp_path / path).write_text(replacement, encoding="utf-8")
 
-    with pytest.raises(check_package_versions.VersionCheckError, match="package versions are inconsistent"):
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
         check_package_versions.validate_versions(check_package_versions.collect_versions(tmp_path))
+    assert "package versions are inconsistent" in str(caught.value)
 
 
 def test_validate_versions_rejects_mismatched_tag(tmp_path: Path) -> None:
     write_release_metadata(tmp_path)
 
-    with pytest.raises(check_package_versions.VersionCheckError, match="release tag"):
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
         check_package_versions.validate_versions(check_package_versions.collect_versions(tmp_path), "v1.2.4")
+    assert "release tag" in str(caught.value)
 
 
 def test_collect_versions_rejects_missing_lockfile_root_version(tmp_path: Path) -> None:
@@ -151,5 +154,6 @@ def test_collect_versions_rejects_missing_lockfile_root_version(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    with pytest.raises(check_package_versions.VersionCheckError, match="packages.*version"):
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
         check_package_versions.collect_versions(tmp_path)
+    assert "packages..version" in str(caught.value)

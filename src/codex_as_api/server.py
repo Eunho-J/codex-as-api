@@ -462,7 +462,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="0.8.2",
+    version="0.8.3",
 )
 
 
@@ -2535,10 +2535,14 @@ async def compact(request: Request) -> JSONResponse:
     for field in ("safety_identifier", "include", "prompt_cache_retention"):
         if body.get(field) is not None:
             raise ChatGPTOAuthInvalidRequestError(f"{field} is not supported by the compact facade")
-    messages, tools, reasoning_effort, anthropic_text, reasoning_summary, thinking_disabled = _messages_from_compact_body(
-        body,
-        anthropic=is_anthropic_compact,
-    )
+    (
+        messages,
+        tools,
+        reasoning_effort,
+        anthropic_text,
+        reasoning_summary,
+        thinking_disabled,
+    ) = _messages_from_compact_body(body, anthropic=is_anthropic_compact)
     if is_anthropic_compact:
         compact_parallel_tool_calls = anthropic_parallel_tool_calls(
             cast(dict[str, Any] | None, body.get("tool_choice"))

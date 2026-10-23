@@ -3834,7 +3834,7 @@ fn finalize_responses_request_with_reasoning_controls(
             .insert("effort".to_string(), Value::String(wire_effort));
     }
     let reasoning_summary = match reasoning_summary_override {
-        Some("none") => None,
+        Some("none") => model.supports_reasoning_summary_parameter.then_some("none"),
         Some(override_summary) => model.supports_reasoning_summary_parameter.then(|| {
             if model.default_reasoning_summary != "none" {
                 model.default_reasoning_summary.as_str()
@@ -3922,6 +3922,7 @@ fn finalize_responses_request_with_reasoning_controls(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_reasoning_effort(
     model: &ModelInfo,
     requested: &str,
@@ -7003,6 +7004,32 @@ mod tests {
                 .is_some_and(|include| include
                     .iter()
                     .any(|value| { value.as_str() == Some("reasoning.encrypted_content") })));
+        }
+    }
+
+    #[test]
+    fn explicit_summary_suppression_is_forwarded_only_when_supported() {
+        for supported in [true, false] {
+            let mut row = live_model_row_for_test("summary-model", false, true);
+            row["supports_reasoning_summary_parameter"] = json!(supported);
+            row["default_reasoning_summary"] = json!("detailed");
+            let resolved = resolved_model_from_row_for_test(row);
+            let request = super::finalize_responses_request_with_reasoning_controls(
+                json!({"input": [], "tools": []}),
+                &resolved,
+                None,
+                None,
+                None,
+                ResponsesEndpointKind::Standard,
+                Some("none"),
+                false,
+            )
+            .unwrap();
+            let summary = request
+                .payload
+                .get("reasoning")
+                .and_then(|value| value.get("summary"));
+            assert_eq!(summary, supported.then_some(json!("none")).as_ref());
         }
     }
 

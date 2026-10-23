@@ -87,6 +87,7 @@ def _catalog_model(
         "default_service_tier": None,
         "use_responses_lite": lite,
         "supports_image_detail_original": original_detail,
+        "supports_reasoning_summaries": True,
         "support_verbosity": True,
         "default_verbosity": "medium",
         "multi_agent_reasoning_effort": "max",

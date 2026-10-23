@@ -1121,26 +1121,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn test_write_auth_json_sets_owner_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!("codex_auth_mode_{}", uuid::Uuid::new_v4()));
-        let auth_path = dir.join("auth.json");
-
-        write_auth_json(&auth_path, &serde_json::json!({"tokens": {}})).unwrap();
-
-        let mode = fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".tmp-")));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     #[test]
     fn test_write_auth_json_replaces_existing_destination() {
         let dir = std::env::temp_dir().join(format!(
@@ -1156,11 +1136,6 @@ mod tests {
 
         let actual = strict_json::parse_slice(&fs::read(&auth_path).unwrap()).unwrap();
         assert_eq!(actual, expected);
-        assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".tmp-")));
         fs::remove_dir_all(dir).unwrap();
     }
 

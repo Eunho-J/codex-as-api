@@ -57,18 +57,21 @@ def test_normalize_stream_content_list_of_dicts():
 
 
 def test_normalize_stream_content_rejects_missing_text():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="requires text"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_stream_content([{"other": "x"}, {"text": "ok"}])
+    assert "requires text" in str(caught.value)
 
 
 def test_normalize_stream_content_rejects_other_type():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="must be a string"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_stream_content(42)
+    assert "must be a string" in str(caught.value)
 
 
 def test_normalize_stream_content_rejects_non_string_item_text():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="text must be a string"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_stream_content([{"text": 42}])
+    assert "text must be a string" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -99,30 +102,35 @@ def test_normalize_chunk_no_choices_empty():
 
 
 def test_normalize_chunk_rejects_missing_choices():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="requires choices"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_openai_chat_completion_chunk({})
+    assert "requires choices" in str(caught.value)
 
 
 def test_normalize_chunk_rejects_malformed_choice():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="choice must be an object"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_openai_chat_completion_chunk({"choices": [42]})
+    assert "choice must be an object" in str(caught.value)
 
 
 def test_normalize_chunk_rejects_malformed_delta():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="delta must be an object"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_openai_chat_completion_chunk({"choices": [{"delta": 42}]})
+    assert "delta must be an object" in str(caught.value)
 
 
 def test_normalize_chunk_rejects_non_array_tool_calls():
     chunk = _make_chunk({"tool_calls": {"id": "tc1"}})
-    with pytest.raises(ChatGPTOAuthProtocolError, match="tool_calls must be an array"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_openai_chat_completion_chunk(chunk)
+    assert "tool_calls must be an array" in str(caught.value)
 
 
 def test_normalize_chunk_rejects_non_string_finish_reason():
     chunk = _make_chunk({}, finish_reason=42)  # type: ignore[arg-type]
-    with pytest.raises(ChatGPTOAuthProtocolError, match="finish_reason must be a string"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         normalize_openai_chat_completion_chunk(chunk)
+    assert "finish_reason must be a string" in str(caught.value)
 
 
 def test_normalize_chunk_reasoning_content():
@@ -266,5 +274,6 @@ def test_reasoning_from_items_multiple_reasoning_items():
 
 
 def test_reasoning_from_items_rejects_non_object_item():
-    with pytest.raises(ChatGPTOAuthProtocolError, match="response item 0"):
+    with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         reasoning_from_response_items([42])  # type: ignore[list-item]
+    assert "response item 0" in str(caught.value)

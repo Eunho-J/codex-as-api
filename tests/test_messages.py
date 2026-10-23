@@ -46,8 +46,9 @@ def test_message_tool_role_valid():
 
 
 def test_message_tool_missing_tool_call_id_raises():
-    with pytest.raises(TypeError, match="tool messages require"):
+    with pytest.raises(TypeError) as caught:
         Message(role=MessageRole.TOOL, content="x", name="fn")
+    assert "tool messages require" in str(caught.value)
 
 
 def test_message_tool_name_is_optional():
@@ -57,19 +58,22 @@ def test_message_tool_name_is_optional():
 
 
 def test_message_non_tool_with_tool_call_id_raises():
-    with pytest.raises(ValueError, match="only allowed on tool messages"):
+    with pytest.raises(ValueError) as caught:
         Message(role=MessageRole.USER, content="x", tool_call_id="tc-1")
+    assert "only allowed on tool messages" in str(caught.value)
 
 
 def test_message_non_tool_with_name_raises():
-    with pytest.raises(ValueError, match="only allowed on tool messages"):
+    with pytest.raises(ValueError) as caught:
         Message(role=MessageRole.SYSTEM, content="x", name="fn")
+    assert "only allowed on tool messages" in str(caught.value)
 
 
 def test_message_tool_calls_only_on_assistant():
     tc = ToolCall(id="id1", name="fn", arguments="{}")
-    with pytest.raises(ValueError, match="only allowed on assistant messages"):
+    with pytest.raises(ValueError) as caught:
         Message(role=MessageRole.USER, content="x", tool_calls=(tc,))
+    assert "only allowed on assistant messages" in str(caught.value)
 
 
 def test_message_assistant_with_tool_calls():
@@ -99,8 +103,9 @@ def test_usage_requires_actual_consistent_total():
 
 
 def test_usage_rejects_inconsistent_explicit_total():
-    with pytest.raises(ValueError, match="must equal"):
+    with pytest.raises(ValueError) as caught:
         Usage(prompt_tokens=10, completion_tokens=5, total_tokens=20)
+    assert "must equal" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +187,15 @@ def test_terminator_call_valid():
 
 
 def test_terminator_call_empty_name_raises():
-    with pytest.raises(ValueError, match="non-empty"):
+    with pytest.raises(ValueError) as caught:
         TerminatorCall(name="", arguments={})
+    assert "non-empty" in str(caught.value)
 
 
 def test_terminator_call_non_dict_arguments_raises():
-    with pytest.raises(TypeError, match="must be a dict"):
+    with pytest.raises(TypeError) as caught:
         TerminatorCall(name="fn", arguments="not a dict")
+    assert "must be a dict" in str(caught.value)
 
 
 # ---------------------------------------------------------------------------

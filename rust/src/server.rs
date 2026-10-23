@@ -1911,8 +1911,7 @@ fn validate_anthropic_compatibility_scope(
     headers: &HeaderMap,
 ) -> Result<bool, ProviderError> {
     let is_claude_code = claude_code_session_id(headers)?.is_some();
-    validate_anthropic_cache_controls(body, true)
-        .map_err(ProviderError::InvalidRequest)?;
+    validate_anthropic_cache_controls(body, true).map_err(ProviderError::InvalidRequest)?;
     Ok(is_claude_code)
 }
 
@@ -3349,7 +3348,8 @@ async fn anthropic_count_tokens(
     }
     validate_anthropic_compatibility_scope(&body, &headers)
         .map_err(|error| anthropic_provider_error_response(&error))?;
-    validate_anthropic_metadata(&body).map_err(|error| anthropic_provider_error_response(&error))?;
+    validate_anthropic_metadata(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     if let Err(error) = validate_anthropic_context_management(&body) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -3453,7 +3453,8 @@ async fn anthropic_messages(
     }
     validate_anthropic_compatibility_scope(&body, &headers)
         .map_err(|error| anthropic_provider_error_response(&error))?;
-    validate_anthropic_metadata(&body).map_err(|error| anthropic_provider_error_response(&error))?;
+    validate_anthropic_metadata(&body)
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     reject_unsupported_anthropic_controls(&body)
         .map_err(|error| anthropic_provider_error_response(&error))?;
     validate_anthropic_context_management(&body).map_err(|error| {
@@ -3573,8 +3574,7 @@ async fn anthropic_messages(
     )
     .map_err(|error| anthropic_provider_error_response(&error))?;
     controls.reasoning_summary = thinking_controls.reasoning_summary.map(str::to_string);
-    controls.allow_disabled_reasoning_fallback =
-        thinking_controls.disabled && !has_explicit_effort;
+    controls.allow_disabled_reasoning_fallback = thinking_controls.disabled && !has_explicit_effort;
 
     let resolved = resolve_anthropic_route_model(&state, &client_model)
         .await
@@ -4591,13 +4591,16 @@ mod live_catalog_tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            unconfigured_claude.status(),
-            reqwest::StatusCode::BAD_REQUEST
-        );
+        // A Claude facade without an override selects the live catalog default.
+        assert_eq!(unconfigured_claude.status(), reqwest::StatusCode::OK);
         let unconfigured_body: Value = unconfigured_claude.json().await.unwrap();
-        assert_eq!(unconfigured_body["error"]["type"], "invalid_request_error");
-        assert!(state.model_requests.lock().unwrap().is_empty());
+        assert_eq!(unconfigured_body["type"], "message");
+        {
+            let mut requests = state.response_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["model"], "live-model");
+            requests.clear();
+        }
 
         let unknown = client
             .post(format!("{api}/v1/chat/completions"))
@@ -4696,7 +4699,10 @@ mod live_catalog_tests {
         let (api, auth_path, api_handle) = start_api(&upstream, "live-model").await;
         let client = reqwest::Client::new();
 
-        for unsupported in [json!({"stream": false}), json!({"metadata": {}})] {
+        for unsupported in [
+            json!({"stream": false}),
+            json!({"metadata": {"unsupported": true}}),
+        ] {
             let mut body = json!({
                 "model": "live-model",
                 "messages": [{"role": "user", "content": "Count this"}]
@@ -4716,6 +4722,33 @@ mod live_catalog_tests {
         }
 
         assert!(state.model_requests.lock().unwrap().is_empty());
+        assert!(state.response_requests.lock().unwrap().is_empty());
+
+        let mut baseline_tokens = None;
+        for metadata in [
+            json!({}),
+            json!({"user_id": "user-123"}),
+            json!({"user_id": null}),
+        ] {
+            let response = client
+                .post(format!("{api}/v1/messages/count_tokens"))
+                .json(&json!({
+                    "model": "live-model",
+                    "messages": [{"role": "user", "content": "Count this"}],
+                    "metadata": metadata
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            let tokens = body["input_tokens"].as_u64().unwrap();
+            if let Some(expected) = baseline_tokens {
+                assert_eq!(tokens, expected);
+            } else {
+                baseline_tokens = Some(tokens);
+            }
+        }
         assert!(state.response_requests.lock().unwrap().is_empty());
 
         api_handle.abort();
@@ -5712,8 +5745,9 @@ mod tests {
                 "test downstream disconnected",
             )
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!worker.is_finished());
+        // Inspect the bounded channel's value rather than a worker's liveness.
+        assert_eq!(sender.capacity(), 0);
+        assert!(!cancellation.load(Ordering::Acquire));
 
         let mut downstream = DownstreamEventReceiver {
             receiver,
@@ -10650,10 +10684,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(no_session.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(no_session.status(), reqwest::StatusCode::OK);
 
         let requests = recording.requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
+        assert!(requests[4].body.get("prompt_cache_key").is_none());
         let session_a_key = "fed3534a8ed1887fdc51648477597f2a98ec264b033271334062e9cba3c23fae";
         let session_b_key = "00d0e78bab5b2ca951064120f1c2d86d481250a6814637aeec71f12b6aed398b";
         assert_eq!(requests[0].body["prompt_cache_key"], session_a_key);

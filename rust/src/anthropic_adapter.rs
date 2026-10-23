@@ -1254,6 +1254,7 @@ fn parse_anthropic_tool_arguments(value: &str) -> Result<Value, String> {
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub fn internal_response_to_anthropic(
     response: &AssistantResponse,
     model: &str,
@@ -1474,6 +1475,7 @@ pub struct AnthropicStreamAdapter {
 }
 
 impl AnthropicStreamAdapter {
+    #[cfg(test)]
     pub fn new(model: &str, request_id: &str) -> Self {
         Self::with_thinking_display(model, request_id, ThinkingDisplayMode::Summarized)
     }
@@ -1983,6 +1985,51 @@ mod strict_adapter_tests {
     }
 
     #[test]
+    fn replayed_thinking_preserves_text_tools_and_results() {
+        let baseline = json!({"messages": [
+            {"role": "user", "content": "Weather?"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Calling a tool."},
+                {"type": "tool_use", "id": "toolu_01", "name": "weather", "input": {"city": "Seoul"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": "Sunny"},
+                {"type": "text", "text": "What next?"}
+            ]}
+        ]});
+        let mut replayed = baseline.clone();
+        let blocks = replayed["messages"][1]["content"].as_array_mut().unwrap();
+        blocks.insert(
+            0,
+            json!({"type": "thinking", "thinking": "Private summary"}),
+        );
+        blocks.insert(2, json!({"type": "redacted_thinking", "data": "opaque"}));
+        let (expected, _, _, _, _, _, _) = anthropic_request_to_internal(&baseline).unwrap();
+        let (actual, _, _, _, _, _, _) = anthropic_request_to_internal(&replayed).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.tool_call_id, expected.tool_call_id);
+            assert_eq!(actual.tool_calls.len(), expected.tool_calls.len());
+            for (actual, expected) in actual.tool_calls.iter().zip(&expected.tool_calls) {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.arguments, expected.arguments);
+            }
+        }
+        assert_eq!(actual[1].content, "Calling a tool.");
+        assert_eq!(actual[1].tool_calls[0].id, "toolu_01");
+        assert_eq!(actual[1].tool_calls[0].name, "weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(&actual[1].tool_calls[0].arguments).unwrap(),
+            json!({"city": "Seoul"})
+        );
+        assert_eq!(actual[2].tool_call_id.as_deref(), Some("toolu_01"));
+        assert_eq!(actual[2].content, "Sunny");
+    }
+
+    #[test]
     fn non_stream_reasoning_emits_unsigned_thinking_and_proxy_extension_unless_omitted() {
         let response = AssistantResponse {
             content: "answer".to_string(),
@@ -2068,12 +2115,15 @@ mod strict_adapter_tests {
             .iter()
             .find(|(event, _)| *event == "message_start")
             .expect("stream must begin with message_start");
-        assert_eq!(start.1["message"]["usage"], json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-        }));
+        assert_eq!(
+            start.1["message"]["usage"],
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            })
+        );
 
         let mut omitted_adapter = AnthropicStreamAdapter::with_thinking_display(
             "claude-facade",

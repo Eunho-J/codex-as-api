@@ -88,10 +88,11 @@ def test_rejects_a_runtime_dependency_without_a_shipped_license_file(tmp_path: P
     missing = package(tmp_path, "missing", "missing")
     (tmp_path / "missing" / "LICENSE").unlink()
 
-    with pytest.raises(notices.NoticeGenerationError, match="no shipped license file"):
+    with pytest.raises(notices.NoticeGenerationError) as caught:
         notices.collect_runtime_dependencies(
             {"x86_64-unknown-linux-gnu": metadata([root, missing], [dependency("missing")])}
         )
+    assert "no shipped license file" in str(caught.value)
 
 
 def test_rejects_an_empty_or_non_utf8_license_file(tmp_path: Path) -> None:
@@ -107,16 +108,18 @@ def test_rejects_an_empty_or_non_utf8_license_file(tmp_path: Path) -> None:
         "targets": ("x86_64-unknown-linux-gnu",),
     }
 
-    with pytest.raises(notices.NoticeGenerationError, match="must not be empty"):
+    with pytest.raises(notices.NoticeGenerationError) as caught:
         notices.render_notices(
             [notices.RuntimeDependency(**base, license_files=(empty_file,))],
             b"bundled notice\n",
         )
-    with pytest.raises(notices.NoticeGenerationError, match="must be UTF-8"):
+    assert "must not be empty" in str(caught.value)
+    with pytest.raises(notices.NoticeGenerationError) as caught:
         notices.render_notices(
             [notices.RuntimeDependency(**base, license_files=(invalid_file,))],
             b"bundled notice\n",
         )
+    assert "must be UTF-8" in str(caught.value)
 
 
 def test_rejects_missing_bundled_asset_notices(tmp_path: Path) -> None:
@@ -131,8 +134,9 @@ def test_rejects_missing_bundled_asset_notices(tmp_path: Path) -> None:
         targets=("x86_64-unknown-linux-gnu",),
     )
 
-    with pytest.raises(notices.NoticeGenerationError, match="must not be empty"):
+    with pytest.raises(notices.NoticeGenerationError) as caught:
         notices.render_notices([dependency_record], b"")
+    assert "must not be empty" in str(caught.value)
 
 
 def test_normalizes_all_input_line_endings_before_hashing_and_rendering(tmp_path: Path) -> None:
