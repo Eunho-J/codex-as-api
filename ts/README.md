@@ -113,3 +113,18 @@ the custom `codex_reasoning_delta` SSE event. The gateway does not fabricate
 Anthropic `thinking` blocks or signatures. `reasoning_content` is response-only;
 Chat request messages reject it rather than dropping an unrepresentable replay
 field.
+
+## Realtime voice (ChatGPT Live)
+
+This runtime also proxies ChatGPT Live realtime voice over the same OAuth login.
+`POST /v1/realtime/calls` takes a client-owned WebRTC SDP offer plus an optional
+`session` object (`instructions`, `voice`, ...), returns the SDP answer as
+`text/plain`, and mirrors the call id as `Location: /v1/realtime/calls/{call_id}`.
+The client keeps the media plane; the proxy never relays audio.
+`WS /v1/realtime/sideband/{call_id}` relays realtime events to
+`wss://api.openai.com/v1/live/{call_id}` for headless clients such as a bot or an
+observer attached to the same call.
+
+The Python and Rust runtimes stay HTTP-only in this release. Realtime is a
+TypeScript-only capability and is documented as such rather than claimed as
+cross-runtime parity.

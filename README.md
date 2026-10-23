@@ -430,6 +430,36 @@ Readiness check. It returns `200` only when OAuth is available, a fresh catalog 
 curl -i http://localhost:18080/health
 ```
 
+### `POST /v1/realtime/calls` (TypeScript)
+
+Creates a ChatGPT Live (realtime voice) call on the OAuth-authenticated ChatGPT
+backend. The client owns the media plane: it sends its own WebRTC SDP offer and
+applies the returned answer, so no audio is relayed through this proxy.
+
+The body is `{"sdp": "<offer>", "session": {...}}`. `session` may carry
+`instructions`, a `voice` (default `cove`), and any additional ChatGPT Live
+session field; `model` defaults to `gpt-live-1-codex`, and `delegation` defaults
+to `{"type": "client"}`. The route rejects unknown top-level fields and any
+client-chosen voice-session id (`id`, `session_id`, `voice_session_id`), because
+the backend denies calls that set those itself. On success it returns `201` with
+the SDP answer as `text/plain` and a mirror `Location: /v1/realtime/calls/{call_id}`.
+
+```bash
+curl -i http://localhost:18080/v1/realtime/calls \
+  -H "Content-Type: application/json" \
+  -d '{"sdp": "v=0\r\n...", "session": {"instructions": "Reply briefly."}}'
+```
+
+### `WS /v1/realtime/sideband/{call_id}` (TypeScript)
+
+Relays a WebSocket to the OpenAI realtime sideband of an already-created call
+(`wss://api.openai.com/v1/live/{call_id}`) with the account's OAuth headers, so a
+headless client — a bot, a server-side agent, or an observer attached to the same
+call — can read and write realtime events without running the media plane.
+Frames, text and binary, are forwarded verbatim; the proxy does not rewrite or
+invent session events. Browser clients that already hold the `oai-events` data
+channel do not need this route.
+
 ## Codex-Specific Features
 
 These features are extensions beyond the standard OpenAI API, designed for Codex CLI compatibility.
@@ -779,6 +809,7 @@ The provider handles:
 - Bounded, account-scoped `previous_response_id` history replay over private HTTP
 - Multimodal Chat input, image generation/inspection, and capability-gated classic `original` detail
 - Remote conversation compaction
+- ChatGPT Live realtime call creation and a sideband event relay, in the TypeScript runtime only
 
 ## Release & package publishing
 
@@ -808,9 +839,9 @@ registry setup is still required:
 After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-python scripts/check_package_versions.py --tag v0.7.0
-git tag v0.7.0
-git push origin v0.7.0
+python scripts/check_package_versions.py --tag v0.8.0
+git tag v0.8.0
+git push origin v0.8.0
 ```
 
 ## Tests
@@ -840,6 +871,20 @@ npm test
 
 
 ## Release Notes
+
+### v0.8.0
+
+- Add ChatGPT Live realtime voice to the TypeScript runtime: `POST
+  /v1/realtime/calls` creates an OAuth-authorized call from a client-owned WebRTC
+  SDP offer and returns the SDP answer, and `WS /v1/realtime/sideband/{call_id}`
+  relays the OpenAI realtime event sideband for headless clients. Audio stays on
+  the client's media plane.
+- Mirror the pinned Codex call contract exactly: one identity in
+  `x-session-id`/`session-id`/`thread-id`, the `openai-alpha: quicksilver=v2`
+  handshake, `intent=quicksilver&architecture=avas`, and a session payload that
+  never chooses its own voice-session id.
+- Document realtime as a TypeScript-only capability; Python and Rust remain
+  HTTP-only in this release instead of claiming cross-runtime parity.
 
 ### v0.7.0
 

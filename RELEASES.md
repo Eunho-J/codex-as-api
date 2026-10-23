@@ -1,5 +1,30 @@
 # Release Notes
 
+## v0.8.0
+
+### ChatGPT Live realtime voice (TypeScript)
+
+- Add `POST /v1/realtime/calls` to the TypeScript runtime. A client-owned WebRTC
+  SDP offer plus an optional `session` object (`instructions`, `voice`, ...) is
+  exchanged for the ChatGPT backend's SDP answer; the call id is returned both in
+  the mirrored `Location: /v1/realtime/calls/{call_id}` header and as
+  `x-realtime-call-id`, and the answer body is `text/plain`, never JSON.
+- Add `WS /v1/realtime/sideband/{call_id}`, which relays text and binary realtime
+  frames to `wss://api.openai.com/v1/live/{call_id}` with the account's OAuth
+  headers so headless clients (bots, server-side agents, observers) can attach to
+  an existing call. The proxy does not proxy RTP; the media plane stays client-side.
+- Send the exact call contract the backend authorizes for OAuth: `version`,
+  `openai-alpha: quicksilver=v2`, `session-id`/`x-session-id`/`thread-id` carrying
+  one minted identity, and `intent=quicksilver&architecture=avas`. Reject unknown
+  top-level request fields and any client-chosen voice-session id (`id`,
+  `session_id`, `voice_session_id`) instead of forwarding a call the backend
+  denies.
+- Default `model` to `gpt-live-1-codex`, `voice` to `cove`, and `delegation` to
+  `{"type": "client"}`.
+- Realtime is TypeScript-only in this release. The Python and Rust runtimes keep
+  their existing HTTP surface, and the runtime difference is stated in
+  `README.md` and `ts/README.md` rather than presented as parity.
+
 ## v0.7.0
 
 ### Live authenticated model catalog

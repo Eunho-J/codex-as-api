@@ -191,3 +191,60 @@ User words, verbatim:
 - Cross-runtime integration, error, package-content, and account-isolation tests
 - `README.md`, `ts/README.md`, `RELEASES.md`, package metadata, and release
   workflows
+
+## D-004: Realtime (ChatGPT Live) proxy scope
+
+Status: APPROVED
+
+### Evidence
+
+User words, verbatim:
+
+> codex-as-api 쪽에 realtime 프록시를 넣고 싶은 거면 그건 다른 작업이니 말해줘. -> 이거부터 하자
+
+> 이 레포 내꺼니까, 필요하면 업데이트하고 배포하자
+
+Verified wire evidence (2026-10-23): an OAuth-authenticated ChatGPT account
+can create a realtime call only with `POST
+https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas`,
+the `version` + `openai-alpha: quicksilver=v2` headers, one identity carried in
+`x-session-id`/`session-id`/`thread-id`, and a session payload that does **not**
+choose its own voice-session id. The returned SDP answer reaches ICE
+`connected` and the `oai-events` data channel delivers `session.started`.
+The server-side event sideband lives on `wss://api.openai.com/v1/live/{call_id}`,
+not on the ChatGPT backend host.
+
+### Decision
+
+- Add `POST /v1/realtime/calls` and a sideband WebSocket relay
+  (`/v1/realtime/sideband/{call_id}`) to the TypeScript runtime, because the
+  consuming client (Scheherazade voice) is TypeScript.
+- Keep the media plane client-owned: the client sends its own SDP offer and
+  applies the returned answer, and the proxy never proxies RTP.
+- Mint one call identity per request and send it as `x-session-id`,
+  `session-id`, and `thread-id`; reject a caller-supplied voice-session id.
+- Default to model `gpt-live-1-codex` and voice `cove`, forward
+  `instructions`, and force `delegation: {type: "client"}` when the caller omits
+  it.
+- Relay sideband frames verbatim (text and binary) with OAuth headers only, and
+  expose the OpenAI call id so a client can attach a codex app-server or another
+  observer to the same call.
+- Leave the Python and Rust runtimes HTTP-only in this release and state that
+  difference in `README.md` and `RELEASES.md` rather than claiming parity.
+
+### Rejected Alternatives
+
+- Proxying RTP/media through the server: WebRTC belongs to the client, and a
+  server-side media plane would add latency, codecs, and a second failure mode.
+- Reusing the API-key realtime route (`https://api.openai.com/v1/realtime/calls`):
+  it rejects ChatGPT OAuth credentials.
+- Letting callers pick a voice-session id: the backend denies those calls.
+- Sending the sideband through the ChatGPT backend host: that path is 403.
+- Claiming a `model` request field: the live model is fixed by the call intent;
+  the proxy rejects unknown top-level fields instead of ignoring them.
+
+### Affected Components
+
+- `ts/src/realtime.ts`, `ts/src/server.ts`, `ts/src/index.ts`, `ts/package.json`
+- `ts/src/__tests__/realtime.test.ts`
+- `README.md`, `ts/README.md`, `RELEASES.md`, package metadata

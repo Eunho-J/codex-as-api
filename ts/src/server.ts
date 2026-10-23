@@ -44,6 +44,12 @@ import {
 } from "./model-capabilities.js";
 import { countO200kOrdinaryTokens } from "./o200k-tokenizer.js";
 import { normalizeFinishReason } from "./protocol.js";
+import {
+  attachRealtimeSideband,
+  createRealtimeCall,
+  REALTIME_CALL_ROUTE,
+  type RealtimeCallSessionPayload,
+} from "./realtime.js";
 import { decodeUtf8Strict, parseJsonStrict } from "./utf8-json.js";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -129,6 +135,11 @@ const CHAT_COMPLETION_FIELDS = new Set<string>([
   "prompt_cache_options",
   "multi_agent",
   "programmatic_tool_calling",
+]);
+
+const REALTIME_CALL_FIELDS = new Set<string>([
+  "sdp",
+  "session",
 ]);
 
 const IMAGE_GENERATION_FIELDS = new Set<string>([
@@ -659,6 +670,38 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           use_responses_lite: entry.useResponsesLite,
         })),
       });
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
+  app.post(REALTIME_CALL_ROUTE, async (req: Request, res: Response) => {
+    try {
+      const body = requireRequestBody(req.body);
+      assertAllowedTopLevelFields(body, REALTIME_CALL_FIELDS, REALTIME_CALL_ROUTE);
+      const session = body.session;
+      if (
+        session !== undefined
+        && (session === null || typeof session !== "object" || Array.isArray(session))
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError("`session` must be a JSON object");
+      }
+      const result = await createRealtimeCall({
+        sdp: body.sdp as string,
+        session: session as RealtimeCallSessionPayload | undefined,
+        authPath,
+      });
+      res
+        .status(201)
+        .set({
+          Location: result.location,
+          "Content-Type": "text/plain; charset=utf-8",
+          "x-session-id": result.sessionId,
+          "session-id": result.sessionId,
+          "thread-id": result.threadId,
+          "x-realtime-call-id": result.callId,
+        })
+        .end(result.sdp);
     } catch (err) {
       handleError(err, res);
     }
@@ -3085,7 +3128,10 @@ export function main(): void {
   const app = createApp();
   const host = resolveServerHost();
   const port = resolveServerPort();
-  app.listen(port, host, () => {
+  const server = app.listen(port, host, () => {
     console.log(`codex-as-api listening on ${host}:${port}`);
+  });
+  attachRealtimeSideband(server, {
+    authPath: process.env.CODEX_AS_API_AUTH_PATH,
   });
 }

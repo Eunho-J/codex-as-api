@@ -10,6 +10,21 @@ export {
 } from "./provider.js";
 export { createApp, main, type CreateAppOptions } from "./server.js";
 export {
+  DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_VOICE,
+  REALTIME_CALL_ROUTE,
+  REALTIME_SIDEBAND_BASE_URL,
+  REALTIME_SIDEBAND_ROUTE_PREFIX,
+  attachRealtimeSideband,
+  createRealtimeCall,
+  relayRealtimeSideband,
+  resolveRealtimeBaseUrl,
+  resolveRealtimeSidebandUrl,
+  type CreateRealtimeCallOptions,
+  type RealtimeCallResult,
+  type RealtimeCallSessionPayload,
+} from "./realtime.js";
+export {
   ChatGPTOAuthError,
   ChatGPTOAuthInvalidRequestError,
   ChatGPTOAuthMissingError,
