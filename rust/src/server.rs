@@ -1938,9 +1938,10 @@ fn anthropic_service_tier(body: &Value) -> Result<Option<String>, ProviderError>
         None | Some(Value::Null) => return Ok(service_tier),
         Some(Value::String(speed)) if speed == "fast" => ("fast", &["fast", "priority"]),
         Some(Value::String(speed)) if speed == "standard" => ("default", &["default"]),
+        Some(Value::String(speed)) if speed == "ultrafast" => ("ultrafast", &["ultrafast"]),
         Some(_) => {
             return Err(ProviderError::InvalidRequest(
-                "speed must be one of: fast, standard".to_string(),
+                "speed must be one of: fast, standard, ultrafast".to_string(),
             ));
         }
     };
@@ -5366,6 +5367,32 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::Semaphore;
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn ultrafast_speed_resolves_without_downgrade_or_conflicts() {
+        for body in [
+            json!({"speed":"ultrafast"}),
+            json!({"speed":"ultrafast","service_tier":"ultrafast"}),
+            json!({"service_tier":"ultrafast"}),
+        ] {
+            assert_eq!(
+                anthropic_service_tier(&body).unwrap().as_deref(),
+                Some("ultrafast")
+            );
+        }
+        for body in [
+            json!({"speed":"ultrafast","service_tier":"priority"}),
+            json!({"speed":"fast","service_tier":"ultrafast"}),
+            json!({"speed":"standard","service_tier":"ultrafast"}),
+            json!({"speed":{}}),
+            json!({"speed":[]}),
+        ] {
+            assert!(matches!(
+                anthropic_service_tier(&body),
+                Err(ProviderError::InvalidRequest(_))
+            ));
+        }
+    }
 
     #[test]
     fn positive_integer_controls_accept_integral_json_number_forms() {

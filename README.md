@@ -537,6 +537,23 @@ The mapping is intentionally transport-aware:
 | `previous_response_id` | Resolve locally and replay complete Response history over HTTP |
 | `service_tier: "fast"` | Send `service_tier: "priority"` |
 | `service_tier: "default"` | Omit the field |
+| `service_tier: "ultrafast"` | Send `service_tier: "ultrafast"` only when the live model advertises it |
+| Messages/compact `speed: "ultrafast"` (proxy extension) | Resolve to `service_tier: "ultrafast"`, with the same catalog check |
+
+Ultra Fast is distinct from Fast (`priority`), not a reasoning effort. For OpenAI
+Chat requests use `"service_tier": "ultrafast"`; for `/v1/messages` and
+`/v1/messages/compact` either that field or the proxy extension
+`"speed": "ultrafast"` is accepted. If both fields are supplied they must agree.
+Unsupported tiers return HTTP 400 before an inference request, including streaming
+requests; the proxy never silently downgrades Ultra Fast to priority. Check the
+account-specific `service_tiers` returned by `GET /v1/models`. An official feature
+flag does not grant account access or change pricing. `speed: "ultrafast"` is not
+claimed as an official Anthropic field, and existing `speed: "fast"` behavior is
+unchanged. The proxy does not inherit speed defaults from Codex config.
+
+Official behavior reference: Codex [0.164.0 service-tier resolution](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/tui/src/service_tier_resolution.rs)
+and [stable, enabled-by-default ultrafast feature](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/features/src/lib.rs).
+The rest of the private HTTP contract remains pinned to 0.153.3.
 
 Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the Codex 0.153.3 [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/b1a547b1f73ce86205d9222ac19cff334b3b7a2e/codex-rs/codex-api/src/common.rs#L275-L350).
 

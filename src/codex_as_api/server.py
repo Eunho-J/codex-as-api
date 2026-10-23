@@ -271,10 +271,10 @@ def _anthropic_service_tier(body: dict[str, Any]) -> str | None:
     speed = body.get("speed")
     if speed is None:
         return cast(str | None, service_tier)
-    if speed not in {"fast", "standard"}:
-        raise ChatGPTOAuthInvalidRequestError("speed must be one of: fast, standard")
-    speed_tier = "fast" if speed == "fast" else "default"
-    equivalent_tiers = {"fast", "priority"} if speed == "fast" else {"default"}
+    if not isinstance(speed, str) or speed not in {"fast", "standard", "ultrafast"}:
+        raise ChatGPTOAuthInvalidRequestError("speed must be one of: fast, standard, ultrafast")
+    speed_tier = "default" if speed == "standard" else speed
+    equivalent_tiers = {"fast", "priority"} if speed == "fast" else {speed_tier}
     if service_tier is not None and service_tier not in equivalent_tiers:
         raise ChatGPTOAuthInvalidRequestError("speed conflicts with service_tier")
     return speed_tier
@@ -497,7 +497,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="0.8.0",
+    version="0.8.1",
 )
 
 

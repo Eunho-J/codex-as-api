@@ -6527,7 +6527,7 @@ mod tests {
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
         assert!(user_agent.starts_with("codex_cli_rs/0.153.3 ("));
-        assert!(user_agent.ends_with(") codex-as-api/0.8.0"));
+        assert!(user_agent.ends_with(") codex-as-api/0.8.1"));
     }
 
     #[test]

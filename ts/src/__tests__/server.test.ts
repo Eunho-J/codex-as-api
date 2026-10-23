@@ -248,6 +248,7 @@ async function withRecordingUpstream(
     requests: RecordedRequest[],
     catalogRequests: RecordedCatalogRequest[],
   ) => Promise<void>,
+  catalogValue: unknown = TEST_CATALOG_VALUE,
 ): Promise<void> {
   const requests: RecordedRequest[] = [];
   const catalogRequests: RecordedCatalogRequest[] = [];
@@ -298,7 +299,7 @@ async function withRecordingUpstream(
         "content-type": "application/json",
         [upstreamContract.models_request.etag_header]: '"test-catalog"',
       });
-      res.end(JSON.stringify(TEST_CATALOG_VALUE));
+      res.end(JSON.stringify(catalogValue));
       return;
     }
     const chunks: Buffer[] = [];
@@ -3382,6 +3383,9 @@ describe("Anthropic compatibility helper routes", () => {
         { speed: "fast" },
         { speed: "standard" },
         { speed: "fast", service_tier: "priority" },
+        { speed: "ultrafast" },
+        { speed: "ultrafast", service_tier: "ultrafast" },
+        { service_tier: "ultrafast" },
       ]) {
         const response = await fetch(`${baseUrl}/v1/messages`, {
           method: "POST",
@@ -3398,10 +3402,14 @@ describe("Anthropic compatibility helper routes", () => {
         });
         assert.equal(response.status, 200);
       }
-      assert.deepEqual(serviceTiers, ["fast", "default", "fast"]);
+      assert.deepEqual(serviceTiers, ["fast", "default", "fast", "ultrafast", "ultrafast", "ultrafast"]);
 
       for (const fields of [
         { speed: "fast", service_tier: "default" },
+        { speed: "ultrafast", service_tier: "priority" },
+        { speed: "fast", service_tier: "ultrafast" },
+        { speed: "standard", service_tier: "ultrafast" },
+        { speed: {} },
         { speed: "warp" },
       ]) {
         const response = await fetch(`${baseUrl}/v1/messages`, {
@@ -3422,8 +3430,50 @@ describe("Anthropic compatibility helper routes", () => {
         assert.equal(body.type, "error");
         assert.equal(body.error.type, "invalid_request_error");
       }
-      assert.deepEqual(serviceTiers, ["fast", "default", "fast"]);
+      assert.deepEqual(serviceTiers, ["fast", "default", "fast", "ultrafast", "ultrafast", "ultrafast"]);
     }, { model: "gpt-5.5" });
+  });
+
+  it("sends ultrafast unchanged on messages, streams and compact only when advertised", async () => {
+    const auth = writeAuthFile();
+    try {
+      for (const advertised of [true, false]) {
+        const catalog = structuredClone(TEST_CATALOG_VALUE);
+        if (advertised) {
+          for (const model of catalog.models) {
+            model.service_tiers = [{ id: "ultrafast", name: "Ultra Fast", description: "Ultra Fast" }];
+          }
+        }
+        await withRecordingUpstream(async (upstreamUrl, requests) => {
+          const provider = new ChatGPTOAuthProvider({
+            model: "gpt-5.5", baseUrl: upstreamUrl, authJsonPath: auth.authPath,
+          });
+          await withServer(provider, async (baseUrl) => {
+            for (const [route, stream] of [
+              ["/v1/messages", false], ["/v1/messages", true], ["/v1/messages/compact", false],
+            ] as const) {
+              const response = await fetch(`${baseUrl}${route}`, {
+                method: "POST", headers: {
+                  "content-type": "application/json", "x-claude-code-session-id": "ultrafast-test",
+                },
+                body: JSON.stringify({ model: "gpt-5.5", max_tokens: 64,
+                  messages: [{ role: "user", content: "hello" }], speed: "ultrafast",
+                  ...(route === "/v1/messages" ? { stream } : {}) }),
+              });
+              assert.equal(response.status, advertised ? 200 : 400, `${route}: ${await response.clone().text()}`);
+              await response.text();
+            }
+            assert.equal(requests.length, advertised ? 3 : 0);
+            for (const request of requests) {
+              assert.equal(request.body.service_tier, "ultrafast");
+              assert.equal(Object.hasOwn(request.body, "speed"), false);
+            }
+          }, { model: "gpt-5.5", authPath: auth.authPath });
+        }, catalog);
+      }
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
   });
 
   it("maps Anthropic parallel control through the real provider", async () => {

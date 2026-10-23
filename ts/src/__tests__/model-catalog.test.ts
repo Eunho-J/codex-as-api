@@ -25,6 +25,18 @@ import {
 import { MessageRole } from "../messages.js";
 import { ChatGPTOAuthProvider } from "../provider.js";
 
+it("preserves catalog-listed ultrafast and rejects it when not advertised", () => {
+  const model = parseModelCatalog({ models: [rawModel("tier-test", {
+    service_tiers: [{ id: "ultrafast", name: "Ultra Fast", description: "Ultra Fast" }],
+  })] }, { key: "tier-test", etag: null, fetchedAt: 0, expiresAt: 60 }).models[0]!;
+  const payload: Record<string, unknown> = {};
+  applyModelCapabilityFields(payload, model, undefined, "ultrafast");
+  assert.equal(payload.service_tier, "ultrafast");
+  assert.throws(() => applyModelCapabilityFields({}, {
+    ...model, serviceTiers: [{ id: "priority", name: "Fast", description: "Fast" }],
+  }, undefined, "ultrafast"), /service_tier/);
+});
+
 function rawModel(
   slug: string,
   overrides: Record<string, unknown> = {},

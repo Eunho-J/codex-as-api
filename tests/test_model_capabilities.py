@@ -89,6 +89,24 @@ def test_catalog_parser_diagnostics_do_not_reflect_slug_or_modality_values(
     assert parsed.models[0].input_modalities == ("audio", "text")
 
 
+def test_ultrafast_preserves_live_tier_and_rejects_unavailable(model_catalog_document) -> None:
+    document = deepcopy(model_catalog_document)
+    document["models"][0]["service_tiers"] = [
+        {"id": "ultrafast", "name": "Ultra Fast", "description": "Ultra Fast"},
+    ]
+    capability = _parse(document).models[0]
+    payload = {}
+    apply_model_capability_fields(
+        payload, capability=capability, text=None, service_tier="ultrafast",
+    )
+    assert payload["service_tier"] == "ultrafast"
+    unavailable = _parse(model_catalog_document).models[0]
+    with pytest.raises(ValueError, match="service_tier"):
+        apply_model_capability_fields(
+            {}, capability=unavailable, text=None, service_tier="ultrafast",
+        )
+
+
 def test_invalid_model_control_diagnostics_do_not_reflect_values(
     model_catalog_document,
 ) -> None:

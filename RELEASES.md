@@ -1,5 +1,23 @@
 # Release Notes
 
+## v0.8.1
+
+### Explicit Ultra Fast selection (all runtimes)
+
+- Accept `speed: "ultrafast"` as a proxy extension on Anthropic Messages and
+  compact routes and forward the literal Codex `service_tier: "ultrafast"`.
+  Direct `service_tier` selection remains supported on Chat and Messages.
+- Preserve live account/model tier validation: unavailable Ultra Fast is HTTP
+  400 before inference/streaming headers, never a silent downgrade to priority.
+  Reject conflicting speed/tier inputs; keep Fast and standard behavior unchanged.
+- Add cross-runtime mapping and capability regression tests, including HTTP
+  recording-backend tests. Malformed Python speed objects/arrays now return
+  invalid-request errors instead of causing an unhashable-type failure.
+- Keep TOML config imports type-checkable on current Python while preserving
+  Python 3.10 support; include `tomli` in dev dependencies for the 3.10 analysis target.
+- Document Ultra Fast separately from priority and reasoning effort. No model
+  support, account entitlement, pricing or config speed default is invented.
+
 ## v0.8.0
 
 ### ChatGPT Live realtime voice (TypeScript)

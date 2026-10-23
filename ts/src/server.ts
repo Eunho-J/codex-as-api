@@ -2471,15 +2471,15 @@ function resolveAnthropicServiceTier(
 
   const speed = body.speed;
   if (speed == null) return serviceTier as string | undefined;
-  if (speed !== "fast" && speed !== "standard") {
+  if (speed !== "fast" && speed !== "standard" && speed !== "ultrafast") {
     throw new ChatGPTOAuthInvalidRequestError(
-      "speed must be one of: fast, standard",
+      "speed must be one of: fast, standard, ultrafast",
     );
   }
-  const speedTier = speed === "fast" ? "fast" : "default";
+  const speedTier = speed === "standard" ? "default" : speed;
   const equivalentTiers = speed === "fast"
     ? new Set(["fast", "priority"])
-    : new Set(["default"]);
+    : new Set([speedTier]);
   if (serviceTier != null && !equivalentTiers.has(serviceTier)) {
     throw new ChatGPTOAuthInvalidRequestError(
       "speed conflicts with service_tier",

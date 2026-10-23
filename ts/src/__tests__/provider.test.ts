@@ -3191,7 +3191,7 @@ describe("Codex CLI request headers", () => {
     const headers = codexCliHeadersForVersion();
 
     assert.equal(headers.originator, "codex_cli_rs");
-    assert.match(headers["User-Agent"], /^codex_cli_rs\/0\.153\.3 \(.+\) codex-as-api\/0\.8\.0$/);
+    assert.match(headers["User-Agent"], /^codex_cli_rs\/0\.153\.3 \(.+\) codex-as-api\/0\.8\.1$/);
   });
 
   it("rejects invalid and arbitrary compatibility versions", () => {

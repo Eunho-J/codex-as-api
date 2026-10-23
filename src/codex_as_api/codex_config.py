@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-    import tomli as tomllib  # type: ignore[import-not-found]
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 
 _JS_SAFE_INTEGER = 9_007_199_254_740_991

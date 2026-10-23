@@ -322,6 +322,23 @@ mod tests {
     }
 
     #[test]
+    fn ultrafast_is_preserved_only_when_advertised() {
+        let mut model = live_model(false, true);
+        let mut payload = serde_json::Map::new();
+        assert!(
+            apply_model_capability_fields(&mut payload, &model, None, Some("ultrafast")).is_err()
+        );
+        assert!(!payload.contains_key("service_tier"));
+        model.service_tiers.push(crate::model_catalog::ServiceTier {
+            id: "ultrafast".to_string(),
+            name: "Ultra Fast".to_string(),
+            description: "Ultra Fast".to_string(),
+        });
+        apply_model_capability_fields(&mut payload, &model, None, Some("ultrafast")).unwrap();
+        assert_eq!(payload["service_tier"], "ultrafast");
+    }
+
+    #[test]
     fn default_service_tier_is_omitted() {
         let model = live_model(false, true);
         let mut payload = serde_json::Map::new();
