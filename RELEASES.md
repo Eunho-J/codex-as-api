@@ -1,5 +1,15 @@
 # Release Notes
 
+## v0.9.1
+
+### TypeScript dependency security updates
+
+- Update Express to the 5.3 series and smol-toml to the 1.9.1 series.
+- Refresh the lockfile to body-parser 2.4.0, proxy-addr 2.0.8 and qs 6.16.1,
+  addressing the reported request-parser, IP-trust and TOML-parser advisories.
+- Keep Python, TypeScript and Rust package versions aligned. No API or reasoning
+  continuity behavior changes are included in this patch.
+
 ## v0.9.0
 
 ### Encrypted reasoning continuity

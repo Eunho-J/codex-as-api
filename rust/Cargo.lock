@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "codex-as-api"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "axum",
  "base64",
