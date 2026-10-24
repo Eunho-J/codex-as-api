@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-as-api"
-version = "0.8.3"
+version = "0.9.0"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -47,12 +47,14 @@ packages = ["src/codex_as_api"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "config/codex-upstream-contract.json" = "codex_as_api/codex-upstream-contract.json"
+"config/verified-hidden-models.json" = "codex_as_api/verified-hidden-models.json"
 "config/o200k_base.tiktoken" = "codex_as_api/o200k_base.tiktoken"
 "THIRD_PARTY_NOTICES.md" = "codex_as_api/THIRD_PARTY_NOTICES.md"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "/config/codex-upstream-contract.json",
+    "/config/verified-hidden-models.json",
     "/config/o200k_base.tiktoken",
     "/src/codex_as_api",
     "/scripts",

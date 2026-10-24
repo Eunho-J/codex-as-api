@@ -1,5 +1,14 @@
 export {
   ChatGPTOAuthProvider,
+  CODEX_CLI_ORIGINATOR,
+  CodexVersionResolver,
+  type CodexVersionProvider,
+  codexCliHeadersForVersion,
+  codexUserAgentForVersion,
+  defaultCodexVersionResolver,
+  resolveCodexCliHeaders,
+  resolveCodexCliVersion,
+  resolveLatestCodexVersion,
   type ChatOptions,
   type ReasoningOptions,
   type PromptCacheOptions,
@@ -71,3 +80,17 @@ export {
   anthropicStreamAdapter,
   formatAnthropicError,
 } from "./anthropic-adapter.js";
+export {
+  REASONING_SIGNATURE_PREFIX,
+  REASONING_SIGNATURE_VERSION,
+  REASONING_COMPATIBLE_MODELS,
+  encodeReasoningSignature,
+  decodeReasoningSignature,
+  isReasoningModelCompatible,
+  validateReplayableReasoningItem,
+  type ReasoningSummaryTextPart,
+  type ReasoningTextContentPart,
+  type ReplayableReasoningItem,
+  type ReasoningSignatureEnvelope,
+  type AssistantReasoningItem,
+} from "./reasoning-signature.js";

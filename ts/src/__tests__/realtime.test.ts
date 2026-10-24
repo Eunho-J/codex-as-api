@@ -139,6 +139,7 @@ describe("realtime call creation", () => {
         authPath,
         baseUrl: upstream.baseUrl,
         sessionId: "session-fixed",
+        versionResolver: () => "0.205.0",
       });
 
       assert.equal(result.callId, "rtc_test123");
@@ -158,7 +159,8 @@ describe("realtime call creation", () => {
       assert.equal(request.headers["chatgpt-account-id"], "account-123");
       assert.equal(String(request.headers.authorization).startsWith("Bearer "), true);
       assert.equal(request.headers["content-type"], "application/json");
-      assert.equal(typeof request.headers.version, "string");
+      assert.equal(request.headers.version, "0.205.0");
+      assert.equal(String(request.headers["user-agent"]).startsWith("codex_cli_rs/0.205.0 ("), true);
 
       const session = request.body.session as Record<string, unknown>;
       assert.equal(session.model, DEFAULT_REALTIME_MODEL);
@@ -183,6 +185,7 @@ describe("realtime call creation", () => {
         sdp: OFFER,
         authPath,
         baseUrl: upstream.baseUrl,
+        versionResolver: () => "0.164.0",
       });
       assert.equal(result.callId, "rtc_abc_123");
     } finally {
@@ -195,15 +198,15 @@ describe("realtime call creation", () => {
     const { authPath, directory } = writeAuthFile();
     try {
       await assert.rejects(
-        createRealtimeCall({ sdp: "not-sdp", authPath }),
+        createRealtimeCall({ sdp: "not-sdp", authPath, versionResolver: () => "0.164.0" }),
         ChatGPTOAuthInvalidRequestError,
       );
       await assert.rejects(
-        createRealtimeCall({ sdp: "", authPath }),
+        createRealtimeCall({ sdp: "", authPath, versionResolver: () => "0.164.0" }),
         ChatGPTOAuthInvalidRequestError,
       );
       await assert.rejects(
-        createRealtimeCall({ sdp: "v=0\r\n", authPath, session: [] as never }),
+        createRealtimeCall({ sdp: "v=0\r\n", authPath, session: [] as never, versionResolver: () => "0.164.0" }),
         ChatGPTOAuthInvalidRequestError,
       );
     } finally {
@@ -217,7 +220,12 @@ describe("realtime call creation", () => {
     upstream.setResponse(403, "Voice session access denied.");
     try {
       await assert.rejects(
-        createRealtimeCall({ sdp: OFFER, authPath, baseUrl: upstream.baseUrl }),
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl: upstream.baseUrl,
+          versionResolver: () => "0.164.0",
+        }),
         (err: unknown) => {
           assert.ok(err instanceof ChatGPTOAuthUpstreamError);
           assert.equal(err.status, 403);
@@ -300,6 +308,7 @@ describe("POST /v1/realtime/calls", () => {
       model: "gpt-5.5",
       codexConfig: TEST_CONFIG,
       authPath,
+      versionResolver: () => "0.205.0",
     });
     server = await new Promise<Server>((resolve) => {
       const listening = app.listen(0, "127.0.0.1", () => resolve(listening));

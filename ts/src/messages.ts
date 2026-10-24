@@ -1,3 +1,5 @@
+import type { AssistantReasoningItem } from "./reasoning-signature.js";
+
 export enum MessageRole {
   SYSTEM = "system",
   DEVELOPER = "developer",
@@ -41,6 +43,7 @@ export interface Message {
   tool_call_id?: string;
   name?: string;
   reasoning_content?: string;
+  reasoning_items?: AssistantReasoningItem[];
   images?: string[];
   structured_content?: MessageContentPart[];
 }
@@ -61,6 +64,7 @@ export interface AssistantResponse {
   finish_reason: FinishReason;
   usage: Usage | null;
   reasoning_content: string | null;
+  reasoning_items?: AssistantReasoningItem[];
   raw: Record<string, unknown> | null;
   response_id?: string | null;
 }

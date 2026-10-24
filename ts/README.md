@@ -59,6 +59,20 @@ This behavior was rechecked against Codex `0.153.3` at
 `b1a547b1f73ce86205d9222ac19cff334b3b7a2e`; Claude Code compatibility was
 last checked with `2.1.220`.
 
+## Client identity and hidden experimental models
+
+Outbound Codex client identity follows the stable `latest` version of npm
+`@openai/codex`, rather than the historical protocol reference above. Catalog
+queries and request headers use the same resolved version.
+
+The effective model catalog also explicitly includes the verified hidden models
+`gpt-6-chat-thinking`, `gpt-reserve`, and `codex-auto-review`. **Their upstream
+support can stop at any time. If one stops responding, [open an issue](https://github.com/Eunho-J/codex-as-api/issues)
+with its ID and a sanitized error; we will remove the discontinued entry.** Never
+post credentials. These experimental entries are not automatic defaults; current
+live capability metadata takes precedence. See the repository README for observed
+purposes and the basic authenticated conversation/tool/coding checks.
+
 ## Claude Code with GPT
 
 Start `codex-as-api` with the desired live Codex model:

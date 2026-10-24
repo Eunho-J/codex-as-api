@@ -8,7 +8,17 @@ from copy import deepcopy
 
 import pytest
 
+from codex_as_api.codex_version import reset_codex_version_cache
 from codex_as_api.model_capabilities import parse_model_catalog
+
+
+@pytest.fixture(autouse=True)
+def _offline_codex_version_resolver():
+    reset_codex_version_cache(
+        fetch=lambda _url, _timeout: b'{"name":"@openai/codex","version":"0.164.0"}'
+    )
+    yield
+    reset_codex_version_cache()
 
 
 def _make_jwt(payload: dict) -> str:
@@ -130,7 +140,7 @@ def model_catalog_snapshot(model_catalog_document):
     now = time.time()
     return parse_model_catalog(
         model_catalog_document,
-        key=("test-account", "https://example.test/codex", "0.153.3"),
+        key=("test-account", "https://example.test/codex", "0.164.0"),
         etag='"test-etag"',
         fetched_at=time.time(),
         expires_at=now + 3600,

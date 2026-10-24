@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import verifiedHiddenModelsConfig from "../../config/verified-hidden-models.json";
 import {
   ChatGPTOAuthCatalogUnavailableError,
   ChatGPTOAuthInvalidRequestError,
@@ -19,6 +20,15 @@ export const SESSION_ID_KEY = "session_id";
 export const THREAD_ID_KEY = "thread_id";
 export const TURN_ID_KEY = "turn_id";
 export const DEFAULT_MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+export const VERIFIED_HIDDEN_MODEL_WARNING =
+  "Experimental hidden model; upstream support may stop at any time.";
+
+const EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS = [
+  "gpt-6-chat-thinking",
+  "gpt-reserve",
+  "codex-auto-review",
+] as const;
+const VERIFIED_HIDDEN_MODEL_SLUGS = new Set<string>(EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS);
 
 type ResponsesLiteMode = "off" | "on" | "auto";
 
@@ -183,9 +193,9 @@ export function parseModelCatalog(
   if (rawModels == null) {
     throw new ChatGPTOAuthCatalogUnavailableError("upstream model catalog must be an object with a models array");
   }
-  const models = rawModels.map((raw, index) => parseModelInfo(raw, index));
+  const liveModels = rawModels.map((raw, index) => parseModelInfo(raw, index));
   const slugs = new Set<string>();
-  for (const model of models) {
+  for (const model of liveModels) {
     if (slugs.has(model.slug)) {
       throw new ChatGPTOAuthCatalogUnavailableError(
         "upstream model catalog contains a duplicate slug",
@@ -194,11 +204,21 @@ export function parseModelCatalog(
     slugs.add(model.slug);
   }
 
-  const orderedModels = models
+  const orderedModels = liveModels
     .map((model, index) => ({ model, index }))
     .sort((left, right) => left.model.priority - right.model.priority || left.index - right.index)
     .map(({ model }) => model);
-  const defaultModel = orderedModels.find((model) => model.visibility === "list") ?? null;
+  const defaultModel = orderedModels.find(
+    (model) => model.visibility === "list" && !VERIFIED_HIDDEN_MODEL_SLUGS.has(model.slug),
+  ) ?? null;
+  const models = [
+    ...liveModels.map((model) => (
+      VERIFIED_HIDDEN_MODEL_SLUGS.has(model.slug)
+        ? promoteVerifiedHiddenModel(model)
+        : model
+    )),
+    ...VERIFIED_HIDDEN_MODELS.filter((model) => !slugs.has(model.slug)),
+  ];
   const etag = typeof metadata.etag === "string" && metadata.etag.trim().length > 0
     ? metadata.etag.trim()
     : null;
@@ -208,10 +228,47 @@ export function parseModelCatalog(
     etag,
     fetchedAt: metadata.fetchedAt,
     expiresAt: metadata.expiresAt,
-    models: Object.freeze([...models]),
+    models: Object.freeze(models),
     defaultModel,
   });
 }
+
+function promoteVerifiedHiddenModel(model: ModelCapability): ModelCapability {
+  return Object.freeze({
+    ...model,
+    description: VERIFIED_HIDDEN_MODEL_WARNING,
+    visibility: "list",
+    supportedInApi: true,
+  });
+}
+
+function loadVerifiedHiddenModels(config: unknown): readonly ModelCapability[] {
+  const record = requireRecord(config, "verified-hidden-models");
+  requireNonEmptyString(record.verified_at, "verified-hidden-models.verified_at");
+  const warning = requireString(record.warning, "verified-hidden-models.warning");
+  if (warning !== VERIFIED_HIDDEN_MODEL_WARNING) {
+    throw new ChatGPTOAuthCatalogUnavailableError(
+      "verified-hidden-models.warning does not match the canonical warning",
+    );
+  }
+  const rawModels = requireArray(record.models, "verified-hidden-models.models");
+  if (rawModels.length !== EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS.length) {
+    throw new ChatGPTOAuthCatalogUnavailableError(
+      "verified-hidden-models.models must contain the three verified hidden models",
+    );
+  }
+  const models = rawModels.map((raw, index) => promoteVerifiedHiddenModel(parseModelInfo(raw, index)));
+  for (let index = 0; index < EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS.length; index++) {
+    if (models[index]?.slug !== EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS[index]) {
+      throw new ChatGPTOAuthCatalogUnavailableError(
+        "verified-hidden-models.models slugs do not match the canonical verified hidden models",
+      );
+    }
+  }
+  return Object.freeze(models);
+}
+
+const VERIFIED_HIDDEN_MODELS = loadVerifiedHiddenModels(verifiedHiddenModelsConfig);
 
 export function modelFromSnapshot(
   snapshot: ModelCatalogSnapshot,

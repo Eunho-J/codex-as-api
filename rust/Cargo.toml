@@ -1,6 +1,6 @@
 [package]
 name = "codex-as-api"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 license = "Apache-2.0"

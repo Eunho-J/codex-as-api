@@ -280,8 +280,11 @@ def test_models_returns_live_safe_metadata(client):
         "gpt-5.2",
         "gpt-5.3-codex",
         "gpt-5.3-codex-spark",
+        "gpt-6-chat-thinking",
+        "gpt-reserve",
+        "codex-auto-review",
     ]
-    assert models[-1]["supported_in_api"] is False
+    assert next(m for m in models if m["id"] == "gpt-5.3-codex-spark")["supported_in_api"] is False
     model = models[0]
     assert model["id"] == "gpt-5.6-sol"
     assert model["object"] == "model"
@@ -393,7 +396,11 @@ def test_models_exposes_an_empty_live_catalog_without_default_fallback(monkeypat
     health = test_client.get("/health")
 
     assert models.status_code == 200
-    assert models.json() == {"object": "list", "data": []}
+    assert [m["id"] for m in models.json()["data"]] == [
+        "gpt-6-chat-thinking",
+        "gpt-reserve",
+        "codex-auto-review",
+    ]
     assert health.status_code == 503
     assert health.json()["error"]["type"] == "catalog_unavailable"
 
@@ -688,7 +695,7 @@ def test_catalog_fetch_uses_pinned_query_and_oauth_headers(
     assert request["headers"]["authorization"].startswith("Bearer ")
     assert request["headers"]["chatgpt-account-id"] == "acc-123"
     assert request["headers"]["originator"] == "codex_cli_rs"
-    assert request["headers"]["user-agent"].startswith("codex_cli_rs/0.153.3 (")
+    assert request["headers"]["user-agent"].startswith("codex_cli_rs/0.164.0 (")
 
 
 def test_model_dependent_routes_reuse_one_fresh_catalog_snapshot(
@@ -6173,3 +6180,515 @@ def test_anthropic_stream_preflight_returns_json_error_before_upstream_request(
         },
     }
     assert recording_backend.requests.empty()
+
+
+def test_anthropic_messages_two_turn_signed_reasoning_roundtrip_and_cross_model_filter(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+    from codex_as_api.reasoning_signature import (
+        decode_reasoning_signature,
+        encode_reasoning_signature,
+    )
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.6-sol")
+
+    orig_post_sse = server_mod._provider._post_sse
+
+    def turn1_sse(path: str, payload: dict[str, Any], extra_headers: Any = None):
+        recording_backend.requests.put({"path": path, "body": payload})
+        del extra_headers
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "reasoning", "id": "rs_turn1", "summary": []},
+        }
+        yield {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_turn1",
+            "summary_index": 0,
+            "delta": "Inspecting city weather.",
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_turn1",
+                "status": "completed",
+                "encrypted_content": "enc_turn1_blob",
+                "summary": [{"type": "summary_text", "text": "Inspecting city weather."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Calling weather tool."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_weather_1",
+                "name": "get_weather",
+                "arguments": '{"city":"Seoul"}',
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-turn-1",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 6,
+                    "total_tokens": 16,
+                    "input_tokens_details": {"cached_tokens": 0},
+                },
+            },
+        }
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", turn1_sse)
+
+    turn1 = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Weather lookup",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ],
+            "messages": [{"role": "user", "content": "Weather in Seoul?"}],
+        },
+    )
+    assert turn1.status_code == 200
+    turn1_body = turn1.json()
+    assert turn1_body["model"] == "claude-sonnet-4-5"
+    assert [block["type"] for block in turn1_body["content"]] == ["thinking", "text", "tool_use"]
+    thinking_block = turn1_body["content"][0]
+    assert thinking_block["thinking"] == "Inspecting city weather."
+    assert thinking_block["signature"].startswith("codex-reasoning-v1:")
+    assert decode_reasoning_signature(thinking_block["signature"]) == {
+        "v": 1,
+        "model": "gpt-5.6-sol",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_turn1",
+            "encrypted_content": "enc_turn1_blob",
+            "summary": [{"type": "summary_text", "text": "Inspecting city weather."}],
+        },
+    }
+    _ = recording_backend.requests.get_nowait()
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", orig_post_sse)
+
+    other_model_sig = encode_reasoning_signature(
+        model="gpt-5.5",
+        item={
+            "type": "reasoning",
+            "id": "rs_other",
+            "encrypted_content": "enc_other_blob",
+            "summary": [{"type": "summary_text", "text": "Other model reasoning"}],
+        },
+    )
+
+    turn2 = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Weather lookup",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Weather in Seoul?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        thinking_block,
+                        {"type": "thinking", "thinking": "Other", "signature": other_model_sig},
+                        {"type": "thinking", "thinking": "Foreign", "signature": "sig-foreign"},
+                        turn1_body["content"][1],
+                        turn1_body["content"][2],
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_weather_1",
+                            "content": '{"temp_c":20}',
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    assert turn2.status_code == 200
+    recorded_turn2 = recording_backend.requests.get_nowait()
+    turn2_payload = recorded_turn2["body"]
+    assert turn2_payload["store"] is False
+    assert "previous_response_id" not in turn2_payload
+    non_dev_items = [
+        item
+        for item in turn2_payload["input"]
+        if not (item.get("role") == "developer" or item.get("type") == "additional_tools")
+    ]
+    assert [item["type"] for item in non_dev_items] == [
+        "message",
+        "reasoning",
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+    assert non_dev_items[1] == {
+        "type": "reasoning",
+        "id": "rs_turn1",
+        "encrypted_content": "enc_turn1_blob",
+        "summary": [{"type": "summary_text", "text": "Inspecting city weather."}],
+    }
+
+
+@pytest.mark.parametrize("route", ["/v1/messages", "/v1/messages/count_tokens", "/v1/messages/compact"])
+def test_anthropic_routes_reject_corrupted_recognized_reasoning_signature_with_400(
+    client,
+    recording_backend: RecordingBackend,
+    route: str,
+):
+    response = client.post(
+        route,
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "tampered",
+                            "signature": "codex-reasoning-v1:not-valid-base64!",
+                        },
+                        {"type": "text", "text": "hi"},
+                    ],
+                },
+                {"role": "user", "content": "follow up"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert recording_backend.requests.empty()
+
+
+def test_openai_chat_completions_handles_reasoning_item_events_without_leaking_signatures(
+    client,
+    monkeypatch,
+):
+    import codex_as_api.server as server_mod
+
+    def sse_with_reasoning(_path: str, _payload: dict[str, Any], extra_headers: Any = None):
+        del extra_headers
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_oai",
+                "encrypted_content": "enc_oai_blob",
+                "summary": [{"type": "summary_text", "text": "Reasoning summary"}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "OpenAI reply"}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-oai-1",
+                "output": [],
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 3,
+                    "total_tokens": 7,
+                    "input_tokens_details": {"cached_tokens": 0},
+                },
+            },
+        }
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", sse_with_reasoning)
+
+    non_stream = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert non_stream.status_code == 200
+    non_stream_msg = non_stream.json()["choices"][0]["message"]
+    assert non_stream_msg["content"] == "OpenAI reply"
+    assert non_stream_msg["reasoning_content"] == "Reasoning summary"
+    assert "codex-reasoning-v1:" not in json.dumps(non_stream.json())
+
+    stream_resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.6-sol",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert stream_resp.status_code == 200
+    assert "OpenAI reply" in stream_resp.text
+    assert "codex-reasoning-v1:" not in stream_resp.text
+
+
+def test_anthropic_messages_with_thinking_disabled_replays_historical_signed_thinking_including_empty_thinking(
+    client,
+    recording_backend: RecordingBackend,
+):
+    from codex_as_api.reasoning_signature import encode_reasoning_signature
+
+    sig_non_empty = encode_reasoning_signature(
+        model="gpt-5.6-sol",
+        item={
+            "type": "reasoning",
+            "id": "rs_hist_1",
+            "encrypted_content": "enc_hist_1",
+            "summary": [{"type": "summary_text", "text": "Earlier thinking summary."}],
+        },
+    )
+    sig_empty = encode_reasoning_signature(
+        model="gpt-5.6-sol",
+        item={
+            "type": "reasoning",
+            "id": "rs_hist_2",
+            "encrypted_content": "enc_hist_2",
+            "summary": [],
+        },
+    )
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 256,
+            "thinking": {"type": "disabled"},
+            "messages": [
+                {"role": "user", "content": "Turn 1"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Earlier thinking summary.",
+                            "signature": sig_non_empty,
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": sig_empty,
+                        },
+                        {"type": "text", "text": "Turn 1 response"},
+                    ],
+                },
+                {"role": "user", "content": "Turn 2 with thinking disabled"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    recorded = recording_backend.requests.get(timeout=1)
+    assert recorded["path"] == "/responses"
+    non_dev_items = [item for item in recorded["body"]["input"] if item.get("role") != "developer"]
+    assert [item["type"] for item in non_dev_items] == [
+        "message",
+        "reasoning",
+        "reasoning",
+        "message",
+        "message",
+    ]
+    assert non_dev_items[1] == {
+        "type": "reasoning",
+        "id": "rs_hist_1",
+        "encrypted_content": "enc_hist_1",
+        "summary": [{"type": "summary_text", "text": "Earlier thinking summary."}],
+    }
+    assert non_dev_items[2] == {
+        "type": "reasoning",
+        "id": "rs_hist_2",
+        "encrypted_content": "enc_hist_2",
+        "summary": [],
+    }
+
+
+def test_anthropic_messages_compact_replays_historical_signed_thinking_blocks(
+    client,
+    recording_backend: RecordingBackend,
+):
+    from codex_as_api.reasoning_signature import encode_reasoning_signature
+
+    sig_1 = encode_reasoning_signature(
+        model="gpt-5.6-sol",
+        item={
+            "type": "reasoning",
+            "id": "rs_compact_1",
+            "encrypted_content": "enc_compact_1",
+            "summary": [{"type": "summary_text", "text": "Compact summary"}],
+        },
+    )
+    sig_2 = encode_reasoning_signature(
+        model="gpt-5.6-sol",
+        item={
+            "type": "reasoning",
+            "id": "rs_compact_2",
+            "encrypted_content": "enc_compact_2",
+            "summary": [],
+        },
+    )
+
+    response = client.post(
+        "/v1/messages/compact",
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 256,
+            "thinking": {"type": "disabled"},
+            "messages": [
+                {"role": "user", "content": "First user message"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Compact summary", "signature": sig_1},
+                        {"type": "thinking", "thinking": "", "signature": sig_2},
+                        {"type": "text", "text": "First assistant reply"},
+                    ],
+                },
+                {"role": "user", "content": "Please compact"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    recorded = recording_backend.requests.get(timeout=1)
+    assert recorded["path"] == "/responses/compact"
+    non_dev_items = [item for item in recorded["body"]["input"] if item.get("role") != "developer"]
+    assert [item["type"] for item in non_dev_items] == [
+        "message",
+        "reasoning",
+        "reasoning",
+        "message",
+        "message",
+    ]
+    assert non_dev_items[1] == {
+        "type": "reasoning",
+        "id": "rs_compact_1",
+        "encrypted_content": "enc_compact_1",
+        "summary": [{"type": "summary_text", "text": "Compact summary"}],
+    }
+    assert non_dev_items[2] == {
+        "type": "reasoning",
+        "id": "rs_compact_2",
+        "encrypted_content": "enc_compact_2",
+        "summary": [],
+    }
+
+
+def test_dynamic_npm_version_resolver_updates_models_query_user_agent_and_cold_failure_503(
+    monkeypatch,
+    auth_json_factory,
+    recording_backend: RecordingBackend,
+):
+    from fastapi.testclient import TestClient
+
+    import codex_as_api.server as server_mod
+    from codex_as_api.codex_version import CodexVersionResolver
+
+    active_version = "0.175.2"
+    resolver = CodexVersionResolver(
+        fetch=lambda _url, _timeout: json.dumps({"name": "@openai/codex", "version": active_version}).encode("utf-8"),
+        ttl_seconds=3600.0,
+    )
+    provider = ChatGPTOAuthProvider(
+        model="gpt-5.6-sol",
+        base_url=recording_backend.base_url,
+        auth_json_path=str(auth_json_factory()),
+        timeout=2,
+        version_resolver=resolver,
+    )
+    monkeypatch.setattr(server_mod, "_provider", provider)
+    test_client = TestClient(
+        server_mod.app,
+        raise_server_exceptions=False,
+        headers={"x-claude-code-session-id": "test-claude-code-session"},
+    )
+
+    chat_resp = test_client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert chat_resp.status_code == 200
+    catalog_req_1 = recording_backend.catalog_requests.get(timeout=1)
+    responses_req_1 = recording_backend.requests.get(timeout=1)
+    assert catalog_req_1["path"] == "/models?client_version=0.175.2"
+    assert catalog_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
+    assert catalog_req_1["headers"]["user-agent"].endswith(") codex-as-api/0.9.0")
+    assert responses_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
+
+    active_version = "0.176.0"
+    resolver.configure(
+        fetch=lambda _url, _timeout: json.dumps({"name": "@openai/codex", "version": active_version}).encode("utf-8")
+    )
+    compact_resp = test_client.post(
+        "/v1/compact",
+        json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert compact_resp.status_code == 200
+    catalog_req_2 = recording_backend.catalog_requests.get(timeout=1)
+    compact_req_2 = recording_backend.requests.get(timeout=1)
+    assert catalog_req_2["path"] == "/models?client_version=0.176.0"
+    assert catalog_req_2["headers"]["user-agent"].startswith("codex_cli_rs/0.176.0 (")
+    assert compact_req_2["headers"]["user-agent"].startswith("codex_cli_rs/0.176.0 (")
+
+    cold_failing_resolver = CodexVersionResolver(
+        fetch=lambda _url, _timeout: (_ for _ in ()).throw(OSError("npm down")),
+        retry_backoff_seconds=0.1,
+    )
+    failing_provider = ChatGPTOAuthProvider(
+        model="gpt-5.6-sol",
+        base_url=recording_backend.base_url,
+        auth_json_path=str(auth_json_factory()),
+        timeout=2,
+        version_resolver=cold_failing_resolver,
+    )
+    monkeypatch.setattr(server_mod, "_provider", failing_provider)
+
+    for path, body in (
+        (
+            "/v1/chat/completions",
+            {"model": "gpt-5.6-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/messages",
+            {"model": "gpt-5.6-sol", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ):
+        err_resp = test_client.post(path, json=body)
+        assert err_resp.status_code == 503
+        assert err_resp.headers["content-type"].startswith("application/json")

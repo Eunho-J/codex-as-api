@@ -21,6 +21,7 @@ import {
   modelFromSnapshot,
   parseModelCatalog,
   shouldEnableParallelToolCalls,
+  VERIFIED_HIDDEN_MODEL_WARNING,
 } from "../model-capabilities.js";
 import { MessageRole } from "../messages.js";
 import { ChatGPTOAuthProvider } from "../provider.js";
@@ -175,6 +176,9 @@ describe("authenticated model catalog parser", () => {
       "hidden-first",
       "visible-later",
       "visible-selected",
+      "gpt-6-chat-thinking",
+      "gpt-reserve",
+      "codex-auto-review",
     ]);
     assert.equal(snapshot.models[1].supportedInApi, false);
     assert.equal(snapshot.models[2].effectiveContextWindowPercent, 95);
@@ -186,6 +190,77 @@ describe("authenticated model catalog parser", () => {
     ]);
     assert.equal(Object.isFrozen(snapshot), true);
     assert.equal(Object.isFrozen(snapshot.models), true);
+  });
+
+  it("merges and promotes verified hidden models without duplicating live entries or changing default selection", async () => {
+    const liveThinking = rawModel("gpt-6-chat-thinking", {
+      display_name: "Live GPT-6 Chat Thinking",
+      description: "Upstream hidden description",
+      priority: 0,
+      visibility: "hide",
+      supported_in_api: false,
+      context_window: 512_000,
+      max_context_window: 512_000,
+      support_verbosity: true,
+      default_verbosity: "high",
+      supports_reasoning_summary_parameter: true,
+      default_reasoning_summary: "detailed",
+    });
+    const regularVisible = rawModel("visible-regular", {
+      priority: 100,
+      visibility: "list",
+    });
+    const snapshot = parseModelCatalog({
+      models: [liveThinking, regularVisible],
+    }, metadata());
+
+    assert.equal(snapshot.defaultModel?.slug, "visible-regular");
+    assert.deepEqual(snapshot.models.map((model) => model.slug), [
+      "gpt-6-chat-thinking",
+      "visible-regular",
+      "gpt-reserve",
+      "codex-auto-review",
+    ]);
+
+    const thinking = modelFromSnapshot(snapshot, "gpt-6-chat-thinking")!;
+    assert.equal(thinking.displayName, "Live GPT-6 Chat Thinking");
+    assert.equal(thinking.description, VERIFIED_HIDDEN_MODEL_WARNING);
+    assert.equal(thinking.visibility, "list");
+    assert.equal(thinking.supportedInApi, true);
+    assert.equal(thinking.priority, 0);
+    assert.equal(thinking.contextWindow, 512_000);
+    assert.equal(thinking.maxContextWindow, 512_000);
+    assert.equal(thinking.supportVerbosity, true);
+    assert.equal(thinking.defaultVerbosity, "high");
+    assert.equal(thinking.supportsReasoningSummaryParameter, true);
+    assert.equal(thinking.defaultReasoningSummary, "detailed");
+
+    const reserve = modelFromSnapshot(snapshot, "gpt-reserve")!;
+    assert.equal(reserve.displayName, "GPT-Reserve");
+    assert.equal(reserve.description, VERIFIED_HIDDEN_MODEL_WARNING);
+    assert.equal(reserve.visibility, "list");
+    assert.equal(reserve.supportedInApi, true);
+    assert.equal(reserve.contextWindow, 272_000);
+    assert.equal(reserve.maxContextWindow, 872_000);
+    assert.equal(reserve.useResponsesLite, true);
+    assert.equal(reserve.supportsReasoningSummaryParameter, true);
+    assert.equal(reserve.defaultReasoningSummary, "none");
+
+    const autoReview = modelFromSnapshot(snapshot, "codex-auto-review")!;
+    assert.equal(autoReview.displayName, "Codex Auto Review");
+    assert.equal(autoReview.description, VERIFIED_HIDDEN_MODEL_WARNING);
+    assert.equal(autoReview.visibility, "list");
+    assert.equal(autoReview.supportedInApi, true);
+    assert.equal(autoReview.priority, 43);
+
+    const provider = new ChatGPTOAuthProvider();
+    assert.equal((await provider.prepareModel("gpt-6-chat-thinking", snapshot)).slug, "gpt-6-chat-thinking");
+    assert.equal((await provider.prepareModel("gpt-reserve", snapshot)).slug, "gpt-reserve");
+    assert.equal((await provider.prepareModel("codex-auto-review", snapshot)).slug, "codex-auto-review");
+    await assert.rejects(
+      () => provider.prepareModel("unknown-hidden-model", snapshot),
+      (error) => error instanceof ChatGPTOAuthModelNotFoundError,
+    );
   });
 
   it("treats an empty optional ETag as absent", () => {
@@ -253,7 +328,7 @@ describe("authenticated model catalog parser", () => {
     }
   });
 
-  it("preserves empty catalogs, opaque slugs, comp_hash, and nonempty custom reasoning values", () => {
+  it("preserves empty catalogs, opaque slugs, comp_hash, and nonempty custom reasoning values", async () => {
     const empty = parseModelCatalog({ models: [] }, metadata());
     const custom = parseModelCatalog({
       models: [rawModel(" ", {
@@ -264,8 +339,21 @@ describe("authenticated model catalog parser", () => {
       })],
     }, metadata()).models[0];
 
-    assert.deepEqual(empty.models, []);
+    assert.deepEqual(empty.models.map((model) => model.slug), [
+      "gpt-6-chat-thinking",
+      "gpt-reserve",
+      "codex-auto-review",
+    ]);
     assert.equal(empty.defaultModel, null);
+    const provider = new ChatGPTOAuthProvider();
+    assert.equal(
+      (await provider.prepareModel("gpt-6-chat-thinking", empty)).slug,
+      "gpt-6-chat-thinking",
+    );
+    await assert.rejects(
+      () => provider.prepareModel(undefined, empty),
+      (error) => error instanceof ChatGPTOAuthCatalogUnavailableError,
+    );
     assert.equal(custom.slug, " ");
     assert.equal(custom.compHash, " compatibility family ");
     assert.equal(custom.defaultReasoningEffort, " ");
@@ -757,6 +845,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       };
 
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://catalog.test",
       });
@@ -776,7 +865,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       assert.equal(new Headers(catalogRequests[0].init?.headers).get("ChatGPT-Account-Id"), "account-a");
       assert.equal(new Headers(catalogRequests[0].init?.headers).get("Authorization"), `Bearer ${oldAccessToken}`);
       assert.equal(
-        (new Headers(catalogRequests[0].init?.headers).get("User-Agent") ?? "").startsWith("codex_cli_rs/0.153.3 "),
+        (new Headers(catalogRequests[0].init?.headers).get("User-Agent") ?? "").startsWith(`codex_cli_rs/${firstCatalogUrl.searchParams.get(upstreamContract.models_request.client_version_query)} `),
         true,
       );
       assert.equal(new Headers(catalogRequests[1].init?.headers).get("Authorization"), `Bearer ${refreshedAccessToken}`);
@@ -805,6 +894,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       };
 
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://cancel-failure.test",
       });
@@ -861,6 +951,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       };
 
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://catalog.test",
       });
@@ -890,6 +981,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
     try {
       globalThis.fetch = async () => new Response("account-a rate limited", { status: 429 });
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://catalog.test",
       });
@@ -921,6 +1013,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
         });
       };
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://catalog.test",
       });
@@ -968,6 +1061,7 @@ describe("ChatGPTOAuthProvider model discovery", () => {
       };
 
       const provider = new ChatGPTOAuthProvider({
+        versionResolver: async () => upstreamContract.upstream.version,
         authJsonPath: authPath,
         baseUrl: "https://catalog.test",
       });

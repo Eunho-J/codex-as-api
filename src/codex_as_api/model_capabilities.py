@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import pathlib
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -17,6 +18,7 @@ from .auth import (
     ChatGPTOAuthModelNotFoundError,
     resolve_auth_path,
 )
+from .strict_json import strict_json_loads
 
 RESPONSES_LITE_ENV = "CODEX_AS_API_RESPONSES_LITE"
 CODEX_METADATA_ENV = "CODEX_AS_API_CODEX_METADATA"
@@ -32,6 +34,16 @@ TURN_ID_KEY = "turn_id"
 DEFAULT_MODEL_CATALOG_TTL_SECONDS = 300.0
 DEFAULT_MODEL_CATALOG_TIMEOUT_SECONDS = 5.0
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+VERIFIED_HIDDEN_MODEL_WARNING = "Experimental hidden model; upstream support may stop at any time."
+_EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS = (
+    "gpt-6-chat-thinking",
+    "gpt-reserve",
+    "codex-auto-review",
+)
+_VERIFIED_HIDDEN_MODEL_SLUGS = frozenset(_EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS)
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_VERIFIED_HIDDEN_MODELS_PATH = _PROJECT_ROOT / "config" / "verified-hidden-models.json"
+_PACKAGE_VERIFIED_HIDDEN_MODELS_PATH = pathlib.Path(__file__).resolve().with_name("verified-hidden-models.json")
 _INSTALLATION_NAMESPACE = uuid.UUID("d2c81270-8f15-5e8d-a5c4-4cdbf2c21fd0")
 _WINDOW_ID = str(uuid.uuid4())
 
@@ -116,7 +128,11 @@ class ModelCatalogSnapshot:
             raise ChatGPTOAuthModelNotFoundError("requested model was not found in the authenticated catalog") from exc
 
     def default_model(self) -> ModelCapability:
-        visible = [model for model in self.models if model.visibility == "list"]
+        visible = [
+            model
+            for model in self.models
+            if model.visibility == "list" and model.slug not in _VERIFIED_HIDDEN_MODEL_SLUGS
+        ]
         if not visible:
             raise ChatGPTOAuthCatalogUnavailableError(
                 "upstream model catalog has no model with list visibility for default selection"
@@ -256,8 +272,14 @@ def parse_model_catalog(
         model = _model_from_mapping(value, index=index)
         if model.slug in by_slug:
             raise ChatGPTOAuthCatalogUnavailableError("model catalog contains a duplicate model slug")
+        if model.slug in _VERIFIED_HIDDEN_MODEL_SLUGS:
+            model = _promote_verified_hidden_model(model)
         by_slug[model.slug] = model
         models.append(model)
+    for fallback in _VERIFIED_HIDDEN_MODELS:
+        if fallback.slug not in by_slug:
+            by_slug[fallback.slug] = fallback
+            models.append(fallback)
     return ModelCatalogSnapshot(
         key=key,
         models=tuple(models),
@@ -693,3 +715,44 @@ def _non_empty_optional_model(value: str | None, field: str) -> str | None:
     if value != value.strip():
         raise ChatGPTOAuthInvalidRequestError(f"{field} must not contain surrounding whitespace")
     return value
+
+
+def _promote_verified_hidden_model(model: ModelCapability) -> ModelCapability:
+    return replace(
+        model,
+        description=VERIFIED_HIDDEN_MODEL_WARNING,
+        visibility="list",
+        supported_in_api=True,
+    )
+
+
+def _load_verified_hidden_models() -> tuple[ModelCapability, ...]:
+    path = (
+        _PACKAGE_VERIFIED_HIDDEN_MODELS_PATH
+        if _PACKAGE_VERIFIED_HIDDEN_MODELS_PATH.exists()
+        else _VERIFIED_HIDDEN_MODELS_PATH
+    )
+    try:
+        document = strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"invalid bundled verified hidden models config: {exc}") from exc
+    if not isinstance(document, dict):
+        raise RuntimeError("bundled verified hidden models config must be a JSON object")
+    verified_at = document.get("verified_at")
+    if not isinstance(verified_at, str) or not verified_at.strip():
+        raise RuntimeError("bundled verified hidden models config has an invalid verified_at")
+    if document.get("warning") != VERIFIED_HIDDEN_MODEL_WARNING:
+        raise RuntimeError("bundled verified hidden models config has an invalid warning")
+    raw_models = document.get("models")
+    if not isinstance(raw_models, list) or len(raw_models) != len(_EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS):
+        raise RuntimeError("bundled verified hidden models config must contain the three verified hidden models")
+    models = tuple(
+        _promote_verified_hidden_model(_model_from_mapping(value, index=index))
+        for index, value in enumerate(raw_models)
+    )
+    if tuple(model.slug for model in models) != _EXPECTED_VERIFIED_HIDDEN_MODEL_SLUGS:
+        raise RuntimeError("bundled verified hidden models config slugs do not match canonical exceptions")
+    return models
+
+
+_VERIFIED_HIDDEN_MODELS = _load_verified_hidden_models()

@@ -36,6 +36,8 @@ import {
   type ModelCatalogSnapshot,
 } from "../model-capabilities.js";
 
+import { decodeReasoningSignature, encodeReasoningSignature } from "../reasoning-signature.js";
+
 const TEST_CONFIG: CodexConfig = {
   codexHome: "/test/codex-home",
   configPath: "/test/codex-home/config.toml",
@@ -1877,7 +1879,7 @@ describe("server model defaults", () => {
       assert.throws(
         () => createApp({ provider: {} as never, codexConfig: TEST_CONFIG }),
         (error) => error instanceof ChatGPTOAuthInvalidRequestError
-          && error.message === "CODEX_AS_API_CODEX_CLI_VERSION is not supported; the wire contract is pinned to 0.153.3",
+          && error.message === "CODEX_AS_API_CODEX_CLI_VERSION is not supported; Codex CLI version is resolved automatically from npm @openai/codex/latest",
       );
     } finally {
       if (previous == null) delete process.env.CODEX_AS_API_CODEX_CLI_VERSION;
@@ -1976,7 +1978,12 @@ describe("live model catalog routes", () => {
       const health = await fetch(`${baseUrl}/health`);
 
       assert.equal(models.status, 200);
-      assert.deepEqual(await models.json(), { object: "list", data: [] });
+      const catalog = await models.json() as { object: string; data: { id: string; visibility: string }[] };
+      assert.equal(catalog.object, "list");
+      assert.deepEqual(catalog.data.map((entry) => entry.id), [
+        "gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review",
+      ]);
+      assert.ok(catalog.data.every((entry) => entry.visibility === "list"));
       assert.equal(health.status, 503);
       const body = await health.json() as { error: { type: string } };
       assert.equal(body.error.type, "catalog_unavailable");
@@ -1998,6 +2005,9 @@ describe("live model catalog routes", () => {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "catalog-only",
+        "gpt-6-chat-thinking",
+        "gpt-reserve",
+        "codex-auto-review",
       ]);
       const catalogOnly = body.data.find((model) => model.id === "catalog-only");
       assert.equal(catalogOnly?.supported_in_api, false);
@@ -6119,5 +6129,334 @@ describe("GPT-5.6 HTTP pipeline", () => {
       else process.env.CODEX_AS_API_RESPONSES_LITE = previousLite;
       fs.rmSync(auth.directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Anthropic /v1/messages encrypted reasoning HTTP round-trip and OpenAI stream compatibility", () => {
+  it("stamps prepared backend model slug in Turn 1 signature and replays reasoning item to upstream /responses in Turn 2", async () => {
+    const auth = writeAuthFile();
+    const catalogWith6 = {
+      models: [
+        rawModel("gpt-6.1-sol", { priority: 10, use_responses_lite: false }),
+        rawModel("gpt-6-astra", { priority: 20, use_responses_lite: false }),
+        rawModel("gpt-5.5", { priority: 30, use_responses_lite: false }),
+      ],
+    };
+
+    try {
+      await withRecordingUpstream(async (upstreamUrl, requests) => {
+        const providerTurn1 = new ChatGPTOAuthProvider({
+          model: "gpt-6.1-sol",
+          baseUrl: upstreamUrl,
+          authJsonPath: auth.authPath,
+        });
+        // Override postSSE on Turn 1 to emit an encrypted reasoning item + assistant text
+        (providerTurn1 as unknown as {
+          postSSE(
+            path: string,
+            payload: Record<string, unknown>,
+          ): AsyncGenerator<Record<string, unknown>>;
+        }).postSSE = async function* (_path, payload) {
+          requests.push({
+            method: "POST",
+            path: "/responses",
+            headers: {},
+            body: payload,
+          });
+          yield {
+            type: "response.output_item.added",
+            item: { type: "reasoning", id: "rs_turn1", summary: [] },
+          };
+          yield {
+            type: "response.reasoning_summary_part.added",
+            summary_index: 0,
+            item_id: "rs_turn1",
+          };
+          yield {
+            type: "response.reasoning_summary_text.delta",
+            delta: "Step 1 analysis",
+            summary_index: 0,
+            item_id: "rs_turn1",
+          };
+          yield {
+            type: "response.output_item.done",
+            item: {
+              type: "reasoning",
+              id: "rs_turn1",
+              encrypted_content: "gAAAA_turn1_exact_cipher",
+              summary: [{ type: "summary_text", text: "Step 1 analysis" }],
+            },
+          };
+          yield {
+            type: "response.output_text.delta",
+            delta: "Turn 1 answer",
+          };
+          yield {
+            type: "response.output_item.done",
+            item: {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Turn 1 answer" }],
+            },
+          };
+          yield {
+            type: "response.completed",
+            response: {
+              id: "resp_turn1",
+              end_turn: true,
+              usage: {
+                input_tokens: 12,
+                output_tokens: 6,
+                total_tokens: 18,
+                input_tokens_details: { cached_tokens: 0 },
+              },
+              output: [],
+            },
+          };
+        };
+
+        let turn1Content: Record<string, unknown>[] = [];
+        await withServer(
+          providerTurn1,
+          async (baseUrl) => {
+            const res1 = await fetch(`${baseUrl}/v1/messages`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                model: "claude-sonnet-4-6",
+                max_tokens: 1024,
+                messages: [{ role: "user", content: "First question" }],
+              }),
+            });
+            assert.equal(res1.status, 200);
+            const body1 = (await res1.json()) as {
+              model: string;
+              content: Record<string, unknown>[];
+            };
+            assert.equal(body1.model, "claude-sonnet-4-6");
+            turn1Content = body1.content;
+            assert.equal(turn1Content.length, 2);
+            assert.equal(turn1Content[0].type, "thinking");
+            assert.equal(turn1Content[0].thinking, "Step 1 analysis");
+            const decodedSig = decodeReasoningSignature(turn1Content[0].signature);
+            assert.deepEqual(decodedSig, {
+              v: 1,
+              model: "gpt-6.1-sol",
+              item: {
+                type: "reasoning",
+                id: "rs_turn1",
+                encrypted_content: "gAAAA_turn1_exact_cipher",
+                summary: [{ type: "summary_text", text: "Step 1 analysis" }],
+              },
+            });
+
+            // Turn 2 on compatible backend model (gpt-6-astra) replays the reasoning item
+            const providerTurn2Compatible = new ChatGPTOAuthProvider({
+              model: "gpt-6-astra",
+              baseUrl: upstreamUrl,
+              authJsonPath: auth.authPath,
+            });
+            await withServer(
+              providerTurn2Compatible,
+              async (baseUrl2) => {
+                const res2 = await fetch(`${baseUrl2}/v1/messages`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    model: "claude-sonnet-4-6",
+                    max_tokens: 1024,
+                    messages: [
+                      { role: "user", content: "First question" },
+                      { role: "assistant", content: turn1Content },
+                      { role: "user", content: "Follow-up question" },
+                    ],
+                  }),
+                });
+                assert.equal(res2.status, 200);
+              },
+              {
+                model: "gpt-6-astra",
+                codexConfig: { ...TEST_CONFIG, model: "gpt-6-astra" },
+                authPath: auth.authPath,
+              },
+            );
+
+            const turn2Request = requests.at(-1)!;
+            assert.equal(turn2Request.body.model, "gpt-6-astra");
+            assert.deepEqual(turn2Request.body.input, [
+              {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: "First question" }],
+              },
+              {
+                type: "reasoning",
+                id: "rs_turn1",
+                encrypted_content: "gAAAA_turn1_exact_cipher",
+                summary: [{ type: "summary_text", text: "Step 1 analysis" }],
+              },
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "Turn 1 answer" }],
+              },
+              {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: "Follow-up question" }],
+              },
+            ]);
+
+            // Turn 2 on incompatible backend model (gpt-5.5) drops only reasoning item
+            const providerTurn2Incompatible = new ChatGPTOAuthProvider({
+              model: "gpt-5.5",
+              baseUrl: upstreamUrl,
+              authJsonPath: auth.authPath,
+            });
+            await withServer(
+              providerTurn2Incompatible,
+              async (baseUrl3) => {
+                const res3 = await fetch(`${baseUrl3}/v1/messages`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    model: "claude-sonnet-4-6",
+                    max_tokens: 1024,
+                    messages: [
+                      { role: "user", content: "First question" },
+                      { role: "assistant", content: turn1Content },
+                      { role: "user", content: "Follow-up question" },
+                    ],
+                  }),
+                });
+                assert.equal(res3.status, 200);
+              },
+              {
+                model: "gpt-5.5",
+                codexConfig: { ...TEST_CONFIG, model: "gpt-5.5" },
+                authPath: auth.authPath,
+              },
+            );
+
+            const turn3Request = requests.at(-1)!;
+            assert.equal(turn3Request.body.model, "gpt-5.5");
+            assert.deepEqual(turn3Request.body.input, [
+              {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: "First question" }],
+              },
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "Turn 1 answer" }],
+              },
+              {
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: "Follow-up question" }],
+              },
+            ]);
+          },
+          {
+            model: "gpt-6.1-sol",
+            codexConfig: { ...TEST_CONFIG, model: "gpt-6.1-sol" },
+            authPath: auth.authPath,
+          },
+        );
+      }, catalogWith6);
+    } finally {
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects malformed codex-reasoning signatures with 400 invalid_request_error and skips reasoning_item in /v1/chat/completions stream", async () => {
+    let providerCalled = false;
+    const mockProvider = {
+      async chat() {
+        providerCalled = true;
+        throw new Error("must not be called on invalid signature");
+      },
+      async *chatStream() {
+        yield {
+          type: "reasoning_delta",
+          text: "Thinking...",
+          summary_index: 0,
+          item_id: "rs_openai_1",
+        };
+        yield {
+          type: "reasoning_item",
+          model: "gpt-5.5",
+          item: {
+            type: "reasoning",
+            id: "rs_openai_1",
+            encrypted_content: "gAAAA_openai_secret_blob",
+            summary: [{ type: "summary_text", text: "Thinking..." }],
+          },
+        };
+        yield { type: "content", text: "Visible OpenAI text" };
+        yield {
+          type: "finish",
+          finish_reason: "stop",
+          response_id: "resp_openai_1",
+          usage: {
+            input_tokens: 5,
+            output_tokens: 3,
+            total_tokens: 8,
+            input_tokens_details: { cached_tokens: 0 },
+          },
+        };
+      },
+    };
+
+    await withServer(mockProvider, async (baseUrl) => {
+      const badRes = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 512,
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "thinking",
+                  thinking: "tampered",
+                  signature: "codex-reasoning-v1:not_valid_json!",
+                },
+                { type: "text", text: "hi" },
+              ],
+            },
+            { role: "user", content: "next" },
+          ],
+        }),
+      });
+      assert.equal(badRes.status, 400);
+      const errBody = (await badRes.json()) as {
+        type: string;
+        error: { type: string; message: string };
+      };
+      assert.equal(errBody.type, "error");
+      assert.equal(errBody.error.type, "invalid_request_error");
+      assert.equal(providerCalled, false);
+
+      // Verify /v1/chat/completions stream skips reasoning_item without error or leaking cipher
+      const streamRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(streamRes.status, 200);
+      const streamText = await streamRes.text();
+      assert.equal(streamText.includes("Visible OpenAI text"), true);
+      assert.equal(streamText.includes("gAAAA_openai_secret_blob"), false);
+      assert.equal(streamText.includes("codex-reasoning-v1:"), false);
+      assert.equal(streamText.includes("data: [DONE]"), true);
+    });
   });
 });

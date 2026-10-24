@@ -172,7 +172,10 @@ function testUsage(): Record<string, unknown> {
 function testProvider(
   opts: ConstructorParameters<typeof ChatGPTOAuthProvider>[0] = {},
 ): ChatGPTOAuthProvider {
-  const provider = new ChatGPTOAuthProvider(opts);
+  const provider = new ChatGPTOAuthProvider({
+    versionResolver: () => "0.164.0",
+    ...opts,
+  });
   const originalPayload = (provider as unknown as {
     responsesPayload(messages: Message[], options: Record<string, unknown>, prepared: PreparedModel): Record<string, unknown>;
   }).responsesPayload.bind(provider);
@@ -3187,38 +3190,152 @@ describe("local previous_response_id history", () => {
 });
 
 describe("Codex CLI request headers", () => {
-  it("formats official originator and the pinned User-Agent version", () => {
-    const headers = codexCliHeadersForVersion();
+  it("formats official originator and the resolved User-Agent version", () => {
+    const headers = codexCliHeadersForVersion("0.164.0");
 
     assert.equal(headers.originator, "codex_cli_rs");
-    assert.ok(headers["User-Agent"].startsWith("codex_cli_rs/0.153.3 ("));
-    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/0.8.3"));
+    assert.ok(headers["User-Agent"].startsWith("codex_cli_rs/0.164.0 ("));
+    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/0.9.0"));
+
+    const dynamicHeaders = codexCliHeadersForVersion("1.2.3");
+    assert.equal(dynamicHeaders.originator, "codex_cli_rs");
+    assert.ok(dynamicHeaders["User-Agent"].startsWith("codex_cli_rs/1.2.3 ("));
   });
 
-  it("rejects invalid and arbitrary compatibility versions", () => {
-    for (const version of ["not-a-version", "", "   ", " 0.153.3", "0.153.3 "]) {
+  it("rejects invalid semantic versions", () => {
+    for (const version of ["not-a-version", "", "   ", " 0.164.0", "0.164.0 ", "0.164.0-alpha.1"]) {
       assert.throws(
         () => codexCliHeadersForVersion(version),
-        /semantic version/,
+        ChatGPTOAuthInvalidRequestError,
       );
     }
-    assert.throws(
-      () => codexCliHeadersForVersion("1.2.3"),
-      ChatGPTOAuthInvalidRequestError,
-    );
   });
 
-  it("returns the pinned upstream contract version", () => {
-    assert.equal(resolveCodexCliVersion(), "0.153.3");
+  it("resolves the dynamic version through the injected version provider", async () => {
+    assert.equal(await resolveCodexCliVersion(() => "0.205.0"), "0.205.0");
   });
 
-  it("adds Codex CLI headers to ChatGPT OAuth requests", () => {
-    const provider = testProvider({ authJsonPath: writeAuthFile() });
-    const headers = (provider as unknown as { getHeaders(): Record<string, string> }).getHeaders();
+  it("adds Codex CLI headers to ChatGPT OAuth requests and propagates resolved version across catalog, responses, compact, and 401 retry", async () => {
+    const authPath = writeAuthFile();
+    const originalFetch = globalThis.fetch;
+    const seenRequests: Array<{ url: string; userAgent: string | null }> = [];
+    const refreshedAccess = makeJwt({ exp: 9_999_999_999 });
+    const refreshedId = makeJwt({
+      exp: 9_999_999_999,
+      "https://api.openai.com/auth": { chatgpt_account_id: "acc-123" },
+    });
+    let responsesAttempt = 0;
 
-    assert.equal(headers.originator, "codex_cli_rs");
-    assert.equal(headers["User-Agent"].startsWith("codex_cli_rs/0.153.3 "), true);
-    assert.equal(headers.Authorization.startsWith("Bearer "), true);
+    try {
+      const provider = new ChatGPTOAuthProvider({
+        authJsonPath: authPath,
+        baseUrl: "https://catalog.test",
+        versionResolver: () => "0.205.0",
+      });
+      const headers = (provider as unknown as {
+        getHeaders(token: undefined, clientVersion: string): Record<string, string>;
+      }).getHeaders(undefined, "0.205.0");
+
+      assert.equal(headers.originator, "codex_cli_rs");
+      assert.equal(headers["User-Agent"].startsWith("codex_cli_rs/0.205.0 "), true);
+      assert.equal(headers.Authorization.startsWith("Bearer "), true);
+
+      globalThis.fetch = async (input, init) => {
+        const url = String(input);
+        const reqHeaders = new Headers(init?.headers);
+        seenRequests.push({
+          url,
+          userAgent: reqHeaders.get("user-agent"),
+        });
+        if (url === "https://auth.openai.com/oauth/token") {
+          return new Response(
+            JSON.stringify({
+              access_token: refreshedAccess,
+              refresh_token: "refresh-new",
+              id_token: refreshedId,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url.startsWith("https://catalog.test/models?")) {
+          return new Response(
+            JSON.stringify({
+              models: [
+                {
+                  slug: "gpt-5.5",
+                  display_name: "gpt-5.5",
+                  description: null,
+                  default_reasoning_level: "low",
+                  supported_reasoning_levels: [{ effort: "low", description: "low" }],
+                  priority: 10,
+                  visibility: "list",
+                  supported_in_api: true,
+                  service_tiers: [],
+                  default_service_tier: null,
+                  support_verbosity: true,
+                  default_verbosity: "low",
+                  supports_image_detail_original: true,
+                  context_window: 272_000,
+                  max_context_window: 272_000,
+                  auto_compact_token_limit: null,
+                  input_modalities: ["text", "image"],
+                  use_responses_lite: false,
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "https://catalog.test/responses") {
+          responsesAttempt += 1;
+          if (responsesAttempt === 1) {
+            return unreadUnauthorizedResponse().response;
+          }
+          return new Response(
+            [
+              'data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}\n\n',
+              'data: {"type":"response.completed","response":{"id":"resp-v","end_turn":true}}\n\n',
+            ].join(""),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        if (url === "https://catalog.test/responses/compact") {
+          return new Response('{"output":[]}', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      };
+
+      const chatResult = await provider.chat(providerMessages(), {
+        model: "gpt-5.5",
+        responsesLite: false,
+      });
+      assert.equal(chatResult.content, "ok");
+
+      await provider.compactMessages(providerMessages(), {
+        model: "gpt-5.5",
+        responsesLite: false,
+      });
+
+      const codexRequests = seenRequests.filter((r) => r.url.startsWith("https://catalog.test/"));
+      assert.deepEqual(
+        codexRequests.map((r) => r.url),
+        [
+          "https://catalog.test/models?client_version=0.205.0",
+          "https://catalog.test/responses",
+          "https://catalog.test/responses",
+          "https://catalog.test/responses/compact",
+        ],
+      );
+      for (const req of codexRequests) {
+        assert.equal(req.userAgent?.startsWith("codex_cli_rs/0.205.0 ("), true);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
+    }
   });
 });
 
@@ -4355,5 +4472,289 @@ describe("usageFromResponse", () => {
       ...testUsage(),
       prompt_tokens: null,
     }), null);
+  });
+});
+
+describe("encrypted reasoning items in provider stream, collector, and input replay", () => {
+  it("emits reasoning_item with item_id-linked deltas and collects reasoning_items in chat()", async () => {
+    const provider = testProvider();
+    (provider as unknown as {
+      postSSE(): AsyncGenerator<Record<string, unknown>>;
+    }).postSSE = async function* () {
+      yield {
+        type: "response.output_item.added",
+        item: {
+          type: "reasoning",
+          id: "rs_item_1",
+          summary: [],
+        },
+      };
+      yield {
+        type: "response.reasoning_summary_part.added",
+        summary_index: 0,
+        item_id: "rs_item_1",
+      };
+      yield {
+        type: "response.reasoning_summary_text.delta",
+        delta: "First summary",
+        summary_index: 0,
+        item_id: "rs_item_1",
+      };
+      yield {
+        type: "response.output_item.done",
+        item: {
+          type: "reasoning",
+          id: "rs_item_1",
+          encrypted_content: "gAAAA_cipher_1",
+          summary: [{ type: "summary_text", text: "First summary" }],
+        },
+      };
+      yield {
+        type: "response.output_item.done",
+        item: {
+          type: "reasoning",
+          id: "rs_item_2",
+          encrypted_content: "gAAAA_cipher_2",
+          summary: [],
+        },
+      };
+      yield {
+        type: "response.output_item.done",
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "done" }],
+        },
+      };
+      yield {
+        type: "response.completed",
+        response: { id: "resp_reasoning_1", usage: testUsage(), output: [] },
+      };
+    };
+
+    const streamEvents: StreamEvent[] = [];
+    for await (const ev of provider.chatStream(providerMessages(), {
+      model: "gpt-5.6-sol",
+    })) {
+      streamEvents.push(ev);
+    }
+
+    assert.deepEqual(
+      streamEvents.filter((e) =>
+        ["reasoning_section_break", "reasoning_delta", "reasoning_item"].includes(e.type),
+      ),
+      [
+        {
+          type: "reasoning_section_break",
+          summary_index: 0,
+          item_id: "rs_item_1",
+        },
+        {
+          type: "reasoning_delta",
+          text: "First summary",
+          summary_index: 0,
+          item_id: "rs_item_1",
+        },
+        {
+          type: "reasoning_item",
+          model: "gpt-5.6-sol",
+          item: {
+            type: "reasoning",
+            model: "gpt-5.6-sol",
+            id: "rs_item_1",
+            encrypted_content: "gAAAA_cipher_1",
+            summary: [{ type: "summary_text", text: "First summary" }],
+          },
+        },
+        {
+          type: "reasoning_item",
+          model: "gpt-5.6-sol",
+          item: {
+            type: "reasoning",
+            model: "gpt-5.6-sol",
+            id: "rs_item_2",
+            encrypted_content: "gAAAA_cipher_2",
+            summary: [],
+          },
+        },
+      ],
+    );
+
+    const chatResp = await provider.chat(providerMessages(), {
+      model: "gpt-5.6-sol",
+    });
+    assert.equal(chatResp.content, "done");
+    assert.equal(chatResp.reasoning_content, "First summary");
+    assert.deepEqual(chatResp.reasoning_items, [
+      {
+        type: "reasoning",
+        model: "gpt-5.6-sol",
+        id: "rs_item_1",
+        encrypted_content: "gAAAA_cipher_1",
+        summary: [{ type: "summary_text", text: "First summary" }],
+      },
+      {
+        type: "reasoning",
+        model: "gpt-5.6-sol",
+        id: "rs_item_2",
+        encrypted_content: "gAAAA_cipher_2",
+        summary: [],
+      },
+    ]);
+  });
+
+  it("replays reasoning items before assistant message and function_call across all 25 compatible model pairs and drops mismatches", () => {
+    const compatibleModels = [
+      "gpt-6.1-sol",
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
+      "gpt-daybreak-blue-latest",
+    ] as const;
+
+    let checkedPairs = 0;
+    for (const sourceModel of compatibleModels) {
+      for (const targetModel of compatibleModels) {
+        checkedPairs += 1;
+        const items = messagesToResponseItems(
+          [
+            {
+              role: MessageRole.ASSISTANT,
+              content: "Checking tool",
+              reasoning_items: [
+                {
+                  type: "reasoning",
+                  model: sourceModel,
+                  id: "rs_1",
+                  encrypted_content: `cipher_${sourceModel}_${targetModel}`,
+                  summary: [{ type: "summary_text", text: "Thought" }],
+                },
+              ],
+              tool_calls: [
+                { id: "call_1", name: "lookup", arguments: '{"q":"x"}' },
+              ],
+            },
+          ],
+          targetModel,
+        );
+        assert.deepEqual(items, [
+          {
+            type: "reasoning",
+            id: "rs_1",
+            encrypted_content: `cipher_${sourceModel}_${targetModel}`,
+            summary: [{ type: "summary_text", text: "Thought" }],
+          },
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Checking tool" }],
+          },
+          {
+            type: "function_call",
+            call_id: "call_1",
+            name: "lookup",
+            arguments: '{"q":"x"}',
+          },
+        ]);
+      }
+    }
+    assert.equal(checkedPairs, 25);
+
+    // Mismatched model outside the compatible set drops only the reasoning item
+    const mismatchedItems = messagesToResponseItems(
+      [
+        {
+          role: MessageRole.ASSISTANT,
+          content: "Checking tool",
+          reasoning_items: [
+            {
+              type: "reasoning",
+              model: "gpt-6.1-sol",
+              id: "rs_drop",
+              encrypted_content: "cipher_drop",
+              summary: [{ type: "summary_text", text: "Thought" }],
+            },
+          ],
+          tool_calls: [
+            { id: "call_1", name: "lookup", arguments: '{"q":"x"}' },
+          ],
+        },
+      ],
+      "gpt-5.5",
+    );
+    assert.deepEqual(mismatchedItems, [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Checking tool" }],
+      },
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "lookup",
+        arguments: '{"q":"x"}',
+      },
+    ]);
+
+    // Assistant turn with ONLY mismatched reasoning_items still emits an empty assistant message to preserve turn alternation
+    const reasoningOnlyDropped = messagesToResponseItems(
+      [
+        {
+          role: MessageRole.ASSISTANT,
+          content: "",
+          reasoning_items: [
+            {
+              type: "reasoning",
+              model: "gpt-6.1-sol",
+              id: "rs_drop_only",
+              encrypted_content: "cipher_drop_only",
+              summary: [{ type: "summary_text", text: "Only thought" }],
+            },
+          ],
+        },
+      ],
+      "gpt-5.5",
+    );
+    assert.deepEqual(reasoningOnlyDropped, [
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "" }],
+      },
+    ]);
+  });
+
+  it("rejects unclosed reasoning deltas before a new reasoning item or response.completed and rejects empty reasoning item ids", async () => {
+    const invalidStreams: Array<Record<string, unknown>[]> = [
+      [
+        { type: "response.output_item.added", item: { type: "reasoning", id: "" } },
+      ],
+      [
+        { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } },
+        { type: "response.reasoning_summary_text.delta", delta: "unclosed", summary_index: 0, item_id: "rs_1" },
+        { type: "response.output_item.added", item: { type: "reasoning", id: "rs_2" } },
+      ],
+      [
+        { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } },
+        { type: "response.reasoning_summary_text.delta", delta: "unclosed", summary_index: 0, item_id: "rs_1" },
+        { type: "response.completed", response: { id: "resp_unclosed", usage: testUsage(), output: [] } },
+      ],
+    ];
+
+    for (const events of invalidStreams) {
+      const provider = testProvider();
+      (provider as unknown as {
+        postSSE(): AsyncGenerator<Record<string, unknown>>;
+      }).postSSE = async function* () {
+        for (const ev of events) {
+          yield ev;
+        }
+      };
+
+      await assert.rejects(
+        provider.chat(providerMessages(), { model: "gpt-5.6-sol" }),
+        ChatGPTOAuthProtocolError,
+      );
+    }
   });
 });

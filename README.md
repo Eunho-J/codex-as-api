@@ -158,9 +158,25 @@ model_auto_compact_token_limit = 244800
 
 ### Supported Models
 
-Models and capabilities come only from the authenticated Codex `/models` response. The proxy keeps each account/base-URL/client-version snapshot in memory for 300 seconds, invalidates it when a Responses `X-Models-Etag` changes, and never serves a static, stale, or cross-account fallback. An unavailable or malformed refresh returns `503 catalog_unavailable` before streaming headers are sent; an upstream HTTP rejection after the one allowed OAuth refresh preserves its status as `upstream_error`.
+Ordinary models and capabilities come from the authenticated Codex `/models` response. The proxy keeps each account/base-URL/client-version snapshot in memory for 300 seconds and invalidates it when a Responses `X-Models-Etag` changes. An unavailable or malformed refresh returns `503 catalog_unavailable` before streaming headers are sent; an upstream HTTP rejection after the one allowed OAuth refresh preserves its status as `upstream_error`. Model snapshots are never shared across accounts or served as an offline fallback.
 
-Use `GET /v1/models` instead of relying on a documentation list. Every row in the fresh authenticated snapshot is returned, including its exact slug, visibility, `supported_in_api`, reasoning-summary controls, and opaque `comp_hash` compatibility identifier when supplied. A valid empty catalog returns `200` with `data: []`; health and model-default resolution then return `503 catalog_unavailable` rather than selecting a fallback. Requests must use an exact live slug; unknown explicit IDs return `404 model_not_found`.
+Use `GET /v1/models` for the effective catalog. It includes exact slugs, visibility, `supported_in_api`, reasoning-summary controls, and opaque `comp_hash` compatibility identifiers when supplied. Unknown IDs return `404 model_not_found`. Automatic default selection uses only the upstream catalog's originally visible models, not the experimental additions below.
+
+#### Experimental hidden models
+
+These three upstream-hidden models returned real responses on October 24, 2026, and are explicitly included in codex-as-api's effective catalog:
+
+| Model ID | Observed upstream purpose |
+| --- | --- |
+| `gpt-6-chat-thinking` | Server-described paid CCA experiment; hidden and marked unsupported in the upstream API catalog |
+| `gpt-reserve` | Official Codex CLI's Luna Reserve routing for reserve usage |
+| `codex-auto-review` | Official Codex CLI's Guardian automatic approval-review model |
+
+A small authenticated smoke test also verified function-tool calling plus tool-result continuation for all three models, and executed a simple generated JavaScript function against four inputs per model. This is a basic functionality check, not a coding-quality benchmark.
+
+**These are hidden models. Upstream support can stop at any time, and availability may differ by account. If a model stops responding, [open an issue](https://github.com/Eunho-J/codex-as-api/issues) with its model ID and a sanitized error; we will remove the discontinued model from this catalog.** Do not include access tokens or other credentials in the issue.
+
+The proxy exposes these verified exceptions as selectable models and prefers their current live capability metadata. Bundled capability records keep only these three IDs available when a successful live catalog omits them; they do not bypass OAuth, upstream rejection, or a failed/malformed catalog fetch. A successful empty upstream catalog can therefore list these experimental entries, while health/default selection still fails until an ordinary upstream default is available. The proxy never selects a hidden experimental model as its automatic default.
 
 To use a different port:
 
@@ -289,7 +305,11 @@ curl -N http://localhost:18080/v1/messages \
   }'
 ```
 
-With `thinking.display: "summarized"` (the enabled/adaptive default), real Codex reasoning summaries are returned as unsigned Anthropic `thinking` blocks and streamed `thinking_delta` content, alongside the existing `codex_reasoning` / `codex_reasoning_delta` extensions. `display: "omitted"` and disabled thinking suppress reasoning output. No Anthropic signature is fabricated. Valid thinking blocks in replayed assistant history are checked and stripped before Codex input; ordinary text and tool calls are preserved.
+With `thinking.display: "summarized"` (the enabled/adaptive default), real Codex reasoning summaries are returned as Anthropic `thinking` blocks and streamed `thinking_delta` content, alongside the existing `codex_reasoning` / `codex_reasoning_delta` extensions. When upstream supplies encrypted reasoning, each reasoning item has its own proxy-specific `signature`: `codex-reasoning-v1:` followed by base64url JSON containing the format version, actual backend model ID, and original reasoning item ID, encrypted content and summary. This is an opaque continuation envelope, not an Anthropic cryptographic signature.
+
+On the following assistant-history request, recognized envelopes restore the original Responses reasoning items before that assistant turn's text/tool calls. Historical signed reasoning is accepted even when the current call uses `thinking: {"type":"disabled"}`, including compaction calls: current output-generation settings do not invalidate prior reasoning input. Ciphertext is preserved unchanged; summary text is never converted to ordinary assistant speech. Missing or foreign signatures retain the legacy ignored-thinking behavior, while malformed recognized envelopes return HTTP 400. Reasoning is retained for the same backend model and across the verified `gpt-6.1-sol` / `gpt-6-astra` / `gpt-6-sol` / `gpt-6-luna` / `gpt-daybreak-blue-latest` combinations (25 authenticated source/target pairs); other cross-model envelopes are discarded while ordinary history remains.
+
+Multiple summary parts share one thinking block per reasoning item. Encrypted-only items use an empty thinking string with a non-empty signature. Streaming sends `signature_delta` before the matching `content_block_stop`. `display: "omitted"` hides the summary but can preserve an encrypted-only signed block for continuity; disabled thinking suppresses thinking output. Items without encrypted content retain unsigned-summary compatibility behavior.
 
 Hosted Anthropic `web_search` declarations are rejected with HTTP 400 on
 Messages, token-counting, and compact requests. OpenAI Responses cannot supply
@@ -546,7 +566,7 @@ unchanged. The proxy does not inherit speed defaults from Codex config.
 
 Official behavior reference: Codex [0.164.0 service-tier resolution](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/tui/src/service_tier_resolution.rs)
 and [stable, enabled-by-default ultrafast feature](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/features/src/lib.rs).
-The rest of the private HTTP contract remains pinned to 0.153.3.
+The bundled private-protocol reference records the reviewed Codex source revision. Outbound client identity is separate: the proxy resolves the stable `latest` version of npm [`@openai/codex`](https://www.npmjs.com/package/@openai/codex) and uses that same version for the model-catalog `client_version` query and Codex User-Agent. It is not hardcoded to the bundled reference or inferred from a locally installed CLI. Successful version lookups are cached for one hour; a refresh failure retains the last successfully resolved version and retries after a short backoff. A cold lookup failure returns an explicit availability error rather than advertising an invented version.
 
 Authenticated tests on July 10, 2026 verified both official continuation paths with `gpt-5.6-sol`: a direct private Responses WebSocket completed a second delta request using the exact prior `response.id`, and the private HTTP endpoint completed the same continuation when the full prior input/output history was replayed. The proxy implements the HTTP replay strategy. Direct HTTP forwarding of `previous_response_id`, Pro, public cache controls, and `safety_identifier` was rejected and is not used. See OpenAI's [reasoning mode documentation](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode) and the Codex 0.153.3 [HTTP/WebSocket request structures](https://github.com/openai/codex/blob/b1a547b1f73ce86205d9222ac19cff334b3b7a2e/codex-rs/codex-api/src/common.rs#L275-L350).
 

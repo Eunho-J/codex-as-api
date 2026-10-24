@@ -2,12 +2,17 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::strict_json;
 
 pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
+pub const VERIFIED_HIDDEN_MODEL_WARNING: &str =
+    "Experimental hidden model; upstream support may stop at any time.";
+const VERIFIED_HIDDEN_MODELS_JSON: &str = include_str!("../../config/verified-hidden-models.json");
+const VERIFIED_HIDDEN_MODEL_SLUGS: [&str; 3] =
+    ["gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CatalogKey {
@@ -81,7 +86,9 @@ impl ModelCatalogSnapshot {
     pub fn default_model(&self) -> Option<Arc<ModelInfo>> {
         self.models
             .iter()
-            .filter(|model| model.visibility == "list")
+            .filter(|model| {
+                model.visibility == "list" && !is_verified_hidden_model_slug(&model.slug)
+            })
             .min_by_key(|model| model.priority)
             .cloned()
     }
@@ -428,6 +435,274 @@ fn string_array(
     Ok(result)
 }
 
+fn is_verified_hidden_model_slug(slug: &str) -> bool {
+    VERIFIED_HIDDEN_MODEL_SLUGS.contains(&slug)
+}
+
+fn promote_verified_hidden_model(mut model: ModelInfo) -> ModelInfo {
+    model.description = Some(VERIFIED_HIDDEN_MODEL_WARNING.to_string());
+    model.visibility = "list".to_string();
+    model.supported_in_api = true;
+    model
+}
+
+fn parse_model_info(value: &Value, path: &str) -> Result<ModelInfo, CatalogError> {
+    let object = required_object(value, path)?;
+    let slug = required_preserved_string(object, "slug", path)?;
+    let display_name = required_preserved_string(object, "display_name", path)?;
+    let description = optional_preserved_string(object, "description", path)?;
+    let default_reasoning_level =
+        optional_reasoning_effort(object, "default_reasoning_level", path)?;
+    let multi_agent_reasoning_effort =
+        optional_reasoning_effort(object, "multi_agent_reasoning_effort", path)?;
+
+    let level_values = object
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CatalogError::Invalid(format!(
+                "{path}.supported_reasoning_levels must be an array"
+            ))
+        })?;
+    let mut supported_reasoning_levels = Vec::with_capacity(level_values.len());
+    for (level_index, level) in level_values.iter().enumerate() {
+        let level_path = format!("{path}.supported_reasoning_levels[{level_index}]");
+        let level = required_object(level, &level_path)?;
+        let effort = required_reasoning_effort(level, "effort", &level_path)?;
+        let description = level
+            .get("description")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("{level_path}.description must be a string"))
+            })?
+            .to_string();
+        supported_reasoning_levels.push(ReasoningLevel {
+            effort,
+            description,
+        });
+    }
+    let visibility = required_string(object, "visibility", path)?;
+    if !matches!(visibility.as_str(), "list" | "hide" | "none") {
+        return Err(CatalogError::Invalid(format!(
+            "{path}.visibility must be one of: list, hide, none"
+        )));
+    }
+    let supported_in_api = required_bool(object, "supported_in_api", path)?;
+    let priority = object
+        .get("priority")
+        .and_then(Value::as_number)
+        .and_then(strict_json::as_js_safe_integer)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| {
+            CatalogError::Invalid(format!("{path}.priority must be a 32-bit integer"))
+        })?;
+
+    let tier_values = match object.get("service_tiers") {
+        None => &[][..],
+        Some(Value::Array(values)) => values.as_slice(),
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.service_tiers must be an array"
+            )));
+        }
+    };
+    let mut service_tiers = Vec::with_capacity(tier_values.len());
+    for (tier_index, tier) in tier_values.iter().enumerate() {
+        let tier_path = format!("{path}.service_tiers[{tier_index}]");
+        let tier = required_object(tier, &tier_path)?;
+        let id = required_preserved_string(tier, "id", &tier_path)?;
+        let name = required_preserved_string(tier, "name", &tier_path)?;
+        let description = tier
+            .get("description")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("{tier_path}.description must be a string"))
+            })?
+            .to_string();
+        service_tiers.push(ServiceTier {
+            id,
+            name,
+            description,
+        });
+    }
+    let default_service_tier = optional_preserved_string(object, "default_service_tier", path)?;
+    let support_verbosity = required_bool(object, "support_verbosity", path)?;
+    let default_verbosity = optional_string(object, "default_verbosity", path)?;
+    if default_verbosity
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "low" | "medium" | "high"))
+    {
+        return Err(CatalogError::Invalid(format!(
+            "{path}.default_verbosity must be one of: low, medium, high"
+        )));
+    }
+    let supports_reasoning_summary_parameter =
+        match object.get("supports_reasoning_summary_parameter") {
+            None => true,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(CatalogError::Invalid(format!(
+                    "{path}.supports_reasoning_summary_parameter must be a boolean"
+                )));
+            }
+        };
+    let default_reasoning_summary = match object.get("default_reasoning_summary") {
+        None => "auto".to_string(),
+        Some(Value::String(value))
+            if matches!(value.as_str(), "auto" | "concise" | "detailed" | "none") =>
+        {
+            value.clone()
+        }
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.default_reasoning_summary must be one of: auto, concise, detailed, none"
+            )));
+        }
+    };
+    let comp_hash = optional_preserved_string(object, "comp_hash", path)?;
+    let supports_image_detail_original = match object.get("supports_image_detail_original") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.supports_image_detail_original must be a boolean"
+            )));
+        }
+    };
+    let context_window = optional_safe_integer(object, "context_window", path)?;
+    let max_context_window = optional_safe_integer(object, "max_context_window", path)?;
+    let auto_compact_token_limit = optional_safe_integer(object, "auto_compact_token_limit", path)?;
+    let effective_context_window_percent = match object.get("effective_context_window_percent") {
+        None => 95,
+        Some(Value::Number(number)) => {
+            strict_json::as_js_safe_integer(number).ok_or_else(|| {
+                CatalogError::Invalid(format!(
+                    "{path}.effective_context_window_percent must be a JavaScript-safe integer"
+                ))
+            })?
+        }
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.effective_context_window_percent must be a JavaScript-safe integer"
+            )));
+        }
+    };
+    let input_modalities = match object.get("input_modalities") {
+        None => vec!["text".to_string(), "image".to_string()],
+        Some(Value::Array(_)) => string_array(object, "input_modalities", path)?,
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.input_modalities must be an array"
+            )));
+        }
+    };
+    if input_modalities
+        .iter()
+        .find(|modality| !matches!(modality.as_str(), "text" | "image" | "audio"))
+        .is_some()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "{path}.input_modalities contains an unsupported value"
+        )));
+    }
+    let use_responses_lite = match object.get("use_responses_lite") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CatalogError::Invalid(format!(
+                "{path}.use_responses_lite must be a boolean"
+            )));
+        }
+    };
+    Ok(ModelInfo {
+        slug,
+        display_name,
+        description,
+        default_reasoning_level,
+        supported_reasoning_levels,
+        multi_agent_reasoning_effort,
+        visibility,
+        supported_in_api,
+        priority,
+        service_tiers,
+        default_service_tier,
+        support_verbosity,
+        default_verbosity,
+        supports_reasoning_summary_parameter,
+        default_reasoning_summary,
+        comp_hash,
+        supports_image_detail_original,
+        context_window,
+        max_context_window,
+        auto_compact_token_limit,
+        effective_context_window_percent,
+        input_modalities,
+        use_responses_lite,
+    })
+}
+
+fn load_verified_hidden_models() -> Result<Vec<Arc<ModelInfo>>, CatalogError> {
+    let root =
+        strict_json::parse_slice(VERIFIED_HIDDEN_MODELS_JSON.as_bytes()).map_err(|error| {
+            CatalogError::Internal(format!(
+                "verified-hidden-models config must be valid JSON: {error}"
+            ))
+        })?;
+    let root = root.as_object().ok_or_else(|| {
+        CatalogError::Internal("verified-hidden-models config must be an object".into())
+    })?;
+    let verified_at = required_string(root, "verified_at", "verified-hidden-models")
+        .map_err(|error| CatalogError::Internal(error.to_string()))?;
+    if verified_at.is_empty() {
+        return Err(CatalogError::Internal(
+            "verified-hidden-models.verified_at must be a non-empty string".into(),
+        ));
+    }
+    let warning = required_preserved_string(root, "warning", "verified-hidden-models")
+        .map_err(|error| CatalogError::Internal(error.to_string()))?;
+    if warning != VERIFIED_HIDDEN_MODEL_WARNING {
+        return Err(CatalogError::Internal(
+            "verified-hidden-models.warning does not match the canonical warning".into(),
+        ));
+    }
+    let models = root
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CatalogError::Internal("verified-hidden-models.models must be an array".into())
+        })?;
+    if models.len() != VERIFIED_HIDDEN_MODEL_SLUGS.len() {
+        return Err(CatalogError::Internal(
+            "verified-hidden-models.models must contain the three verified hidden models".into(),
+        ));
+    }
+    let mut parsed = Vec::with_capacity(models.len());
+    for (index, value) in models.iter().enumerate() {
+        let path = format!("verified-hidden-models.models[{index}]");
+        let model = promote_verified_hidden_model(
+            parse_model_info(value, &path)
+                .map_err(|error| CatalogError::Internal(error.to_string()))?,
+        );
+        if model.slug != VERIFIED_HIDDEN_MODEL_SLUGS[index] {
+            return Err(CatalogError::Internal(
+                "verified-hidden-models.models slugs do not match the canonical verified hidden models"
+                    .into(),
+            ));
+        }
+        parsed.push(Arc::new(model));
+    }
+    Ok(parsed)
+}
+
+fn verified_hidden_models() -> Result<&'static [Arc<ModelInfo>], CatalogError> {
+    static VERIFIED_HIDDEN_MODELS: OnceLock<Result<Vec<Arc<ModelInfo>>, CatalogError>> =
+        OnceLock::new();
+    match VERIFIED_HIDDEN_MODELS.get_or_init(load_verified_hidden_models) {
+        Ok(models) => Ok(models.as_slice()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 pub fn parse_models_response(body: &[u8]) -> Result<Vec<Arc<ModelInfo>>, CatalogError> {
     let root = strict_json::parse_slice(body)
         .map_err(|error| CatalogError::Invalid(format!("root must be valid JSON: {error}")))?;
@@ -438,210 +713,26 @@ pub fn parse_models_response(body: &[u8]) -> Result<Vec<Arc<ModelInfo>>, Catalog
         .get("models")
         .and_then(Value::as_array)
         .ok_or_else(|| CatalogError::Invalid("root.models must be an array".into()))?;
-    let mut parsed = Vec::with_capacity(models.len());
+    let fallback_models = verified_hidden_models()?;
+    let mut parsed = Vec::with_capacity(models.len() + fallback_models.len());
     let mut slugs = HashSet::new();
     for (index, value) in models.iter().enumerate() {
         let path = format!("root.models[{index}]");
-        let object = required_object(value, &path)?;
-        let slug = required_preserved_string(object, "slug", &path)?;
-        if !slugs.insert(slug.clone()) {
+        let mut model = parse_model_info(value, &path)?;
+        if !slugs.insert(model.slug.clone()) {
             return Err(CatalogError::Invalid(
                 "model catalog contains a duplicate model slug".to_string(),
             ));
         }
-        let display_name = required_preserved_string(object, "display_name", &path)?;
-        let description = optional_preserved_string(object, "description", &path)?;
-        let default_reasoning_level =
-            optional_reasoning_effort(object, "default_reasoning_level", &path)?;
-        let multi_agent_reasoning_effort =
-            optional_reasoning_effort(object, "multi_agent_reasoning_effort", &path)?;
-
-        let level_values = object
-            .get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                CatalogError::Invalid(format!(
-                    "{path}.supported_reasoning_levels must be an array"
-                ))
-            })?;
-        let mut supported_reasoning_levels = Vec::with_capacity(level_values.len());
-        for (level_index, level) in level_values.iter().enumerate() {
-            let level_path = format!("{path}.supported_reasoning_levels[{level_index}]");
-            let level = required_object(level, &level_path)?;
-            let effort = required_reasoning_effort(level, "effort", &level_path)?;
-            let description = level
-                .get("description")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    CatalogError::Invalid(format!("{level_path}.description must be a string"))
-                })?
-                .to_string();
-            supported_reasoning_levels.push(ReasoningLevel {
-                effort,
-                description,
-            });
+        if is_verified_hidden_model_slug(&model.slug) {
+            model = promote_verified_hidden_model(model);
         }
-        let visibility = required_string(object, "visibility", &path)?;
-        if !matches!(visibility.as_str(), "list" | "hide" | "none") {
-            return Err(CatalogError::Invalid(format!(
-                "{path}.visibility must be one of: list, hide, none"
-            )));
+        parsed.push(Arc::new(model));
+    }
+    for fallback in fallback_models {
+        if !slugs.contains(&fallback.slug) {
+            parsed.push(fallback.clone());
         }
-        let supported_in_api = required_bool(object, "supported_in_api", &path)?;
-        let priority = object
-            .get("priority")
-            .and_then(Value::as_number)
-            .and_then(strict_json::as_js_safe_integer)
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| {
-                CatalogError::Invalid(format!("{path}.priority must be a 32-bit integer"))
-            })?;
-
-        let tier_values = match object.get("service_tiers") {
-            None => &[][..],
-            Some(Value::Array(values)) => values.as_slice(),
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.service_tiers must be an array"
-                )));
-            }
-        };
-        let mut service_tiers = Vec::with_capacity(tier_values.len());
-        for (tier_index, tier) in tier_values.iter().enumerate() {
-            let tier_path = format!("{path}.service_tiers[{tier_index}]");
-            let tier = required_object(tier, &tier_path)?;
-            let id = required_preserved_string(tier, "id", &tier_path)?;
-            let name = required_preserved_string(tier, "name", &tier_path)?;
-            let description = tier
-                .get("description")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    CatalogError::Invalid(format!("{tier_path}.description must be a string"))
-                })?
-                .to_string();
-            service_tiers.push(ServiceTier {
-                id,
-                name,
-                description,
-            });
-        }
-        let default_service_tier =
-            optional_preserved_string(object, "default_service_tier", &path)?;
-        let support_verbosity = required_bool(object, "support_verbosity", &path)?;
-        let default_verbosity = optional_string(object, "default_verbosity", &path)?;
-        if default_verbosity
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "low" | "medium" | "high"))
-        {
-            return Err(CatalogError::Invalid(format!(
-                "{path}.default_verbosity must be one of: low, medium, high"
-            )));
-        }
-        let supports_reasoning_summary_parameter =
-            match object.get("supports_reasoning_summary_parameter") {
-                None => true,
-                Some(Value::Bool(value)) => *value,
-                Some(_) => {
-                    return Err(CatalogError::Invalid(format!(
-                        "{path}.supports_reasoning_summary_parameter must be a boolean"
-                    )));
-                }
-            };
-        let default_reasoning_summary = match object.get("default_reasoning_summary") {
-            None => "auto".to_string(),
-            Some(Value::String(value))
-                if matches!(value.as_str(), "auto" | "concise" | "detailed" | "none") =>
-            {
-                value.clone()
-            }
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.default_reasoning_summary must be one of: auto, concise, detailed, none"
-                )));
-            }
-        };
-        let comp_hash = optional_preserved_string(object, "comp_hash", &path)?;
-        let supports_image_detail_original = match object.get("supports_image_detail_original") {
-            None => false,
-            Some(Value::Bool(value)) => *value,
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.supports_image_detail_original must be a boolean"
-                )));
-            }
-        };
-        let context_window = optional_safe_integer(object, "context_window", &path)?;
-        let max_context_window = optional_safe_integer(object, "max_context_window", &path)?;
-        let auto_compact_token_limit =
-            optional_safe_integer(object, "auto_compact_token_limit", &path)?;
-        let effective_context_window_percent = match object.get("effective_context_window_percent")
-        {
-            None => 95,
-            Some(Value::Number(number)) => {
-                strict_json::as_js_safe_integer(number).ok_or_else(|| {
-                    CatalogError::Invalid(format!(
-                        "{path}.effective_context_window_percent must be a JavaScript-safe integer"
-                    ))
-                })?
-            }
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.effective_context_window_percent must be a JavaScript-safe integer"
-                )));
-            }
-        };
-        let input_modalities = match object.get("input_modalities") {
-            None => vec!["text".to_string(), "image".to_string()],
-            Some(Value::Array(_)) => string_array(object, "input_modalities", &path)?,
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.input_modalities must be an array"
-                )));
-            }
-        };
-        if input_modalities
-            .iter()
-            .find(|modality| !matches!(modality.as_str(), "text" | "image" | "audio"))
-            .is_some()
-        {
-            return Err(CatalogError::Invalid(format!(
-                "{path}.input_modalities contains an unsupported value"
-            )));
-        }
-        let use_responses_lite = match object.get("use_responses_lite") {
-            None => false,
-            Some(Value::Bool(value)) => *value,
-            Some(_) => {
-                return Err(CatalogError::Invalid(format!(
-                    "{path}.use_responses_lite must be a boolean"
-                )));
-            }
-        };
-        parsed.push(Arc::new(ModelInfo {
-            slug,
-            display_name,
-            description,
-            default_reasoning_level,
-            supported_reasoning_levels,
-            multi_agent_reasoning_effort,
-            visibility,
-            supported_in_api,
-            priority,
-            service_tiers,
-            default_service_tier,
-            support_verbosity,
-            default_verbosity,
-            supports_reasoning_summary_parameter,
-            default_reasoning_summary,
-            comp_hash,
-            supports_image_detail_original,
-            context_window,
-            max_context_window,
-            auto_compact_token_limit,
-            effective_context_window_percent,
-            input_modalities,
-            use_responses_lite,
-        }));
     }
 
     Ok(parsed)
@@ -742,9 +833,14 @@ mod tests {
 
     #[test]
     fn preserves_empty_catalogs_opaque_slugs_comp_hash_and_custom_reasoning_values() {
-        assert!(parse_models_response(br#"{"models":[]}"#)
-            .unwrap()
-            .is_empty());
+        let empty_catalog = parse_models_response(br#"{"models":[]}"#).unwrap();
+        assert_eq!(
+            empty_catalog
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review"]
+        );
 
         let mut candidate = model(" ", 1);
         candidate["comp_hash"] = json!(" compatibility family ");
@@ -1132,6 +1228,119 @@ mod tests {
         };
         assert!(snapshot.default_model().is_none());
         assert_eq!(snapshot.model("hidden").unwrap().slug, "hidden");
+    }
+
+    #[test]
+    fn verified_hidden_models_merge_without_duplicates_and_preserve_live_capabilities() {
+        let mut live_reserve = model("gpt-reserve", 1);
+        live_reserve["description"] = json!("upstream hidden description");
+        live_reserve["visibility"] = json!("hide");
+        live_reserve["supported_in_api"] = json!(false);
+        live_reserve["context_window"] = json!(333_333);
+        live_reserve["max_context_window"] = json!(400_000);
+        live_reserve["default_reasoning_level"] = json!("high");
+        live_reserve["supported_reasoning_levels"] = json!([
+            {"effort": "low", "description": "low"},
+            {"effort": "high", "description": "high"}
+        ]);
+        live_reserve["comp_hash"] = json!("live-comp-hash");
+
+        let parsed = parse_models_response(
+            &serde_json::to_vec(&json!({
+                "models": [model("gpt-5.4", 10), live_reserve]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "gpt-5.4",
+                "gpt-reserve",
+                "gpt-6-chat-thinking",
+                "codex-auto-review"
+            ]
+        );
+        let by_slug = parsed
+            .iter()
+            .map(|model| (model.slug.clone(), model.clone()))
+            .collect();
+        let snapshot = ModelCatalogSnapshot {
+            key: key("account"),
+            models: parsed,
+            by_slug,
+            etag: None,
+            fetched_at: Utc::now(),
+            expires_at: Utc::now() + Duration::from_secs(60),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+
+        assert_eq!(snapshot.default_model().unwrap().slug, "gpt-5.4");
+        for slug in ["gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review"] {
+            let hidden = snapshot.model(slug).unwrap();
+            assert_eq!(hidden.visibility, "list");
+            assert!(hidden.supported_in_api);
+            assert_eq!(
+                hidden.description.as_deref(),
+                Some(VERIFIED_HIDDEN_MODEL_WARNING)
+            );
+        }
+
+        let reserve = snapshot.model("gpt-reserve").unwrap();
+        assert_eq!(reserve.context_window, Some(333_333));
+        assert_eq!(reserve.max_context_window, Some(400_000));
+        assert_eq!(reserve.default_reasoning_level.as_deref(), Some("high"));
+        assert_eq!(reserve.comp_hash.as_deref(), Some("live-comp-hash"));
+
+        let chat_thinking = snapshot.model("gpt-6-chat-thinking").unwrap();
+        assert_eq!(chat_thinking.context_window, Some(272_000));
+        assert_eq!(
+            chat_thinking.default_reasoning_level.as_deref(),
+            Some("medium")
+        );
+        assert!(!chat_thinking.support_verbosity);
+        assert_eq!(chat_thinking.default_verbosity.as_deref(), Some("medium"));
+
+        let auto_review = snapshot.model("codex-auto-review").unwrap();
+        assert_eq!(auto_review.context_window, Some(272_000));
+        assert_eq!(
+            auto_review.default_reasoning_level.as_deref(),
+            Some("medium")
+        );
+        assert!(auto_review.support_verbosity);
+        assert_eq!(auto_review.default_verbosity.as_deref(), Some("low"));
+
+        let empty_parsed = parse_models_response(br#"{"models":[]}"#).unwrap();
+        let empty_by_slug = empty_parsed
+            .iter()
+            .map(|model| (model.slug.clone(), model.clone()))
+            .collect();
+        let empty_snapshot = ModelCatalogSnapshot {
+            key: key("account"),
+            models: empty_parsed,
+            by_slug: empty_by_slug,
+            etag: None,
+            fetched_at: Utc::now(),
+            expires_at: Utc::now() + Duration::from_secs(60),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        assert!(empty_snapshot.default_model().is_none());
+        assert_eq!(
+            empty_snapshot.model("gpt-6-chat-thinking").unwrap().slug,
+            "gpt-6-chat-thinking"
+        );
+        assert_eq!(
+            empty_snapshot.model("gpt-reserve").unwrap().slug,
+            "gpt-reserve"
+        );
+        assert_eq!(
+            empty_snapshot.model("codex-auto-review").unwrap().slug,
+            "codex-auto-review"
+        );
+        assert!(empty_snapshot.model("unknown-hidden-model").is_none());
     }
 
     #[test]

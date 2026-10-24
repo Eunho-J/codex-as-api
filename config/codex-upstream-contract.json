@@ -1,9 +1,9 @@
 {
   "upstream": {
     "repository": "openai/codex",
-    "version": "0.153.3",
-    "tag": "rust-v0.153.3",
-    "commit": "b1a547b1f73ce86205d9222ac19cff334b3b7a2e"
+    "version": "0.164.0",
+    "tag": "rust-v0.164.0",
+    "commit": "6aaac694803004a63c6f393d153c96d22521a6b9"
   },
   "models_request": {
     "path": "/models",

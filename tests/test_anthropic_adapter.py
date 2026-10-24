@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -20,6 +21,15 @@ from codex_as_api.messages import (
     MessageRole,
     ToolCall,
     Usage,
+)
+from codex_as_api.reasoning_signature import (
+    REASONING_COMPATIBLE_MODELS,
+    REASONING_SIGNATURE_PREFIX,
+    decode_reasoning_signature,
+    encode_reasoning_signature,
+    extract_reasoning_item_for_model,
+    is_reasoning_model_compatible,
+    is_recognized_reasoning_signature,
 )
 
 # ---------------------------------------------------------------------------
@@ -1872,3 +1882,634 @@ class TestFormatAnthropicError:
     def test_rate_limit(self):
         result = format_anthropic_error(429, "slow down")
         assert result["error"]["type"] == "rate_limit_error"
+
+
+# ---------------------------------------------------------------------------
+# Signed reasoning signature envelope and Anthropic thinking block tests
+# ---------------------------------------------------------------------------
+
+
+def _encode_raw_signature_json(raw_json: str) -> str:
+    encoded = base64.urlsafe_b64encode(raw_json.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{REASONING_SIGNATURE_PREFIX}{encoded}"
+
+
+class TestReasoningSignatureAndAnthropicAdapter:
+    def test_encode_and_decode_roundtrip_excludes_transient_fields_and_preserves_summary(self):
+        signature = encode_reasoning_signature(
+            model="gpt-5.6-sol",
+            item={
+                "type": "reasoning",
+                "id": "rs_123",
+                "status": "completed",
+                "encrypted_content": "gAAAAABencrypted+payload/123==",
+                "summary": [
+                    {"type": "summary_text", "text": "First step."},
+                    {"type": "summary_text", "text": "Second step."},
+                ],
+                "content": [{"type": "reasoning_text", "text": "raw reasoning"}],
+            },
+        )
+        assert signature is not None
+        assert signature.startswith("codex-reasoning-v1:")
+        assert "=" not in signature[len(REASONING_SIGNATURE_PREFIX) :]
+
+        decoded = decode_reasoning_signature(signature)
+        assert decoded == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_123",
+                "encrypted_content": "gAAAAABencrypted+payload/123==",
+                "summary": [
+                    {"type": "summary_text", "text": "First step."},
+                    {"type": "summary_text", "text": "Second step."},
+                ],
+            },
+        }
+        assert extract_reasoning_item_for_model(decoded, backend_model="gpt-5.6-sol") == decoded["item"]
+        assert extract_reasoning_item_for_model(decoded, backend_model="gpt-5.7-other") is None
+
+    def test_encode_omits_id_when_absent_and_returns_none_without_encrypted_content(self):
+        signature = encode_reasoning_signature(
+            model="gpt-5.6-sol",
+            item={
+                "type": "reasoning",
+                "encrypted_content": "enc_only",
+                "summary": [],
+            },
+        )
+        assert signature is not None
+        decoded = decode_reasoning_signature(signature)
+        assert decoded == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "encrypted_content": "enc_only",
+                "summary": [],
+            },
+        }
+
+        assert (
+            encode_reasoning_signature(
+                model="gpt-5.6-sol",
+                item={"type": "reasoning", "summary": [{"type": "summary_text", "text": "no enc"}]},
+            )
+            is None
+        )
+        assert (
+            encode_reasoning_signature(
+                model="gpt-5.6-sol",
+                item={"type": "reasoning", "encrypted_content": "", "summary": []},
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("signature", "expected"),
+        [
+            (None, False),
+            ("", False),
+            ("sig-1", False),
+            ("anthropic-sig-xyz", False),
+            ("codex-reasoning-v1:abc", True),
+            ("codex-reasoning-v2:abc", True),
+            ("codex-reasoning:abc", True),
+        ],
+    )
+    def test_is_recognized_reasoning_signature(self, signature, expected):
+        assert is_recognized_reasoning_signature(signature) is expected
+
+    @pytest.mark.parametrize(
+        "invalid_signature",
+        [
+            "codex-reasoning-v2:eyJ2IjoxfQ",
+            "codex-reasoning:eyJ2IjoxfQ",
+            "codex-reasoning-v1:",
+            "codex-reasoning-v1:not valid base64!",
+            "codex-reasoning-v1:eyJ2IjoxfQ=",
+            "codex-reasoning-v1:AAB",
+            "codex-reasoning-v1:" + base64.urlsafe_b64encode(bytes([255, 254])).decode("ascii").rstrip("="),
+            _encode_raw_signature_json("{bad json"),
+            _encode_raw_signature_json('["not-an-object"]'),
+            _encode_raw_signature_json(
+                '{"v":1,"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":2,"model":"gpt-5.6-sol","item":{"type":"reasoning","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":true,"model":"gpt-5.6-sol","item":{"type":"reasoning","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"  ","item":{"type":"reasoning","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol","extra":1,'
+                '"item":{"type":"reasoning","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol","item":{"type":"message","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","id":"","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol","item":{"type":"reasoning","encrypted_content":"","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","status":"completed","encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","content":[],"encrypted_content":"enc","summary":[]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","encrypted_content":"enc",'
+                '"summary":[{"type":"input_text","text":"x"}]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","encrypted_content":"enc",'
+                '"summary":[{"type":"summary_text","text":123}]}}'
+            ),
+            _encode_raw_signature_json(
+                '{"v":1,"model":"gpt-5.6-sol",'
+                '"item":{"type":"reasoning","encrypted_content":"enc",'
+                '"summary":[{"type":"summary_text","text":"x","extra":1}]}}'
+            ),
+        ],
+    )
+    def test_decode_rejects_invalid_signatures(self, invalid_signature):
+        with pytest.raises(ValueError):
+            decode_reasoning_signature(invalid_signature)
+
+        with pytest.raises(ValueError):
+            anthropic_request_to_internal(
+                model="gpt-5.6-sol",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "x", "signature": invalid_signature},
+                            {"type": "text", "text": "hello"},
+                        ],
+                    }
+                ],
+                backend_model="gpt-5.6-sol",
+            )
+
+    def test_request_conversion_preserves_same_model_reasoning_and_ignores_foreign_or_mismatched(self):
+        sig_1 = encode_reasoning_signature(
+            model="gpt-5.6-sol",
+            item={
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_1",
+                "summary": [{"type": "summary_text", "text": "Plan A"}],
+            },
+        )
+        sig_2 = encode_reasoning_signature(
+            model="gpt-5.6-sol",
+            item={
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [],
+            },
+        )
+        sig_other_model = encode_reasoning_signature(
+            model="gpt-5.7-other",
+            item={
+                "type": "reasoning",
+                "id": "rs_other",
+                "encrypted_content": "enc_other",
+                "summary": [{"type": "summary_text", "text": "Other model plan"}],
+            },
+        )
+
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="claude-sonnet-4-5",
+            backend_model="gpt-5.6-sol",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Unsigned thinking"},
+                        {"type": "thinking", "thinking": "Foreign thinking", "signature": "sig-foreign"},
+                        {"type": "thinking", "thinking": "Empty sig", "signature": ""},
+                        {"type": "thinking", "thinking": "Plan A", "signature": sig_1},
+                        {"type": "thinking", "thinking": "Other model", "signature": sig_other_model},
+                        {"type": "thinking", "thinking": "", "signature": sig_2},
+                        {"type": "text", "text": "Done."},
+                    ],
+                }
+            ],
+        )
+
+        assert len(messages) == 1
+        assert messages[0].role is MessageRole.ASSISTANT
+        assert messages[0].content == "Done."
+        assert messages[0].reasoning_items == (
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_1",
+                "summary": [{"type": "summary_text", "text": "Plan A"}],
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [],
+            },
+        )
+
+    def test_internal_response_to_anthropic_emits_signed_thinking_blocks_and_preserves_multi_part_summary(self):
+        response = AssistantResponse(
+            content="Final answer",
+            reasoning_content="First part\n\nSecond part\n\nThird item",
+            reasoning_items=(
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "enc_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "First part"},
+                        {"type": "summary_text", "text": "Second part"},
+                    ],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "encrypted_content": "enc_2",
+                    "summary": [],
+                },
+            ),
+            tool_calls=(ToolCall(id="call_1", name="lookup", arguments='{"q":"x"}'),),
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            finish_reason="tool_calls",
+        )
+
+        rendered = internal_response_to_anthropic(
+            response,
+            model="claude-sonnet-4-5",
+            request_id="msg_reasoning_fixture",
+            backend_model="gpt-5.6-sol",
+        )
+
+        assert [block["type"] for block in rendered["content"]] == [
+            "thinking",
+            "thinking",
+            "text",
+            "tool_use",
+        ]
+        assert rendered["content"][0]["thinking"] == "First partSecond part"
+        decoded_0 = decode_reasoning_signature(rendered["content"][0]["signature"])
+        assert decoded_0 == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_1",
+                "summary": [
+                    {"type": "summary_text", "text": "First part"},
+                    {"type": "summary_text", "text": "Second part"},
+                ],
+            },
+        }
+        assert rendered["content"][1]["thinking"] == ""
+        decoded_1 = decode_reasoning_signature(rendered["content"][1]["signature"])
+        assert decoded_1 == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [],
+            },
+        }
+        assert rendered["codex_reasoning"] == "First part\n\nSecond part\n\nThird item"
+
+    def test_internal_response_to_anthropic_omitted_and_disabled_modes(self):
+        response = AssistantResponse(
+            content="Answer",
+            finish_reason="stop",
+            reasoning_content="Visible summary",
+            reasoning_items=(
+                {
+                    "type": "reasoning",
+                    "id": "rs_enc",
+                    "encrypted_content": "enc_payload",
+                    "summary": [{"type": "summary_text", "text": "Visible summary"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_unenc",
+                    "summary": [{"type": "summary_text", "text": "Unsigned summary"}],
+                },
+            ),
+            usage=Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+        )
+
+        omitted = internal_response_to_anthropic(
+            response,
+            model="claude-sonnet-4-5",
+            request_id="msg_reasoning_fixture",
+            backend_model="gpt-5.6-sol",
+            thinking_display="omitted",
+        )
+        assert "codex_reasoning" not in omitted
+        assert [block["type"] for block in omitted["content"]] == ["thinking", "text"]
+        assert omitted["content"][0]["thinking"] == ""
+        assert decode_reasoning_signature(omitted["content"][0]["signature"]) == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_enc",
+                "encrypted_content": "enc_payload",
+                "summary": [{"type": "summary_text", "text": "Visible summary"}],
+            },
+        }
+
+        disabled = internal_response_to_anthropic(
+            response,
+            model="claude-sonnet-4-5",
+            request_id="msg_reasoning_fixture",
+            backend_model="gpt-5.6-sol",
+            thinking_disabled=True,
+        )
+        assert "codex_reasoning" not in disabled
+        assert disabled["content"] == [{"type": "text", "text": "Answer", "citations": None}]
+
+    def test_stream_adapter_emits_signature_delta_for_summarized_and_encrypted_only_items(self):
+        def _collect(**kwargs):
+            out = []
+            for chunk in anthropic_stream_adapter(
+                iter(events),
+                model="claude-sonnet-4-5",
+                request_id="msg_stream_fixture",
+                **kwargs,
+            ):
+                for line in chunk.strip().split("\n"):
+                    if line.startswith("data: "):
+                        out.append(json.loads(line[6:]))
+            return out
+
+        events = [
+            {"type": "reasoning_delta", "text": "Part 1", "item_id": "rs_1"},
+            {"type": "reasoning_section_break", "summary_index": 1, "item_id": "rs_1"},
+            {"type": "reasoning_delta", "text": "Part 2", "item_id": "rs_1"},
+            {
+                "type": "reasoning_item",
+                "model": "gpt-5.6-sol",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "enc_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "Part 1"},
+                        {"type": "summary_text", "text": "Part 2"},
+                    ],
+                },
+            },
+            {
+                "type": "reasoning_item",
+                "model": "gpt-5.6-sol",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "encrypted_content": "enc_2",
+                    "summary": [],
+                },
+            },
+            {"type": "content", "text": "Hello"},
+            {
+                "type": "finish",
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+            },
+        ]
+
+        rendered = _collect(backend_model="gpt-5.6-sol")
+        sig_deltas = [
+            e
+            for e in rendered
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "signature_delta"
+        ]
+        assert len(sig_deltas) == 2
+        assert sig_deltas[0]["index"] == 0
+        assert decode_reasoning_signature(sig_deltas[0]["delta"]["signature"]) == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_1",
+                "summary": [
+                    {"type": "summary_text", "text": "Part 1"},
+                    {"type": "summary_text", "text": "Part 2"},
+                ],
+            },
+        }
+        assert sig_deltas[1]["index"] == 1
+        assert decode_reasoning_signature(sig_deltas[1]["delta"]["signature"]) == {
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [],
+            },
+        }
+
+        omitted = _collect(backend_model="gpt-5.6-sol", thinking_display="omitted")
+        assert [e for e in omitted if e["type"] == "codex_reasoning_delta"] == []
+        assert [
+            e
+            for e in omitted
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "thinking_delta"
+        ] == []
+        omitted_sig_deltas = [
+            e
+            for e in omitted
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "signature_delta"
+        ]
+        assert len(omitted_sig_deltas) == 2
+
+        disabled = _collect(backend_model="gpt-5.6-sol", thinking_disabled=True)
+        assert [
+            e
+            for e in disabled
+            if e["type"] == "content_block_start" and e["content_block"]["type"] == "thinking"
+        ] == []
+
+    def test_stream_adapter_rejects_mismatched_reasoning_item_id_or_text(self):
+        def _collect(items):
+            return list(
+                anthropic_stream_adapter(
+                    iter(items),
+                    model="claude-sonnet-4-5",
+                    request_id="msg_stream_fixture",
+                )
+            )
+
+        mismatched_id_events = [
+            {"type": "reasoning_delta", "text": "Part 1", "item_id": "rs_1"},
+            {
+                "type": "reasoning_item",
+                "model": "gpt-5.6-sol",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "encrypted_content": "enc_1",
+                    "summary": [{"type": "summary_text", "text": "Part 1"}],
+                },
+            },
+        ]
+        with pytest.raises(ChatGPTOAuthProtocolError) as exc_id:
+            _collect(mismatched_id_events)
+        assert "id does not match streamed reasoning deltas" in str(exc_id.value)
+
+        mismatched_text_events = [
+            {"type": "reasoning_delta", "text": "Part 1", "item_id": "rs_1"},
+            {
+                "type": "reasoning_item",
+                "model": "gpt-5.6-sol",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "enc_1",
+                    "summary": [{"type": "summary_text", "text": "Different"}],
+                },
+            },
+        ]
+        with pytest.raises(ChatGPTOAuthProtocolError) as exc_text:
+            _collect(mismatched_text_events)
+        assert "summary does not match streamed reasoning deltas" in str(exc_text.value)
+
+    def test_reasoning_compatible_models_25_pair_matrix_and_outside_set_drop(self):
+        expected_compatible_models = {
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-daybreak-blue-latest",
+        }
+        assert set(REASONING_COMPATIBLE_MODELS) == expected_compatible_models
+        compatible_models = sorted(REASONING_COMPATIBLE_MODELS)
+        assert len(compatible_models) == 5
+
+        pair_count = 0
+        for source_model in compatible_models:
+            sig = encode_reasoning_signature(
+                model=source_model,
+                item={
+                    "type": "reasoning",
+                    "id": f"rs_{source_model}",
+                    "encrypted_content": f"enc_{source_model}",
+                    "summary": [{"type": "summary_text", "text": f"thought from {source_model}"}],
+                },
+            )
+            decoded = decode_reasoning_signature(sig)
+            for target_model in compatible_models:
+                pair_count += 1
+                assert is_reasoning_model_compatible(source_model, target_model) is True
+                extracted = extract_reasoning_item_for_model(decoded, backend_model=target_model)
+                assert extracted == {
+                    "type": "reasoning",
+                    "id": f"rs_{source_model}",
+                    "encrypted_content": f"enc_{source_model}",
+                    "summary": [{"type": "summary_text", "text": f"thought from {source_model}"}],
+                }
+                messages, _, _, _, _, _ = anthropic_request_to_internal(
+                    model=target_model,
+                    backend_model=target_model,
+                    thinking={"type": "disabled"},
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "", "signature": sig},
+                                {"type": "text", "text": "Prior answer"},
+                            ],
+                        },
+                        {"role": "user", "content": "Follow up"},
+                    ],
+                )
+                assert len(messages[0].reasoning_items) == 1
+                assert messages[0].reasoning_items[0] == extracted
+        assert pair_count == 25
+
+        outside_models = ["gpt-5.6-sol", "gpt-5.5", "claude-sonnet-4-5"]
+        for outside_model in outside_models:
+            assert is_reasoning_model_compatible(outside_model, outside_model) is True
+            outside_sig = encode_reasoning_signature(
+                model=outside_model,
+                item={
+                    "type": "reasoning",
+                    "id": "rs_outside",
+                    "encrypted_content": "enc_outside",
+                    "summary": [],
+                },
+            )
+            for compatible_model in compatible_models:
+                assert is_reasoning_model_compatible(outside_model, compatible_model) is False
+                assert is_reasoning_model_compatible(compatible_model, outside_model) is False
+                assert (
+                    extract_reasoning_item_for_model(
+                        decode_reasoning_signature(outside_sig),
+                        backend_model=compatible_model,
+                    )
+                    is None
+                )
+                messages, _, _, _, _, _ = anthropic_request_to_internal(
+                    model=compatible_model,
+                    backend_model=compatible_model,
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "", "signature": outside_sig},
+                                {"type": "text", "text": "Prior answer"},
+                            ],
+                        },
+                        {"role": "user", "content": "Follow up"},
+                    ],
+                )
+                assert messages[0].reasoning_items == ()
+
+    def test_recognized_reasoning_signature_prefix_case_whitespace_and_underscore_variants(self):
+        for recognized in (
+            "codex-reasoning.v1.bad",
+            "CODEX-REASONING.v1.bad",
+            "  codex_reasoning.v1.bad",
+            "\tCodex_Reasoning:invalid",
+        ):
+            assert is_recognized_reasoning_signature(recognized) is True
+            with pytest.raises(ValueError, match="Anthropic thinking signature"):
+                anthropic_request_to_internal(
+                    model="gpt-6.1-sol",
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "thought", "signature": recognized},
+                                {"type": "text", "text": "answer"},
+                            ],
+                        },
+                        {"role": "user", "content": "next"},
+                    ],
+                )
+        for foreign in ("ErUBCkYICBgCIk...", "anthropic-signature", "other_prefix.v1.payload"):
+            assert is_recognized_reasoning_signature(foreign) is False

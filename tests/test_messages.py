@@ -213,3 +213,33 @@ def test_tool_result_ok():
 def test_tool_result_with_payload():
     r = ToolResult(ok=False, content="error", payload={"code": 404})
     assert r.payload == {"code": 404}
+
+
+def test_message_and_assistant_response_reasoning_items_validation():
+    item = {
+        "v": 1,
+        "model": "gpt-5.6-sol",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "enc_1",
+            "summary": [{"type": "summary_text", "text": "step 1"}],
+        },
+    }
+    msg = Message(role=MessageRole.ASSISTANT, content="answer", reasoning_items=[item])
+    assert msg.reasoning_items == (item,)
+
+    resp = AssistantResponse(content="answer", finish_reason="stop", reasoning_items=[item])
+    assert resp.reasoning_items == (item,)
+
+    with pytest.raises(ValueError) as role_err:
+        Message(role=MessageRole.USER, content="hi", reasoning_items=[item])
+    assert "only allowed on assistant messages" in str(role_err.value)
+
+    with pytest.raises(TypeError) as type_err:
+        Message(role=MessageRole.ASSISTANT, content="hi", reasoning_items=["bad"])  # type: ignore[list-item]
+    assert "must contain dict values" in str(type_err.value)
+
+    with pytest.raises(TypeError) as resp_type_err:
+        AssistantResponse(content="hi", finish_reason="stop", reasoning_items=["bad"])  # type: ignore[list-item]
+    assert "must contain dict values" in str(resp_type_err.value)

@@ -14,6 +14,14 @@ import {
   ChatGPTOAuthProtocolError,
 } from "./auth.js";
 import { parseJsonStrict } from "./utf8-json.js";
+import {
+  decodeReasoningSignature,
+  encodeReasoningSignature,
+  isReasoningModelCompatible,
+  type AssistantReasoningItem,
+  type ReasoningSummaryTextPart,
+  type ReasoningTextContentPart,
+} from "./reasoning-signature.js";
 
 // ---------------------------------------------------------------------------
 // Request conversion: Anthropic → internal
@@ -22,10 +30,12 @@ import { parseJsonStrict } from "./utf8-json.js";
 export interface AnthropicResponseOptions {
   thinkingDisplay?: "summarized" | "omitted";
   suppressReasoning?: boolean;
+  backendModel?: string;
 }
 
 export function anthropicRequestToInternal(opts: {
   model?: string;
+  backendModel?: string;
   messages: Record<string, unknown>[];
   system?: string | Record<string, unknown>[];
   maxTokens?: number;
@@ -70,7 +80,7 @@ export function anthropicRequestToInternal(opts: {
     if (role === "user") {
       convertUserMessage(content, internalMessages);
     } else if (role === "assistant") {
-      convertAssistantMessage(content, internalMessages);
+      convertAssistantMessage(content, internalMessages, opts.backendModel);
     } else {
       throw new ChatGPTOAuthInvalidRequestError(
         `message ${messageIndex} role must be one of: user, assistant`,
@@ -294,6 +304,7 @@ function anthropicImageSourceUrl(sourceValue: unknown): string {
 function convertAssistantMessage(
   content: unknown,
   out: Message[],
+  backendModel?: string,
 ): void {
   if (typeof content === "string") {
     out.push({ role: MessageRole.ASSISTANT, content });
@@ -309,6 +320,7 @@ function convertAssistantMessage(
   const textParts: string[] = [];
   const toolCalls: ToolCall[] = [];
   const toolCallIds = new Set<string>();
+  const reasoningItems: AssistantReasoningItem[] = [];
   for (const [blockIndex, block] of content.entries()) {
     if (typeof block !== "object" || block === null || Array.isArray(block)) {
       throw new ChatGPTOAuthInvalidRequestError(`assistant content block ${blockIndex} must be an object`);
@@ -384,6 +396,22 @@ function convertAssistantMessage(
           `assistant thinking block ${blockIndex} signature must be a string when provided`,
         );
       }
+      const decoded = decodeReasoningSignature(b.signature);
+      if (decoded !== null) {
+        if (
+          backendModel === undefined ||
+          backendModel.length === 0 ||
+          isReasoningModelCompatible(decoded.model, backendModel)
+        ) {
+          reasoningItems.push({
+            type: "reasoning",
+            model: decoded.model,
+            ...(decoded.item.id !== undefined ? { id: decoded.item.id } : {}),
+            encrypted_content: decoded.item.encrypted_content,
+            summary: decoded.item.summary,
+          });
+        }
+      }
     } else if (blockType === "redacted_thinking") {
       assertAllowedFields(
         b,
@@ -409,6 +437,7 @@ function convertAssistantMessage(
     role: MessageRole.ASSISTANT,
     content: textParts.join(""),
     tool_calls: toolCalls.length ? toolCalls : [],
+    ...(reasoningItems.length > 0 ? { reasoning_items: reasoningItems } : {}),
   };
   out.push(msg);
 }
@@ -876,12 +905,47 @@ export function internalResponseToAnthropic(
   opts?: AnthropicResponseOptions,
 ): Record<string, unknown> {
   const content: Record<string, unknown>[] = [];
-  const suppressReasoning = opts?.suppressReasoning === true
-    || opts?.thinkingDisplay === "omitted";
+  const thinkingDisabled = opts?.suppressReasoning === true;
+  const thinkingOmitted = opts?.thinkingDisplay === "omitted";
+  const suppressReasoning = thinkingDisabled || thinkingOmitted;
+  const fallbackBackendModel = opts?.backendModel ?? model;
 
   rejectUnrepresentableResponseEvents(response.raw);
 
-  if (!suppressReasoning && response.reasoning_content) {
+  const reasoningItems = resolveResponseReasoningItems(response, fallbackBackendModel);
+  if (reasoningItems.length > 0) {
+    if (!thinkingDisabled) {
+      for (const item of reasoningItems) {
+        const summaryText = item.summary.map((part) => part.text).join("");
+        const contentText = (item.content ?? []).map((part) => part.text).join("");
+        const visibleThinking = thinkingOmitted ? "" : summaryText + contentText;
+        if (
+          typeof item.encrypted_content === "string" &&
+          item.encrypted_content.length > 0
+        ) {
+          const signature = encodeReasoningSignature(
+            item.model ?? fallbackBackendModel,
+            {
+              type: "reasoning",
+              ...(item.id !== undefined ? { id: item.id } : {}),
+              encrypted_content: item.encrypted_content,
+              summary: item.summary,
+            },
+          );
+          content.push({
+            type: "thinking",
+            thinking: visibleThinking,
+            signature,
+          });
+        } else if (!thinkingOmitted && visibleThinking.length > 0) {
+          content.push({
+            type: "thinking",
+            thinking: visibleThinking,
+          });
+        }
+      }
+    }
+  } else if (!suppressReasoning && response.reasoning_content) {
     content.push({
       type: "thinking",
       thinking: response.reasoning_content,
@@ -1057,7 +1121,7 @@ export async function* anthropicStreamAdapter(
   opts?: AnthropicResponseOptions,
 ): AsyncGenerator<string> {
   yield messageStartSse(model, requestId);
-  for await (const chunk of renderAnthropicStreamEvents(eventIterator, opts)) {
+  for await (const chunk of renderAnthropicStreamEvents(eventIterator, opts, model)) {
     yield chunk;
   }
 }
@@ -1246,16 +1310,128 @@ function requireUsageNumber(value: unknown, field: string): number {
   return value;
 }
 
+function normalizeAnthropicReasoningItem(
+  rawItem: unknown,
+  fallbackModel: string,
+): AssistantReasoningItem {
+  if (typeof rawItem !== "object" || rawItem === null || Array.isArray(rawItem)) {
+    throw new ChatGPTOAuthProtocolError("provider reasoning_item must be an object");
+  }
+  const item = rawItem as Record<string, unknown>;
+  if (item.type !== undefined && item.type !== "reasoning") {
+    throw new ChatGPTOAuthProtocolError("provider reasoning_item type must be reasoning");
+  }
+  const modelValue = item.model ?? fallbackModel;
+  if (typeof modelValue !== "string" || modelValue.length === 0 || modelValue.trim() !== modelValue) {
+    throw new ChatGPTOAuthProtocolError(
+      "provider reasoning_item model must be a non-empty trimmed string",
+    );
+  }
+  if (item.id != null && typeof item.id !== "string") {
+    throw new ChatGPTOAuthProtocolError("provider reasoning_item id must be a string");
+  }
+  if (item.encrypted_content != null && typeof item.encrypted_content !== "string") {
+    throw new ChatGPTOAuthProtocolError(
+      "provider reasoning_item encrypted_content must be a string",
+    );
+  }
+  if (!Array.isArray(item.summary)) {
+    throw new ChatGPTOAuthProtocolError("provider reasoning_item summary must be an array");
+  }
+  const summary: ReasoningSummaryTextPart[] = [];
+  for (const part of item.summary) {
+    if (
+      typeof part !== "object" ||
+      part === null ||
+      Array.isArray(part) ||
+      (part as Record<string, unknown>).type !== "summary_text" ||
+      typeof (part as Record<string, unknown>).text !== "string"
+    ) {
+      throw new ChatGPTOAuthProtocolError(
+        "provider reasoning_item summary entry must be {type:'summary_text', text:string}",
+      );
+    }
+    summary.push({
+      type: "summary_text",
+      text: (part as Record<string, unknown>).text as string,
+    });
+  }
+  const content: ReasoningTextContentPart[] = [];
+  if (item.content != null) {
+    if (!Array.isArray(item.content)) {
+      throw new ChatGPTOAuthProtocolError("provider reasoning_item content must be an array");
+    }
+    for (const part of item.content) {
+      if (
+        typeof part !== "object" ||
+        part === null ||
+        Array.isArray(part) ||
+        ((part as Record<string, unknown>).type !== "reasoning_text" &&
+          (part as Record<string, unknown>).type !== "text") ||
+        typeof (part as Record<string, unknown>).text !== "string"
+      ) {
+        throw new ChatGPTOAuthProtocolError(
+          "provider reasoning_item content entry must have reasoning_text/text and string text",
+        );
+      }
+      content.push({
+        type: "reasoning_text",
+        text: (part as Record<string, unknown>).text as string,
+      });
+    }
+  }
+  return {
+    type: "reasoning",
+    model: modelValue,
+    ...(typeof item.id === "string" && item.id.length > 0 ? { id: item.id } : {}),
+    ...(typeof item.encrypted_content === "string" && item.encrypted_content.length > 0
+      ? { encrypted_content: item.encrypted_content }
+      : {}),
+    summary,
+    ...(content.length > 0 ? { content } : {}),
+  };
+}
+
+function resolveResponseReasoningItems(
+  response: AssistantResponse,
+  fallbackModel: string,
+): AssistantReasoningItem[] {
+  if (response.reasoning_items !== undefined) {
+    if (!Array.isArray(response.reasoning_items)) {
+      throw new ChatGPTOAuthProtocolError("provider reasoning_items must be an array");
+    }
+    return response.reasoning_items.map((item) =>
+      normalizeAnthropicReasoningItem(item, fallbackModel),
+    );
+  }
+  const events = rawEvents(response.raw);
+  const fromEvents: AssistantReasoningItem[] = [];
+  for (const event of events) {
+    const e = event as Record<string, unknown>;
+    if (e.type !== "reasoning_item") continue;
+    const eventModel =
+      typeof e.model === "string" && e.model.length > 0 ? e.model : fallbackModel;
+    fromEvents.push(normalizeAnthropicReasoningItem(e.item, eventModel));
+  }
+  return fromEvents;
+}
+
 async function* renderAnthropicStreamEvents(
   events: AsyncIterable<Record<string, unknown>>,
   opts?: AnthropicResponseOptions,
+  streamModel = "unknown",
 ): AsyncGenerator<string> {
   let blockIndex = 0;
   let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let sawFinish = false;
   let hasToolCalls = false;
-  const suppressReasoning = opts?.suppressReasoning === true
-    || opts?.thinkingDisplay === "omitted";
+  const thinkingDisabled = opts?.suppressReasoning === true;
+  const thinkingOmitted = opts?.thinkingDisplay === "omitted";
+  const suppressReasoning = thinkingDisabled || thinkingOmitted;
+  const fallbackBackendModel = opts?.backendModel ?? streamModel;
+  let hasPendingReasoningDeltas = false;
+  let activeThinkingItemId: string | undefined;
+  const streamedThinkingParts: string[] = [];
 
   for await (const event of events) {
     if (sawFinish) {
@@ -1267,6 +1443,26 @@ async function* renderAnthropicStreamEvents(
       if (typeof event.text !== "string") {
         throw new ChatGPTOAuthProtocolError("reasoning event text must be a string");
       }
+      if (event.item_id != null && typeof event.item_id !== "string") {
+        throw new ChatGPTOAuthProtocolError("reasoning event item_id must be a string");
+      }
+      const eventItemId =
+        typeof event.item_id === "string" && event.item_id.length > 0
+          ? event.item_id
+          : undefined;
+      if (hasPendingReasoningDeltas) {
+        if (
+          eventItemId !== activeThinkingItemId
+        ) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning delta item_id does not match active reasoning item",
+          );
+        }
+      } else {
+        activeThinkingItemId = eventItemId;
+      }
+      hasPendingReasoningDeltas = true;
+      streamedThinkingParts.push(event.text);
       if (suppressReasoning) {
         continue;
       }
@@ -1293,8 +1489,151 @@ async function* renderAnthropicStreamEvents(
       });
       continue;
     } else if (typ === "reasoning_section_break") {
+      if (event.item_id != null && typeof event.item_id !== "string") {
+        throw new ChatGPTOAuthProtocolError(
+          "reasoning_section_break item_id must be a string",
+        );
+      }
+      const eventItemId =
+        typeof event.item_id === "string" && event.item_id.length > 0
+          ? event.item_id
+          : undefined;
+      if (
+        hasPendingReasoningDeltas &&
+        eventItemId !== undefined &&
+        activeThinkingItemId !== undefined &&
+        eventItemId !== activeThinkingItemId
+      ) {
+        throw new ChatGPTOAuthProtocolError(
+          "reasoning_section_break item_id does not match active reasoning item",
+        );
+      }
+      continue;
+    } else if (typ === "reasoning_item") {
+      if (event.model != null && (typeof event.model !== "string" || event.model.length === 0)) {
+        throw new ChatGPTOAuthProtocolError(
+          "reasoning_item event model must be a non-empty string",
+        );
+      }
+      const eventModel =
+        typeof event.model === "string" && event.model.length > 0
+          ? event.model
+          : fallbackBackendModel;
+      const item = normalizeAnthropicReasoningItem(event.item, eventModel);
+      const expectedText =
+        item.summary.map((part) => part.text).join("") +
+        (item.content ?? []).map((part) => part.text).join("");
+
+      const sawDeltasForThisItem = hasPendingReasoningDeltas;
+      if (sawDeltasForThisItem) {
+        if (
+          activeThinkingItemId !== undefined &&
+          item.id !== activeThinkingItemId
+        ) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning_item id does not match streamed reasoning delta item_id",
+          );
+        }
+        if (streamedThinkingParts.join("") !== expectedText) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning_item text does not match streamed reasoning deltas",
+          );
+        }
+      }
+
+      hasPendingReasoningDeltas = false;
+      activeThinkingItemId = undefined;
+      streamedThinkingParts.length = 0;
+
+      if (thinkingDisabled) {
+        continue;
+      }
+
+      const hasEncryptedContent =
+        typeof item.encrypted_content === "string" && item.encrypted_content.length > 0;
+
+      if (hasEncryptedContent) {
+        const signature = encodeReasoningSignature(item.model ?? eventModel, {
+          type: "reasoning",
+          ...(item.id !== undefined ? { id: item.id } : {}),
+          encrypted_content: item.encrypted_content!,
+          summary: item.summary,
+        });
+        if (currentBlock !== "thinking") {
+          if (currentBlock !== null) {
+            yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            blockIndex++;
+          }
+          yield sse("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "thinking", thinking: "" },
+          });
+          currentBlock = "thinking";
+          if (!sawDeltasForThisItem && !thinkingOmitted && expectedText.length > 0) {
+            yield sse("content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "thinking_delta", thinking: expectedText },
+            });
+            yield sse("codex_reasoning_delta", {
+              type: "codex_reasoning_delta",
+              delta: expectedText,
+            });
+          }
+        }
+        yield sse("content_block_delta", {
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "signature_delta", signature },
+        });
+        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+        blockIndex++;
+        currentBlock = null;
+      } else {
+        if (thinkingOmitted) {
+          continue;
+        }
+        if (!sawDeltasForThisItem && expectedText.length > 0) {
+          if (currentBlock !== "thinking") {
+            if (currentBlock !== null) {
+              yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+              blockIndex++;
+            }
+            yield sse("content_block_start", {
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "thinking", thinking: "" },
+            });
+            currentBlock = "thinking";
+          }
+          yield sse("content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "thinking_delta", thinking: expectedText },
+          });
+          yield sse("codex_reasoning_delta", {
+            type: "codex_reasoning_delta",
+            delta: expectedText,
+          });
+        }
+        if (currentBlock === "thinking") {
+          yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+          blockIndex++;
+          currentBlock = null;
+        }
+      }
       continue;
     } else if (typ === "content") {
+      if (hasPendingReasoningDeltas) {
+        if (activeThinkingItemId !== undefined) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning stream with item_id ended without matching reasoning_item",
+          );
+        }
+        hasPendingReasoningDeltas = false;
+        streamedThinkingParts.length = 0;
+      }
       if (typeof event.text !== "string") {
         throw new ChatGPTOAuthProtocolError("content event text must be a string");
       }
@@ -1317,6 +1656,15 @@ async function* renderAnthropicStreamEvents(
         delta: { type: "text_delta", text },
       });
     } else if (typ === "tool_call") {
+      if (hasPendingReasoningDeltas) {
+        if (activeThinkingItemId !== undefined) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning stream with item_id ended without matching reasoning_item",
+          );
+        }
+        hasPendingReasoningDeltas = false;
+        streamedThinkingParts.length = 0;
+      }
       hasToolCalls = true;
       if (currentBlock !== null) {
         yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
@@ -1356,6 +1704,15 @@ async function* renderAnthropicStreamEvents(
         "provider web_search_call output cannot be represented losslessly by the Anthropic facade",
       );
     } else if (typ === "finish") {
+      if (hasPendingReasoningDeltas) {
+        if (activeThinkingItemId !== undefined) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning stream with item_id ended without matching reasoning_item",
+          );
+        }
+        hasPendingReasoningDeltas = false;
+        streamedThinkingParts.length = 0;
+      }
       if (currentBlock !== null) {
         yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
         currentBlock = null;

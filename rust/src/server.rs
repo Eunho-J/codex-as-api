@@ -18,7 +18,7 @@ use tokio::task;
 
 use crate::anthropic_adapter::{
     anthropic_request_to_internal, anthropic_thinking_controls, format_anthropic_error,
-    internal_response_to_anthropic_with_display, validate_anthropic_cache_controls,
+    internal_response_to_anthropic_with_options, validate_anthropic_cache_controls,
     AnthropicStreamAdapter,
 };
 use crate::auth;
@@ -906,6 +906,16 @@ impl OpenAiStreamState {
                 chunks
             }
             "reasoning_section_break" => Vec::new(),
+            "reasoning_item" => {
+                if !event.get("item").is_some_and(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("reasoning")
+                }) {
+                    return Err(ProviderError::UpstreamProtocol(
+                        "reasoning_item event requires a reasoning item object".to_string(),
+                    ));
+                }
+                Vec::new()
+            }
             "web_search_call" => {
                 return Err(ProviderError::UpstreamProtocol(
                     "provider web_search_call event cannot be represented by /v1/chat/completions"
@@ -3579,6 +3589,7 @@ async fn anthropic_messages(
     let resolved = resolve_anthropic_route_model(&state, &client_model)
         .await
         .map_err(|error| anthropic_provider_error_response(&error))?;
+    let backend_model = resolved.model.slug.clone();
     let reasoning_effort = effective_reasoning_effort_with_fallback(
         &state,
         requested_reasoning_effort.as_deref(),
@@ -3587,6 +3598,10 @@ async fn anthropic_messages(
         controls.allow_disabled_reasoning_fallback,
     )
     .map_err(|error| anthropic_provider_error_response(&error))?;
+    let thinking_disabled = thinking_controls.disabled
+        || reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| matches!(effort, "none" | "disabled"));
 
     let max_tokens = None;
 
@@ -3654,11 +3669,14 @@ async fn anthropic_messages(
         let worker_sender = sender.clone();
         let worker_cancellation = cancellation.clone();
         let thinking_display = thinking_controls.display;
+        let backend_model_for_stream = backend_model.clone();
         let worker = task::spawn_blocking(move || {
-            let mut adapter = AnthropicStreamAdapter::with_thinking_display(
+            let mut adapter = AnthropicStreamAdapter::with_options(
                 &client_model,
                 &request_id,
                 thinking_display,
+                thinking_disabled,
+                Some(backend_model_for_stream.as_str()),
             );
             for chunk in adapter.start() {
                 send_sse_event_with_backpressure(
@@ -3773,11 +3791,13 @@ async fn anthropic_messages(
             }
         };
 
-        let out = internal_response_to_anthropic_with_display(
+        let out = internal_response_to_anthropic_with_options(
             &response,
             &client_model,
             &request_id,
             thinking_controls.display,
+            thinking_disabled,
+            Some(backend_model.as_str()),
         )
         .map_err(|message| {
             anthropic_provider_error_response(&ProviderError::UpstreamProtocol(message))
@@ -4128,6 +4148,25 @@ mod live_catalog_tests {
         path
     }
 
+    fn test_codex_version_resolver() -> crate::codex_version::CodexVersionResolver {
+        let version = upstream_contract()["upstream"]["version"]
+            .as_str()
+            .expect("upstream.version must be a string")
+            .to_string();
+        crate::codex_version::CodexVersionResolver::new_for_test(
+            crate::codex_version::CODEX_NPM_LATEST_URL.to_string(),
+            crate::codex_version::CODEX_VERSION_CACHE_TTL,
+            std::time::Duration::from_secs(1),
+            move || {
+                Ok(serde_json::to_vec(&json!({
+                    "name": "@openai/codex",
+                    "version": version,
+                }))
+                .unwrap())
+            },
+        )
+    }
+
     async fn start_api(
         upstream: &str,
         configured_model: &str,
@@ -4155,7 +4194,8 @@ mod live_catalog_tests {
                 Some(std::time::Duration::from_secs(5)),
                 catalog_ttl,
             )
-            .unwrap(),
+            .unwrap()
+            .with_version_resolver(test_codex_version_resolver()),
         );
         let config = CodexConfig {
             model: None,
@@ -4191,7 +4231,7 @@ mod live_catalog_tests {
         assert_eq!(models_response.status(), reqwest::StatusCode::OK);
         assert!(models_response.headers().get("etag").is_none());
         let models_body: Value = models_response.json().await.unwrap();
-        assert_eq!(models_body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(models_body["data"].as_array().unwrap().len(), 5);
         assert!(models_body["data"][0].get("created").is_none());
         assert!(models_body["data"][0].get("base_instructions").is_none());
         assert!(models_body["data"][0].get("model_messages").is_none());
@@ -4343,9 +4383,17 @@ mod live_catalog_tests {
 
         let models = client.get(format!("{api}/v1/models")).send().await.unwrap();
         assert_eq!(models.status(), reqwest::StatusCode::OK);
+        let models_body: Value = models.json().await.unwrap();
+        assert_eq!(models_body["object"], "list");
+        let model_ids: Vec<&str> = models_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
         assert_eq!(
-            models.json::<Value>().await.unwrap(),
-            json!({"object": "list", "data": []})
+            model_ids,
+            vec!["gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review"]
         );
         let health = client.get(format!("{api}/health")).send().await.unwrap();
         assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -5218,7 +5266,16 @@ mod live_catalog_tests {
         let models = client.get(format!("{api}/v1/models")).send().await.unwrap();
         assert_eq!(models.status(), reqwest::StatusCode::OK);
         let models_body: Value = models.json().await.unwrap();
-        assert_eq!(models_body["data"], json!([]));
+        let model_ids: Vec<&str> = models_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(
+            model_ids,
+            vec!["gpt-6-chat-thinking", "gpt-reserve", "codex-auto-review"]
+        );
         let health = client.get(format!("{api}/health")).send().await.unwrap();
         assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         let health_body: Value = health.json().await.unwrap();
@@ -6044,7 +6101,12 @@ mod tests {
         Json(json!({
             "models": [
                 live_model("gpt-5.5", 1, false),
-                live_model("gpt-5.6-sol", 2, true)
+                live_model("gpt-5.6-sol", 2, true),
+                live_model("gpt-6.1-sol", 10, false),
+                live_model("gpt-6-astra", 11, false),
+                live_model("gpt-6-sol", 12, false),
+                live_model("gpt-6-luna", 13, false),
+                live_model("gpt-daybreak-blue-latest", 14, false)
             ]
         }))
     }
@@ -6410,6 +6472,22 @@ mod tests {
         .await
     }
 
+    fn test_codex_version_resolver(version: &str) -> crate::codex_version::CodexVersionResolver {
+        let version = version.to_string();
+        crate::codex_version::CodexVersionResolver::new_for_test(
+            crate::codex_version::CODEX_NPM_LATEST_URL.to_string(),
+            crate::codex_version::CODEX_VERSION_CACHE_TTL,
+            std::time::Duration::from_secs(1),
+            move || {
+                Ok(serde_json::to_vec(&json!({
+                    "name": "@openai/codex",
+                    "version": version,
+                }))
+                .unwrap())
+            },
+        )
+    }
+
     async fn start_api_server_with_timeout(
         upstream_base_url: &str,
         state_model: &str,
@@ -6424,7 +6502,8 @@ mod tests {
             Some(auth_path_string.clone()),
             Some(timeout),
         )
-        .unwrap();
+        .unwrap()
+        .with_version_resolver(test_codex_version_resolver("0.164.0"));
         let app = create_router(AppState {
             auth_path: Some(auth_path_string),
             codex_config,
@@ -6449,7 +6528,8 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap(),
+                .unwrap()
+                .with_version_resolver(test_codex_version_resolver("0.164.0")),
             ),
         }
     }
@@ -10757,6 +10837,421 @@ mod tests {
             .unwrap();
         assert_eq!(empty_session.status(), reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(recording.requests().len(), before_invalid);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anthropic_messages_preserves_and_replays_encrypted_reasoning_items_end_to_end() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let reasoning_output = json!({
+            "type": "reasoning",
+            "id": "rs_turn_1",
+            "summary": [{"type": "summary_text", "text": "Need lookup tool"}],
+            "content": [{"type": "reasoning_text", "text": "raw trace"}],
+            "status": "completed",
+            "encrypted_content": "enc_turn_1"
+        });
+        let tool_output = json!({
+            "type": "function_call",
+            "call_id": "call_turn_1",
+            "name": "lookup",
+            "arguments": "{\"query\":\"rust\"}"
+        });
+        recording.set_response_output(vec![reasoning_output.clone(), tool_output.clone()]);
+        let (api_url, auth_path, api_handle) = start_api_server(
+            &upstream_url,
+            "gpt-5.6-sol",
+            test_codex_config(None, None, None),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        // Turn 1 (non-streaming): emits signed thinking block + tool_use block.
+        let turn1 = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-r1")
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 256,
+                "system": "Use tools carefully.",
+                "messages": [{"role": "user", "content": "Find rust docs."}],
+                "tools": [{
+                    "name": "lookup",
+                    "description": "Lookup docs",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}}
+                    }
+                }],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(turn1.status(), reqwest::StatusCode::OK);
+        let turn1_body: Value = turn1.json().await.unwrap();
+        assert_eq!(turn1_body["content"][0]["type"], "thinking");
+        assert_eq!(turn1_body["content"][0]["thinking"], "Need lookup tool");
+        let sig = turn1_body["content"][0]["signature"]
+            .as_str()
+            .expect("thinking block must carry codex-reasoning-v1 signature")
+            .to_string();
+        assert!(sig.starts_with("codex-reasoning-v1:"));
+        assert_eq!(turn1_body["content"][1]["type"], "tool_use");
+        assert_eq!(turn1_body["content"][1]["id"], "call_turn_1");
+
+        // Turn 1 (streaming): emits thinking_delta, signature_delta, and tool_use.
+        let turn1_stream = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-r1")
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 256,
+                "stream": true,
+                "system": "Use tools carefully.",
+                "messages": [{"role": "user", "content": "Find rust docs."}],
+                "tools": [{
+                    "name": "lookup",
+                    "description": "Lookup docs",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}}
+                    }
+                }],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(turn1_stream.status(), reqwest::StatusCode::OK);
+        let mut pending = turn1_stream.text().await.unwrap();
+        let mut sse_events = Vec::new();
+        parse_anthropic_sse_blocks(&mut pending, &mut sse_events);
+        assert!(pending.is_empty());
+        let streamed_sig = sse_events
+            .iter()
+            .find_map(|(event, data)| {
+                (event == "content_block_delta" && data["delta"]["type"] == "signature_delta")
+                    .then(|| data["delta"]["signature"].as_str().unwrap().to_string())
+            })
+            .expect("streaming response must include signature_delta");
+        assert_eq!(streamed_sig, sig);
+
+        // Turn 1 with thinking.display = "omitted": still emits signed empty thinking block.
+        let omitted_turn = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-r1")
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 2048,
+                "thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"},
+                "messages": [{"role": "user", "content": "Find rust docs."}],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(omitted_turn.status(), reqwest::StatusCode::OK);
+        let omitted_body: Value = omitted_turn.json().await.unwrap();
+        assert!(omitted_body.get("codex_reasoning").is_none());
+        assert_eq!(omitted_body["content"][0]["type"], "thinking");
+        assert_eq!(omitted_body["content"][0]["thinking"], "");
+        assert_eq!(omitted_body["content"][0]["signature"], sig);
+
+        // Turn 2: replay assistant content (thinking with signature + tool_use) and tool_result.
+        recording.set_response_output(vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Here are the docs."}]
+        })]);
+        let turn2 = client
+            .post(format!("{api_url}/v1/messages"))
+            .header("x-claude-code-session-id", "session-r1")
+            .json(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 256,
+                "system": "Use tools carefully.",
+                "messages": [
+                    {"role": "user", "content": "Find rust docs."},
+                    {"role": "assistant", "content": turn1_body["content"]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_turn_1", "content": "Result text"}
+                    ]}
+                ],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(turn2.status(), reqwest::StatusCode::OK);
+
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[3].body["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Find rust docs."}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_turn_1",
+                    "summary": [{"type": "summary_text", "text": "Need lookup tool"}],
+                    "encrypted_content": "enc_turn_1"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_turn_1",
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"rust\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_turn_1",
+                    "output": "Result text"
+                }
+            ])
+        );
+
+        // /v1/messages/compact replays matching signature and filters cross-model signature.
+        let other_model_sig = crate::reasoning_signature::encode_reasoning_signature(
+            "gpt-5.5",
+            &json!({
+                "type": "reasoning",
+                "id": "rs_other",
+                "summary": [],
+                "encrypted_content": "enc_other"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let compact_resp = client
+            .post(format!("{api_url}/v1/messages/compact"))
+            .header("x-claude-code-session-id", "session-r1")
+            .json(&json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 128,
+                "messages": [
+                    {"role": "user", "content": "Find rust docs."},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "Need lookup tool", "signature": sig},
+                        {"type": "thinking", "thinking": "Other model", "signature": other_model_sig},
+                        {"type": "text", "text": "Done"}
+                    ]}
+                ],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(compact_resp.status(), reqwest::StatusCode::OK);
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[4].endpoint, RecordedEndpoint::Compact);
+        assert_eq!(
+            requests[4].body["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Find rust docs."}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_turn_1",
+                    "summary": [{"type": "summary_text", "text": "Need lookup tool"}],
+                    "encrypted_content": "enc_turn_1"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done"}]
+                }
+            ])
+        );
+
+        // Cross-model compatible signature replay (gpt-6-luna -> gpt-6.1-sol) with thinking disabled
+        // still replays historical signed reasoning items (including empty-thinking omitted display)
+        // in both /v1/messages and /v1/messages/compact while suppressing thinking output blocks.
+        let luna_sig = crate::reasoning_signature::encode_reasoning_signature(
+            "gpt-6-luna",
+            &json!({
+                "type": "reasoning",
+                "id": "rs_luna_omitted",
+                "summary": [{"type": "summary_text", "text": "Hidden summary"}],
+                "encrypted_content": "enc_luna_omitted"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let disabled_msg_resp = client
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "gpt-6.1-sol",
+                "max_tokens": 128,
+                "thinking": {"type": "disabled"},
+                "messages": [
+                    {"role": "user", "content": "Continue from Luna."},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "", "signature": luna_sig.clone()},
+                        {"type": "text", "text": "Prior answer"}
+                    ]},
+                    {"role": "user", "content": "Next step?"}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled_msg_resp.status(), reqwest::StatusCode::OK);
+        let disabled_msg_body: Value = disabled_msg_resp.json().await.unwrap();
+        assert!(disabled_msg_body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "thinking"));
+
+        let disabled_compact_resp = client
+            .post(format!("{api_url}/v1/messages/compact"))
+            .json(&json!({
+                "model": "gpt-6.1-sol",
+                "max_tokens": 128,
+                "thinking": {"type": "disabled"},
+                "messages": [
+                    {"role": "user", "content": "Continue from Luna."},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "", "signature": luna_sig},
+                        {"type": "text", "text": "Prior answer"}
+                    ]}
+                ],
+                "responses_lite": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled_compact_resp.status(), reqwest::StatusCode::OK);
+        let requests = recording.requests();
+        assert_eq!(requests.len(), 7);
+        for idx in [5usize, 6usize] {
+            assert_eq!(requests[idx].body["model"], "gpt-6.1-sol");
+            assert_eq!(
+                requests[idx].body["input"][1],
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_luna_omitted",
+                    "summary": [{"type": "summary_text", "text": "Hidden summary"}],
+                    "encrypted_content": "enc_luna_omitted"
+                })
+            );
+        }
+
+        // Malformed codex-reasoning* signatures return 400 on all Anthropic routes before upstream.
+        let before_malformed = recording.requests().len();
+        for route in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/messages/compact",
+        ] {
+            let mut body = json!({
+                "model": "gpt-5.6-sol",
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "bad", "signature": "codex-reasoning-v1:not-valid-base64!"}
+                    ]}
+                ]
+            });
+            if route != "/v1/messages/count_tokens" {
+                body["max_tokens"] = json!(128);
+            }
+            let res = client
+                .post(format!("{api_url}{route}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST, "{route}");
+            let err_body: Value = res.json().await.unwrap();
+            assert_eq!(err_body["error"]["type"], "invalid_request_error");
+        }
+        assert_eq!(recording.requests().len(), before_malformed);
+
+        api_handle.abort();
+        upstream_handle.abort();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_codex_version_resolution_failure_returns_503_across_routes() {
+        let (upstream_url, recording, upstream_handle) = start_recording_upstream().await;
+        let auth_path = write_test_auth_file();
+        let auth_path_string = auth_path.to_string_lossy().to_string();
+        let failing_resolver = crate::codex_version::CodexVersionResolver::new_for_test(
+            crate::codex_version::CODEX_NPM_LATEST_URL.to_string(),
+            crate::codex_version::CODEX_VERSION_CACHE_TTL,
+            std::time::Duration::from_secs(1),
+            || {
+                Err(crate::codex_version::CodexVersionError::Unavailable(
+                    "simulated npm version lookup failure".to_string(),
+                ))
+            },
+        );
+        let provider = ChatGPTOAuthProvider::new(
+            "gpt-5.5".to_string(),
+            upstream_url,
+            Some(auth_path_string.clone()),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap()
+        .with_version_resolver(failing_resolver);
+        let app = create_router(AppState {
+            auth_path: Some(auth_path_string),
+            codex_config: CodexConfig {
+                model: None,
+                model_reasoning_effort: None,
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+            },
+            provider: Arc::new(provider),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let api_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let api_url = format!("http://{address}");
+        let client = reqwest::Client::new();
+
+        let models_res = client
+            .get(format!("{api_url}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            models_res.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let models_err: Value = models_res.json().await.unwrap();
+        assert_eq!(models_err["error"]["code"], "catalog_unavailable");
+
+        let msg_res = client
+            .post(format!("{api_url}/v1/messages"))
+            .json(&json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(msg_res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let msg_err: Value = msg_res.json().await.unwrap();
+        assert_eq!(msg_err["error"]["type"], "api_error");
+        assert!(recording.requests().is_empty());
 
         api_handle.abort();
         upstream_handle.abort();

@@ -38,6 +38,18 @@ pub fn anthropic_thinking_controls(body: &Value) -> Result<AnthropicThinkingCont
 }
 
 pub fn anthropic_request_to_internal(body: &Value) -> Result<AnthropicInternalRequest, String> {
+    let target_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.starts_with("claude-"));
+    anthropic_request_to_internal_for_model(body, target_model)
+}
+
+pub fn anthropic_request_to_internal_for_model(
+    body: &Value,
+    target_model: Option<&str>,
+) -> Result<AnthropicInternalRequest, String> {
     body.as_object()
         .ok_or_else(|| "Anthropic request body must be an object".to_string())?;
     reject_explicit_null_top_level_fields(body)?;
@@ -55,6 +67,7 @@ pub fn anthropic_request_to_internal(body: &Value) -> Result<AnthropicInternalRe
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             });
@@ -80,7 +93,7 @@ pub fn anthropic_request_to_internal(body: &Value) -> Result<AnthropicInternalRe
             .ok_or_else(|| format!("messages[{index}].content is required"))?;
         match role {
             "user" => convert_user_message(content, &mut messages)?,
-            "assistant" => convert_assistant_message(content, &mut messages)?,
+            "assistant" => convert_assistant_message(content, target_model, &mut messages)?,
             _ => return Err(format!("messages[{index}].role must be user or assistant")),
         }
     }
@@ -330,6 +343,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             });
@@ -385,6 +399,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                                 tool_call_id: None,
                                 name: None,
                                 reasoning_content: None,
+                                reasoning_items: None,
                                 images: std::mem::take(&mut image_urls),
                                 structured_content: None,
                             });
@@ -424,6 +439,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                             tool_call_id: Some(tool_use_id),
                             name: None,
                             reasoning_content: None,
+                            reasoning_items: None,
                             images: vec![],
                             structured_content: None,
                         });
@@ -435,6 +451,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                                 tool_call_id: None,
                                 name: None,
                                 reasoning_content: None,
+                                reasoning_items: None,
                                 images: tool_result_images,
                                 structured_content: None,
                             });
@@ -468,6 +485,7 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
+                    reasoning_items: None,
                     images: image_urls,
                     structured_content: None,
                 });
@@ -581,7 +599,11 @@ fn anthropic_image_source_url(source: Option<&Value>) -> Result<String, String> 
     }
 }
 
-fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<(), String> {
+fn convert_assistant_message(
+    content: &Value,
+    target_model: Option<&str>,
+    out: &mut Vec<Message>,
+) -> Result<(), String> {
     match content {
         Value::String(s) => {
             out.push(Message {
@@ -591,6 +613,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             });
@@ -604,6 +627,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
+                    reasoning_items: None,
                     images: vec![],
                     structured_content: None,
                 });
@@ -612,6 +636,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
             let mut text_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut tool_call_ids: HashSet<String> = HashSet::new();
+            let mut reasoning_items: Vec<Value> = Vec::new();
             let mut saw_thinking_block = false;
 
             for (block_index, block) in arr.iter().enumerate() {
@@ -712,13 +737,34 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                                 "assistant thinking block {block_index} requires string thinking"
                             ));
                         }
-                        if object
-                            .get("signature")
-                            .is_some_and(|value| !value.is_null() && !value.is_string())
-                        {
-                            return Err(format!(
-                                "assistant thinking block {block_index} signature must be a string when provided"
-                            ));
+                        match object.get("signature") {
+                            None | Some(Value::Null) => {}
+                            Some(Value::String(signature)) => {
+                                if let Some(envelope) =
+                                    crate::reasoning_signature::decode_reasoning_signature(
+                                        signature,
+                                    )
+                                    .map_err(|error| {
+                                        format!(
+                                            "assistant thinking block {block_index} has invalid signature: {error}"
+                                        )
+                                    })?
+                                {
+                                    if target_model.is_none_or(|target| {
+                                        crate::reasoning_signature::is_reasoning_model_compatible(
+                                            &envelope.model,
+                                            target,
+                                        )
+                                    }) {
+                                        reasoning_items.push(envelope.to_value());
+                                    }
+                                }
+                            }
+                            Some(_) => {
+                                return Err(format!(
+                                    "assistant thinking block {block_index} signature must be a string when provided"
+                                ));
+                            }
                         }
                         saw_thinking_block = true;
                     }
@@ -766,6 +812,7 @@ fn convert_assistant_message(content: &Value, out: &mut Vec<Message>) -> Result<
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: (!reasoning_items.is_empty()).then_some(reasoning_items),
                 images: vec![],
                 structured_content: None,
             });
@@ -1268,26 +1315,88 @@ pub fn internal_response_to_anthropic(
     )
 }
 
+#[cfg(test)]
 pub fn internal_response_to_anthropic_with_display(
     response: &AssistantResponse,
     model: &str,
     request_id: &str,
     display: ThinkingDisplayMode,
 ) -> Result<Value, String> {
+    internal_response_to_anthropic_with_options(response, model, request_id, display, false, None)
+}
+
+pub fn internal_response_to_anthropic_with_options(
+    response: &AssistantResponse,
+    model: &str,
+    request_id: &str,
+    display: ThinkingDisplayMode,
+    disabled: bool,
+    backend_model: Option<&str>,
+) -> Result<Value, String> {
     let mut content: Vec<Value> = Vec::new();
 
     reject_unrepresentable_response_events(response.raw.as_ref())?;
 
-    let reasoning_summary = match display {
-        ThinkingDisplayMode::Summarized => response
-            .reasoning_content
+    let mut joined_visible_reasoning = String::new();
+    if !disabled {
+        if let Some(items) = response
+            .reasoning_items
             .as_ref()
-            .filter(|reasoning| !reasoning.is_empty()),
-        ThinkingDisplayMode::Omitted => None,
-    };
-    if let Some(reasoning) = reasoning_summary {
-        content.push(json!({"type": "thinking", "thinking": reasoning}));
+            .filter(|items| !items.is_empty())
+        {
+            let sig_model = backend_model
+                .or_else(|| raw_reasoning_item_model(response.raw.as_ref()))
+                .unwrap_or(model);
+            for item in items {
+                let (item_summary, item_raw) =
+                    crate::protocol::reasoning_parts_from_response_items(std::slice::from_ref(
+                        item,
+                    ))?;
+                let visible = format!("{item_summary}{item_raw}");
+                joined_visible_reasoning.push_str(&visible);
+                let signature =
+                    crate::reasoning_signature::encode_reasoning_signature(sig_model, item)?;
+                if let Some(sig) = signature {
+                    let thinking_text = match display {
+                        ThinkingDisplayMode::Summarized => item_summary,
+                        ThinkingDisplayMode::Omitted => String::new(),
+                    };
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                        "signature": sig,
+                    }));
+                } else if display == ThinkingDisplayMode::Summarized && !visible.is_empty() {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": visible,
+                    }));
+                }
+            }
+        } else if display == ThinkingDisplayMode::Summarized {
+            if let Some(reasoning) = response
+                .reasoning_content
+                .as_ref()
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                content.push(json!({"type": "thinking", "thinking": reasoning}));
+            }
+        }
     }
+
+    let reasoning_summary = if disabled || display == ThinkingDisplayMode::Omitted {
+        None
+    } else if let Some(reasoning) = response
+        .reasoning_content
+        .as_ref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        Some(reasoning.as_str())
+    } else if !joined_visible_reasoning.is_empty() {
+        Some(joined_visible_reasoning.as_str())
+    } else {
+        None
+    };
 
     if !response.content.is_empty() {
         content.push(json!({"type": "text", "text": response.content, "citations": null}));
@@ -1354,6 +1463,19 @@ pub fn internal_response_to_anthropic_with_display(
     let usage_dict = merge_actual_usage_extensions(usage_dict, response.raw.as_ref())?;
     object.insert("usage".to_string(), usage_dict);
     Ok(result)
+}
+
+fn raw_reasoning_item_model(raw: Option<&Value>) -> Option<&str> {
+    raw?.get("events")?.as_array()?.iter().find_map(|event| {
+        if event.get("type").and_then(Value::as_str) == Some("reasoning_item") {
+            event
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.trim().is_empty())
+        } else {
+            None
+        }
+    })
 }
 
 fn reject_unrepresentable_response_events(raw: Option<&Value>) -> Result<(), String> {
@@ -1465,11 +1587,14 @@ fn map_stop_reason(
 
 pub struct AnthropicStreamAdapter {
     model: String,
+    backend_model: Option<String>,
     request_id: String,
     display: ThinkingDisplayMode,
+    disabled: bool,
     started: bool,
     block_index: u32,
     current_block: Option<&'static str>,
+    active_thinking_item_id: Option<String>,
     has_tool_calls: bool,
     finished: bool,
 }
@@ -1480,18 +1605,32 @@ impl AnthropicStreamAdapter {
         Self::with_thinking_display(model, request_id, ThinkingDisplayMode::Summarized)
     }
 
+    #[cfg(test)]
     pub fn with_thinking_display(
         model: &str,
         request_id: &str,
         display: ThinkingDisplayMode,
     ) -> Self {
+        Self::with_options(model, request_id, display, false, None)
+    }
+
+    pub fn with_options(
+        model: &str,
+        request_id: &str,
+        display: ThinkingDisplayMode,
+        disabled: bool,
+        backend_model: Option<&str>,
+    ) -> Self {
         Self {
             model: model.to_string(),
+            backend_model: backend_model.map(str::to_string),
             request_id: request_id.to_string(),
             display,
+            disabled,
             started: false,
             block_index: 0,
             current_block: None,
+            active_thinking_item_id: None,
             has_tool_calls: false,
             finished: false,
         }
@@ -1525,6 +1664,30 @@ impl AnthropicStreamAdapter {
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("{typ} event requires string text"))?
                     .to_string();
+                let event_item_id = match event.get("item_id") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    Some(_) => {
+                        return Err(format!(
+                            "{typ} event item_id must be a non-empty string when provided"
+                        ));
+                    }
+                };
+                if self.disabled {
+                    return Ok(out);
+                }
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    if let Some(incoming_id) = event_item_id {
+                        if active_id != incoming_id {
+                            return Err(
+                                "reasoning delta item_id does not match active thinking block item_id"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else if let Some(incoming_id) = event_item_id {
+                    self.active_thinking_item_id = Some(incoming_id.to_string());
+                }
                 if self.display == ThinkingDisplayMode::Summarized {
                     if current_block != Some("thinking") {
                         if current_block.is_some() {
@@ -1559,7 +1722,102 @@ impl AnthropicStreamAdapter {
                 }
             }
 
+            "reasoning_item" => {
+                let item = event
+                    .get("item")
+                    .ok_or_else(|| "reasoning_item event requires an object item".to_string())?;
+                let item_obj = item
+                    .as_object()
+                    .ok_or_else(|| "reasoning_item event requires an object item".to_string())?;
+                if item_obj.get("type").and_then(Value::as_str) != Some("reasoning") {
+                    return Err("reasoning_item event item must have type 'reasoning'".to_string());
+                }
+                let done_id = match item_obj.get("id") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    Some(_) => {
+                        return Err(
+                            "reasoning_item id must be a non-empty string when present".to_string()
+                        );
+                    }
+                };
+                crate::protocol::reasoning_parts_from_response_items(std::slice::from_ref(item))?;
+                let event_model = match event.get("model") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(m)) if !m.trim().is_empty() => Some(m.as_str()),
+                    Some(_) => {
+                        return Err(
+                            "reasoning_item model must be a non-empty string when provided"
+                                .to_string(),
+                        );
+                    }
+                };
+                let sig_model = event_model
+                    .or(self.backend_model.as_deref())
+                    .unwrap_or(self.model.as_str());
+                let signature =
+                    crate::reasoning_signature::encode_reasoning_signature(sig_model, item)?;
+                if self.disabled {
+                    self.active_thinking_item_id = None;
+                    return Ok(out);
+                }
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    if done_id != Some(active_id) {
+                        return Err(
+                            "reasoning_item id does not match active streamed thinking item_id"
+                                .to_string(),
+                        );
+                    }
+                }
+                if let Some(sig) = signature {
+                    if current_block != Some("thinking") {
+                        if current_block.is_some() {
+                            out.push(sse(
+                                "content_block_stop",
+                                &json!({"type": "content_block_stop", "index": block_index}),
+                            ));
+                            block_index += 1;
+                        }
+                        out.push(sse(
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }),
+                        ));
+                    }
+                    out.push(sse(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "signature_delta", "signature": sig},
+                        }),
+                    ));
+                    out.push(sse(
+                        "content_block_stop",
+                        &json!({"type": "content_block_stop", "index": block_index}),
+                    ));
+                    block_index += 1;
+                    current_block = None;
+                } else if current_block == Some("thinking") {
+                    out.push(sse(
+                        "content_block_stop",
+                        &json!({"type": "content_block_stop", "index": block_index}),
+                    ));
+                    block_index += 1;
+                    current_block = None;
+                }
+                self.active_thinking_item_id = None;
+            }
+
             "content" => {
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    return Err(format!(
+                        "thinking block with item_id {active_id} ended without a matching reasoning_item event"
+                    ));
+                }
                 let text = event
                     .get("text")
                     .and_then(Value::as_str)
@@ -1594,6 +1852,11 @@ impl AnthropicStreamAdapter {
             }
 
             "tool_call" => {
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    return Err(format!(
+                        "thinking block with item_id {active_id} ended without a matching reasoning_item event"
+                    ));
+                }
                 has_tool_calls = true;
                 if current_block.is_some() {
                     out.push(sse(
@@ -1658,6 +1921,11 @@ impl AnthropicStreamAdapter {
             }
 
             "finish" => {
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    return Err(format!(
+                        "thinking block with item_id {active_id} ended without a matching reasoning_item event"
+                    ));
+                }
                 if current_block.is_some() {
                     out.push(sse(
                         "content_block_stop",
@@ -1693,7 +1961,25 @@ impl AnthropicStreamAdapter {
                 self.finished = true;
             }
 
-            "reasoning_section_break" => {}
+            "reasoning_section_break" => {
+                if let Some(id_val) = event.get("item_id").filter(|v| !v.is_null()) {
+                    let id = id_val.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+                        "reasoning_section_break item_id must be a non-empty string".to_string()
+                    })?;
+                    if !self.disabled {
+                        if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                            if active_id != id {
+                                return Err(
+                                    "reasoning_section_break item_id does not match active thinking block item_id"
+                                        .to_string(),
+                                );
+                            }
+                        } else {
+                            self.active_thinking_item_id = Some(id.to_string());
+                        }
+                    }
+                }
+            }
             _ => {
                 return Err(format!(
                     "unsupported normalized response event type {typ:?}"
@@ -2043,6 +2329,7 @@ mod strict_adapter_tests {
                 cache_write_tokens: None,
             }),
             reasoning_content: Some("real reasoning".to_string()),
+            reasoning_items: None,
             raw: None,
             response_id: Some("resp".to_string()),
         };
@@ -3342,6 +3629,7 @@ mod tests {
                 cache_write_tokens: None,
             })),
             reasoning_content,
+            reasoning_items: None,
             raw: None,
             response_id: None,
         }
@@ -3989,5 +4277,270 @@ mod tests {
     fn test_error_unknown_status() {
         let e = format_anthropic_error(503, "unavailable");
         assert_eq!(e["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn non_stream_encrypted_reasoning_emits_signatures_and_honors_display_and_disabled() {
+        let item_1 = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "Step 1"}],
+            "encrypted_content": "enc_1"
+        });
+        let item_2 = json!({
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "enc_2"
+        });
+        let response = AssistantResponse {
+            content: "Final answer".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: Some(crate::messages::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: Some(0),
+                cache_write_tokens: None,
+            }),
+            reasoning_content: Some("Step 1".to_string()),
+            reasoning_items: Some(vec![item_1.clone(), item_2.clone()]),
+            raw: None,
+            response_id: Some("resp-1".to_string()),
+        };
+
+        let summarized = internal_response_to_anthropic_with_options(
+            &response,
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Summarized,
+            false,
+            Some("gpt-5.6-sol"),
+        )
+        .unwrap();
+        assert_eq!(summarized["codex_reasoning"], "Step 1");
+        let blocks = summarized["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "Step 1");
+        let sig_1 = blocks[0]["signature"].as_str().unwrap();
+        assert!(sig_1.starts_with("codex-reasoning-v1:"));
+        let decoded_1 = crate::reasoning_signature::decode_reasoning_signature(sig_1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded_1.model, "gpt-5.6-sol");
+        assert_eq!(decoded_1.item.to_value(), item_1);
+
+        assert_eq!(blocks[1]["type"], "thinking");
+        assert_eq!(blocks[1]["thinking"], "");
+        let sig_2 = blocks[1]["signature"].as_str().unwrap();
+        let decoded_2 = crate::reasoning_signature::decode_reasoning_signature(sig_2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded_2.item.to_value(), item_2);
+        assert_eq!(
+            blocks[2],
+            json!({"type": "text", "text": "Final answer", "citations": null})
+        );
+
+        let omitted = internal_response_to_anthropic_with_options(
+            &response,
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Omitted,
+            false,
+            Some("gpt-5.6-sol"),
+        )
+        .unwrap();
+        assert!(omitted.get("codex_reasoning").is_none());
+        let omitted_blocks = omitted["content"].as_array().unwrap();
+        assert_eq!(omitted_blocks.len(), 3);
+        assert_eq!(omitted_blocks[0]["thinking"], "");
+        assert_eq!(omitted_blocks[0]["signature"], sig_1);
+        assert_eq!(omitted_blocks[1]["thinking"], "");
+        assert_eq!(omitted_blocks[1]["signature"], sig_2);
+
+        let disabled = internal_response_to_anthropic_with_options(
+            &response,
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Summarized,
+            true,
+            Some("gpt-5.6-sol"),
+        )
+        .unwrap();
+        assert!(disabled.get("codex_reasoning").is_none());
+        assert_eq!(
+            disabled["content"],
+            json!([{"type": "text", "text": "Final answer", "citations": null}])
+        );
+    }
+
+    #[test]
+    fn stream_encrypted_reasoning_emits_signature_delta_and_honors_display_and_disabled() {
+        let reasoning_item = json!({
+            "type": "reasoning",
+            "id": "rs_stream_1",
+            "summary": [{"type": "summary_text", "text": "Streamed thought"}],
+            "encrypted_content": "enc_stream_1"
+        });
+        let events = vec![
+            json!({
+                "type": "reasoning_delta",
+                "text": "Streamed thought",
+                "item_id": "rs_stream_1"
+            }),
+            json!({
+                "type": "reasoning_item",
+                "item": reasoning_item,
+                "model": "gpt-5.6-sol"
+            }),
+            json!({"type": "content", "text": "Answer"}),
+            finish_event("stop", 10, 5),
+        ];
+
+        let mut summarized_adapter = AnthropicStreamAdapter::with_options(
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Summarized,
+            false,
+            Some("gpt-5.6-sol"),
+        );
+        let mut chunks = summarized_adapter.start();
+        for ev in &events {
+            chunks.extend(summarized_adapter.push(ev).unwrap());
+        }
+        let parsed = get_sse_events(&chunks);
+        let sig_delta = parsed
+            .iter()
+            .find(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+            .expect("must emit signature_delta");
+        let sig = sig_delta.1["delta"]["signature"].as_str().unwrap();
+        let decoded = crate::reasoning_signature::decode_reasoning_signature(sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.model, "gpt-5.6-sol");
+        assert_eq!(decoded.item.id.as_deref(), Some("rs_stream_1"));
+
+        let mut omitted_adapter = AnthropicStreamAdapter::with_options(
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Omitted,
+            false,
+            Some("gpt-5.6-sol"),
+        );
+        let mut omitted_chunks = omitted_adapter.start();
+        for ev in &events {
+            omitted_chunks.extend(omitted_adapter.push(ev).unwrap());
+        }
+        let omitted_parsed = get_sse_events(&omitted_chunks);
+        assert!(omitted_parsed
+            .iter()
+            .all(|(e, d)| e != "codex_reasoning_delta" && d["delta"]["type"] != "thinking_delta"));
+        assert!(omitted_parsed
+            .iter()
+            .any(|(e, d)| e == "content_block_delta" && d["delta"]["type"] == "signature_delta"));
+
+        let mut disabled_adapter = AnthropicStreamAdapter::with_options(
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Summarized,
+            true,
+            Some("gpt-5.6-sol"),
+        );
+        let mut disabled_chunks = disabled_adapter.start();
+        for ev in &events {
+            disabled_chunks.extend(disabled_adapter.push(ev).unwrap());
+        }
+        let disabled_parsed = get_sse_events(&disabled_chunks);
+        assert!(disabled_parsed
+            .iter()
+            .all(|(_, d)| d["content_block"]["type"] != "thinking"
+                && d["delta"]["type"] != "signature_delta"));
+    }
+
+    #[test]
+    fn stream_rejects_item_tracked_thinking_block_without_matching_reasoning_item() {
+        let mut adapter = AnthropicStreamAdapter::with_options(
+            "claude-sonnet-4-5",
+            "msg-1",
+            ThinkingDisplayMode::Summarized,
+            false,
+            Some("gpt-5.6-sol"),
+        );
+        let _ = adapter
+            .push(&json!({
+                "type": "reasoning_delta",
+                "text": "Incomplete item",
+                "item_id": "rs_incomplete"
+            }))
+            .unwrap();
+        let err = adapter
+            .push(&json!({"type": "content", "text": "Next"}))
+            .unwrap_err();
+        assert!(err.contains("rs_incomplete"));
+    }
+
+    #[test]
+    fn anthropic_request_decodes_valid_codex_signatures_filters_models_and_rejects_malformed() {
+        let item_match = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "Step 1"}],
+            "encrypted_content": "enc_1"
+        });
+        let sig_match =
+            crate::reasoning_signature::encode_reasoning_signature("gpt-6-sol", &item_match)
+                .unwrap()
+                .unwrap();
+        let sig_compatible =
+            crate::reasoning_signature::encode_reasoning_signature("gpt-6-luna", &item_match)
+                .unwrap()
+                .unwrap();
+        let sig_other =
+            crate::reasoning_signature::encode_reasoning_signature("gpt-5.4", &item_match)
+                .unwrap()
+                .unwrap();
+
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Step 1", "signature": sig_match},
+                    {"type": "thinking", "thinking": "Compatible model", "signature": sig_compatible},
+                    {"type": "thinking", "thinking": "Other model", "signature": sig_other},
+                    {"type": "thinking", "thinking": "Foreign", "signature": "ErUBCkYICBgCIkDforeign"},
+                    {"type": "thinking", "thinking": "Empty sig", "signature": ""},
+                    {"type": "text", "text": "Hello"}
+                ]}
+            ]
+        });
+
+        let (messages, _, _, _, _, _, _) =
+            super::anthropic_request_to_internal_for_model(&body, Some("gpt-6.1-sol")).unwrap();
+        let assistant = &messages[1];
+        let items = assistant.reasoning_items.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["model"], "gpt-6-sol");
+        assert_eq!(items[0]["item"], item_match);
+        assert_eq!(items[1]["model"], "gpt-6-luna");
+        assert_eq!(items[1]["item"], item_match);
+
+        for bad_sig in [
+            "codex-reasoning-v1:!!!",
+            "codex-reasoning-v2:abc",
+            "CODEX-REASONING-v1:abc",
+            "codex_reasoning_v1:abc",
+        ] {
+            let bad_body = json!({
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "Bad", "signature": bad_sig}
+                    ]}
+                ]
+            });
+            assert!(super::anthropic_request_to_internal(&bad_body).is_err());
+        }
     }
 }

@@ -7,6 +7,13 @@ import {
   formatAnthropicError,
 } from "../anthropic-adapter.js";
 import {
+  REASONING_COMPATIBLE_MODELS,
+  REASONING_SIGNATURE_PREFIX,
+  decodeReasoningSignature,
+  encodeReasoningSignature,
+  isReasoningModelCompatible,
+} from "../reasoning-signature.js";
+import {
   ChatGPTOAuthInvalidRequestError,
   ChatGPTOAuthProtocolError,
 } from "../auth.js";
@@ -1693,5 +1700,553 @@ describe("formatAnthropicError", () => {
   it("rate limit", () => {
     const result = formatAnthropicError(429, "slow down");
     assert.equal((result.error as Record<string, unknown>).type, "rate_limit_error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Encrypted reasoning signature & preservation tests
+// ---------------------------------------------------------------------------
+
+describe("reasoning signature codec and encrypted reasoning preservation", () => {
+  it("encodes and decodes deterministic compact JSON envelopes with exact key order", () => {
+    const item = {
+      type: "reasoning" as const,
+      id: "rs_abc123",
+      encrypted_content: "gAAAAABn_exact_cipher_blob_+/=unicode_한글_🧪",
+      summary: [
+        { type: "summary_text" as const, text: "First part. " },
+        { type: "summary_text" as const, text: "Second part." },
+      ],
+    };
+    const sig = encodeReasoningSignature("gpt-6.1-sol", item);
+    assert.ok(sig.startsWith(REASONING_SIGNATURE_PREFIX));
+    const b64 = sig.slice(REASONING_SIGNATURE_PREFIX.length);
+    assert.equal(b64.includes("="), false);
+    assert.equal(b64.includes("+"), false);
+    assert.equal(b64.includes("/"), false);
+
+    const rawJson = Buffer.from(b64, "base64url").toString("utf8");
+    assert.equal(
+      rawJson,
+      JSON.stringify({
+        v: 1,
+        model: "gpt-6.1-sol",
+        item: {
+          type: "reasoning",
+          id: "rs_abc123",
+          encrypted_content: item.encrypted_content,
+          summary: item.summary,
+        },
+      }),
+    );
+
+    const decoded = decodeReasoningSignature(sig);
+    assert.deepEqual(decoded, {
+      v: 1,
+      model: "gpt-6.1-sol",
+      item,
+    });
+  });
+
+  it("omits id when absent and supports empty summary arrays", () => {
+    const sig = encodeReasoningSignature({
+      model: "gpt-6-astra",
+      item: {
+        encrypted_content: "cipher_only_blob",
+        summary: [],
+      },
+    });
+    const rawJson = Buffer.from(
+      sig.slice(REASONING_SIGNATURE_PREFIX.length),
+      "base64url",
+    ).toString("utf8");
+    assert.equal(
+      rawJson,
+      '{"v":1,"model":"gpt-6-astra","item":{"type":"reasoning","encrypted_content":"cipher_only_blob","summary":[]}}',
+    );
+    const decoded = decodeReasoningSignature(sig);
+    assert.deepEqual(decoded, {
+      v: 1,
+      model: "gpt-6-astra",
+      item: {
+        type: "reasoning",
+        encrypted_content: "cipher_only_blob",
+        summary: [],
+      },
+    });
+    assert.equal(Object.hasOwn(decoded!.item, "id"), false);
+  });
+
+  it("ignores missing, empty, or foreign signatures without error", () => {
+    for (const foreign of [
+      undefined,
+      null,
+      "",
+      "   ",
+      "ErUBCkYICBgCIkD_anthropic_native_signature",
+      "anthropic-signature-v1:eyJ2IjoxfQ",
+      "sig-abc",
+    ]) {
+      assert.equal(decodeReasoningSignature(foreign), null);
+    }
+
+    const { messages } = anthropicRequestToInternal({
+      model: "claude-sonnet-4-6",
+      backendModel: "gpt-6.1-sol",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Native claude thought", signature: "ErUBCkYICBgCIkD" },
+            { type: "thinking", thinking: "Unsigned thought" },
+            { type: "text", text: "Visible answer" },
+          ],
+        },
+      ],
+    });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].content, "Visible answer");
+    assert.equal(messages[0].reasoning_items, undefined);
+  });
+
+  it("rejects malformed recognized prefixes, base64url defects, duplicate keys, and schema violations with 400", () => {
+    const validPayload = Buffer.from(
+      JSON.stringify({
+        v: 1,
+        model: "gpt-6.1-sol",
+        item: {
+          type: "reasoning",
+          id: "rs_1",
+          encrypted_content: "SECRET_CIPHER_SENTINEL",
+          summary: [{ type: "summary_text", text: "ok" }],
+        },
+      }),
+      "utf8",
+    ).toString("base64url");
+
+    const duplicateTopKeyB64 = Buffer.from(
+      '{"v":1,"v":1,"model":"gpt-6.1-sol","item":{"type":"reasoning","encrypted_content":"SECRET_CIPHER_SENTINEL","summary":[]}}',
+      "utf8",
+    ).toString("base64url");
+
+    const duplicateEscapedKeyB64 = Buffer.from(
+      '{"v":1,"\\u0076":1,"model":"gpt-6.1-sol","item":{"type":"reasoning","encrypted_content":"SECRET_CIPHER_SENTINEL","summary":[]}}',
+      "utf8",
+    ).toString("base64url");
+
+    const duplicateNestedKeyB64 = Buffer.from(
+      '{"v":1,"model":"gpt-6.1-sol","item":{"type":"reasoning","type":"reasoning","encrypted_content":"SECRET_CIPHER_SENTINEL","summary":[]}}',
+      "utf8",
+    ).toString("base64url");
+
+    const invalidCases: string[] = [
+      "codex-reasoning:",
+      "codex-reasoning-v1:",
+      `codex-reasoning-v0:${validPayload}`,
+      `codex-reasoning-v2:${validPayload}`,
+      `codex_reasoning-v1:${validPayload}`,
+      ` codex-reasoning-v1:${validPayload}`,
+      `CODEX-REASONING-V1:${validPayload}`,
+      `codex-reasoning-v1:${validPayload}=`,
+      "codex-reasoning-v1:a",
+      "codex-reasoning-v1:ab+c",
+      "codex-reasoning-v1:ab/c",
+      "codex-reasoning-v1:!",
+      `codex-reasoning-v1:${Buffer.from([0xff, 0xfe, 0xfd]).toString("base64url")}`,
+      `codex-reasoning-v1:${Buffer.from("{not-json", "utf8").toString("base64url")}`,
+      `codex-reasoning-v1:${duplicateTopKeyB64}`,
+      `codex-reasoning-v1:${duplicateEscapedKeyB64}`,
+      `codex-reasoning-v1:${duplicateNestedKeyB64}`,
+    ];
+
+    const badObjects: unknown[] = [
+      [],
+      { v: 2, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "", item: { type: "reasoning", encrypted_content: "c", summary: [] } },
+      { v: 1, model: " gpt-6.1-sol ", item: { type: "reasoning", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", extra: true, item: { type: "reasoning", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "message", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", id: "", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", id: null, encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: null, summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", status: "completed", encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", content: [], encrypted_content: "c", summary: [] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "c", summary: "bad" } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "c", summary: [{ type: "text", text: "x" }] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "c", summary: [{ type: "summary_text", text: 123 }] } },
+      { v: 1, model: "gpt-6.1-sol", item: { type: "reasoning", encrypted_content: "c", summary: [{ type: "summary_text", text: "x", extra: 1 }] } },
+    ];
+
+    for (const obj of badObjects) {
+      invalidCases.push(
+        `codex-reasoning-v1:${Buffer.from(JSON.stringify(obj), "utf8").toString("base64url")}`,
+      );
+    }
+
+    for (const badSig of invalidCases) {
+      assert.throws(
+        () =>
+          anthropicRequestToInternal({
+            model: "claude-sonnet-4-6",
+            messages: [
+              {
+                role: "assistant",
+                content: [
+                  { type: "thinking", thinking: "thought", signature: badSig },
+                  { type: "text", text: "hello" },
+                ],
+              },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof ChatGPTOAuthInvalidRequestError &&
+          !err.message.includes("SECRET_CIPHER_SENTINEL"),
+      );
+    }
+  });
+
+  it("allows replay across all 25 compatible model pairs and drops outside-set mismatches", () => {
+    const compatibleModels = [...REASONING_COMPATIBLE_MODELS];
+    assert.deepEqual(compatibleModels, [
+      "gpt-6.1-sol",
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
+      "gpt-daybreak-blue-latest",
+    ]);
+
+    // Verify encodeReasoningSignature omits null id and strips additive upstream summary fields
+    const nullIdSig = encodeReasoningSignature("gpt-6.1-sol", {
+      type: "reasoning",
+      id: null,
+      encrypted_content: "cipher_null_id",
+      summary: [
+        {
+          type: "summary_text",
+          text: "plan",
+          future_field: "ignored",
+        } as unknown as { type: "summary_text"; text: string },
+      ],
+    });
+    assert.deepEqual(decodeReasoningSignature(nullIdSig), {
+      v: 1,
+      model: "gpt-6.1-sol",
+      item: {
+        type: "reasoning",
+        encrypted_content: "cipher_null_id",
+        summary: [{ type: "summary_text", text: "plan" }],
+      },
+    });
+
+    let pairCount = 0;
+    for (const sourceModel of compatibleModels) {
+      for (const targetModel of compatibleModels) {
+        pairCount += 1;
+        assert.equal(isReasoningModelCompatible(sourceModel, targetModel), true);
+        const sig = encodeReasoningSignature(sourceModel, {
+          type: "reasoning",
+          id: `rs_${sourceModel}_${targetModel}`,
+          encrypted_content: `cipher_${sourceModel}_${targetModel}`,
+          summary: [{ type: "summary_text", text: "plan" }],
+        });
+        const { messages } = anthropicRequestToInternal({
+          model: "claude-sonnet-4-6",
+          backendModel: targetModel,
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "plan", signature: sig },
+                { type: "text", text: "answer" },
+              ],
+            },
+          ],
+        });
+        assert.equal(messages[0].reasoning_items?.length, 1);
+        assert.equal(
+          messages[0].reasoning_items?.[0].encrypted_content,
+          `cipher_${sourceModel}_${targetModel}`,
+        );
+      }
+    }
+    assert.equal(pairCount, 25);
+
+    // Exact match outside the 5-model set is also allowed
+    assert.equal(isReasoningModelCompatible("gpt-5.5", "gpt-5.5"), true);
+
+    // Outside-set mismatches drop reasoning only while keeping assistant text and tool_use
+    for (const [sourceModel, targetModel] of [
+      ["gpt-6.1-sol", "gpt-5.5"],
+      ["gpt-5.5", "gpt-6.1-sol"],
+      ["gpt-5.6-sol", "gpt-6-sol"],
+      ["gpt-6-sol", "gpt-5.6-sol"],
+      ["gpt-6-future", "gpt-6-sol"],
+    ] as const) {
+      assert.equal(isReasoningModelCompatible(sourceModel, targetModel), false);
+      const sig = encodeReasoningSignature(sourceModel, {
+        type: "reasoning",
+        id: "rs_drop",
+        encrypted_content: "cipher_drop",
+        summary: [{ type: "summary_text", text: "plan" }],
+      });
+      const { messages } = anthropicRequestToInternal({
+        model: "claude-sonnet-4-6",
+        backendModel: targetModel,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "plan", signature: sig },
+              { type: "text", text: "kept text" },
+              { type: "tool_use", id: "tc_1", name: "lookup", input: { q: "a" } },
+            ],
+          },
+        ],
+      });
+      assert.equal(messages[0].reasoning_items, undefined);
+      assert.equal(messages[0].content, "kept text");
+      assert.equal(messages[0].tool_calls?.length, 1);
+    }
+  });
+
+  it("formats non-streaming responses with one thinking block per reasoning item, empty-summary support, and omitted/disabled semantics", () => {
+    const resp = makeResponse({
+      content: "Final answer",
+      reasoning_content: "Part 1Part 2Second item",
+      reasoning_items: [
+        {
+          type: "reasoning",
+          model: "gpt-6.1-sol",
+          id: "rs_1",
+          encrypted_content: "enc_blob_1",
+          summary: [
+            { type: "summary_text", text: "Part 1" },
+            { type: "summary_text", text: "Part 2" },
+          ],
+        },
+        {
+          type: "reasoning",
+          model: "gpt-6.1-sol",
+          id: "rs_2",
+          encrypted_content: "enc_blob_2",
+          summary: [],
+        },
+      ],
+      tool_calls: [{ id: "tc_1", name: "lookup", arguments: '{"q":"test"}' }],
+      finish_reason: "tool_calls",
+      usage: makeUsage({ prompt_tokens: 10, completion_tokens: 5 }),
+    });
+
+    const result = internalResponseToAnthropic(resp, "claude-sonnet-4-6", "msg_1", {
+      backendModel: "gpt-6.1-sol",
+    });
+    const content = result.content as Record<string, unknown>[];
+    assert.equal(content.length, 4);
+    assert.equal(content[0].type, "thinking");
+    assert.equal(content[0].thinking, "Part 1Part 2");
+    const sig1 = decodeReasoningSignature(content[0].signature);
+    assert.deepEqual(sig1, {
+      v: 1,
+      model: "gpt-6.1-sol",
+      item: {
+        type: "reasoning",
+        id: "rs_1",
+        encrypted_content: "enc_blob_1",
+        summary: [
+          { type: "summary_text", text: "Part 1" },
+          { type: "summary_text", text: "Part 2" },
+        ],
+      },
+    });
+
+    assert.equal(content[1].type, "thinking");
+    assert.equal(content[1].thinking, "");
+    const sig2 = decodeReasoningSignature(content[1].signature);
+    assert.deepEqual(sig2, {
+      v: 1,
+      model: "gpt-6.1-sol",
+      item: {
+        type: "reasoning",
+        id: "rs_2",
+        encrypted_content: "enc_blob_2",
+        summary: [],
+      },
+    });
+
+    assert.equal(content[2].type, "text");
+    assert.equal(content[2].text, "Final answer");
+    assert.equal(content[3].type, "tool_use");
+
+    // thinkingDisplay: "omitted" keeps signed thinking blocks with empty text
+    const omitted = internalResponseToAnthropic(resp, "claude-sonnet-4-6", "msg_2", {
+      thinkingDisplay: "omitted",
+      backendModel: "gpt-6.1-sol",
+    });
+    const omittedContent = omitted.content as Record<string, unknown>[];
+    assert.equal(omittedContent.length, 4);
+    assert.equal(omittedContent[0].type, "thinking");
+    assert.equal(omittedContent[0].thinking, "");
+    assert.equal(omittedContent[0].signature, content[0].signature);
+    assert.equal(omittedContent[1].type, "thinking");
+    assert.equal(omittedContent[1].thinking, "");
+    assert.equal(omittedContent[1].signature, content[1].signature);
+    assert.equal(Object.hasOwn(omitted, "codex_reasoning"), false);
+
+    // suppressReasoning: true (thinking disabled) suppresses all thinking blocks
+    const disabled = internalResponseToAnthropic(resp, "claude-sonnet-4-6", "msg_3", {
+      suppressReasoning: true,
+      backendModel: "gpt-6.1-sol",
+    });
+    const disabledContent = disabled.content as Record<string, unknown>[];
+    assert.equal(disabledContent.length, 2);
+    assert.equal(disabledContent[0].type, "text");
+    assert.equal(disabledContent[1].type, "tool_use");
+  });
+
+  it("streams signature_delta before content_block_stop for multiple items, encrypted-only items, and omitted display", async () => {
+    const streamEvents = [
+      { type: "reasoning_delta", text: "Part A", summary_index: 0, item_id: "rs_1" },
+      { type: "reasoning_section_break", summary_index: 1, item_id: "rs_1" },
+      { type: "reasoning_delta", text: "Part B", summary_index: 1, item_id: "rs_1" },
+      {
+        type: "reasoning_item",
+        model: "gpt-6.1-sol",
+        item: {
+          type: "reasoning",
+          id: "rs_1",
+          encrypted_content: "enc_stream_1",
+          summary: [
+            { type: "summary_text", text: "Part A" },
+            { type: "summary_text", text: "Part B" },
+          ],
+        },
+      },
+      {
+        type: "reasoning_item",
+        model: "gpt-6.1-sol",
+        item: {
+          type: "reasoning",
+          id: "rs_2",
+          encrypted_content: "enc_stream_2",
+          summary: [],
+        },
+      },
+      { type: "content", text: "Hello" },
+      { type: "tool_call", id: "tc_1", name: "lookup", arguments: '{"a":1}' },
+      { type: "finish", finish_reason: "tool_calls", usage: makeStreamUsage() },
+    ];
+
+    const collected = await collectStreamEvents(streamEvents, {
+      backendModel: "gpt-6.1-sol",
+    });
+
+    const blockEvents = collected.filter((e) =>
+      ["content_block_start", "content_block_delta", "content_block_stop"].includes(
+        e.type as string,
+      ),
+    );
+    assert.deepEqual(
+      blockEvents.map((e) => ({
+        type: e.type,
+        index: e.index,
+        subType:
+          (e.content_block as Record<string, unknown> | undefined)?.type ??
+          (e.delta as Record<string, unknown> | undefined)?.type,
+      })),
+      [
+        { type: "content_block_start", index: 0, subType: "thinking" },
+        { type: "content_block_delta", index: 0, subType: "thinking_delta" },
+        { type: "content_block_delta", index: 0, subType: "thinking_delta" },
+        { type: "content_block_delta", index: 0, subType: "signature_delta" },
+        { type: "content_block_stop", index: 0, subType: undefined },
+        { type: "content_block_start", index: 1, subType: "thinking" },
+        { type: "content_block_delta", index: 1, subType: "signature_delta" },
+        { type: "content_block_stop", index: 1, subType: undefined },
+        { type: "content_block_start", index: 2, subType: "text" },
+        { type: "content_block_delta", index: 2, subType: "text_delta" },
+        { type: "content_block_stop", index: 2, subType: undefined },
+        { type: "content_block_start", index: 3, subType: "tool_use" },
+        { type: "content_block_delta", index: 3, subType: "input_json_delta" },
+        { type: "content_block_stop", index: 3, subType: undefined },
+      ],
+    );
+
+    // Omitted display mode streams signed thinking blocks with empty thinking text and no thinking_delta
+    const omittedEvents = await collectStreamEvents(streamEvents, {
+      thinkingDisplay: "omitted",
+      backendModel: "gpt-6.1-sol",
+    });
+    assert.equal(
+      omittedEvents.some(
+        (e) =>
+          e.type === "content_block_delta" &&
+          (e.delta as Record<string, unknown>).type === "thinking_delta",
+      ),
+      false,
+    );
+    assert.equal(
+      omittedEvents.some((e) => e.type === "codex_reasoning_delta"),
+      false,
+    );
+    const omittedSigDeltas = omittedEvents.filter(
+      (e) =>
+        e.type === "content_block_delta" &&
+        (e.delta as Record<string, unknown>).type === "signature_delta",
+    );
+    assert.equal(omittedSigDeltas.length, 2);
+
+    // Disabled thinking suppresses all thinking blocks in stream
+    const disabledEvents = await collectStreamEvents(streamEvents, {
+      suppressReasoning: true,
+      backendModel: "gpt-6.1-sol",
+    });
+    const disabledStarts = disabledEvents.filter((e) => e.type === "content_block_start");
+    assert.deepEqual(
+      disabledStarts.map((e) => (e.content_block as Record<string, unknown>).type),
+      ["text", "tool_use"],
+    );
+  });
+
+  it("errors on inconsistent reasoning_delta and reasoning_item association in stream", async () => {
+    // Mismatched item_id
+    await assert.rejects(
+      () =>
+        collectStreamEvents([
+          { type: "reasoning_delta", text: "A", item_id: "rs_1" },
+          {
+            type: "reasoning_item",
+            model: "gpt-6.1-sol",
+            item: {
+              type: "reasoning",
+              id: "rs_2",
+              encrypted_content: "enc",
+              summary: [{ type: "summary_text", text: "A" }],
+            },
+          },
+          { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+        ]),
+      ChatGPTOAuthProtocolError,
+    );
+
+    // Mismatched summary text
+    await assert.rejects(
+      () =>
+        collectStreamEvents([
+          { type: "reasoning_delta", text: "Streamed A", item_id: "rs_1" },
+          {
+            type: "reasoning_item",
+            model: "gpt-6.1-sol",
+            item: {
+              type: "reasoning",
+              id: "rs_1",
+              encrypted_content: "enc",
+              summary: [{ type: "summary_text", text: "Different B" }],
+            },
+          },
+          { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
+        ]),
+      ChatGPTOAuthProtocolError,
+    );
   });
 });

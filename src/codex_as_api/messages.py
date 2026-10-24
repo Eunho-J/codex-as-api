@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from typing import Any
 
 
 class MessageRole(enum.Enum):
@@ -37,6 +38,7 @@ class Message:
     reasoning_content: str | None = None
     images: tuple[str, ...] = ()
     content_parts: tuple[dict[str, object], ...] | None = None
+    reasoning_items: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, MessageRole):
@@ -49,10 +51,14 @@ class Message:
             object.__setattr__(self, "content_parts", tuple(self.content_parts))
         if not isinstance(self.images, tuple):
             object.__setattr__(self, "images", tuple(self.images))
+        if not isinstance(self.reasoning_items, tuple):
+            object.__setattr__(self, "reasoning_items", tuple(self.reasoning_items))
         if any(not isinstance(image, str) or not image for image in self.images):
             raise ValueError("Message.images must contain non-empty strings")
         if self.content_parts is not None and any(not isinstance(part, dict) for part in self.content_parts):
             raise TypeError("Message.content_parts must contain dict values")
+        if any(not isinstance(item, dict) for item in self.reasoning_items):
+            raise TypeError("Message.reasoning_items must contain dict values")
         if self.reasoning_content is not None and not isinstance(
             self.reasoning_content,
             str,
@@ -67,6 +73,8 @@ class Message:
             raise ValueError("tool_call_id and name are only allowed on tool messages")
         if self.tool_calls and self.role is not MessageRole.ASSISTANT:
             raise ValueError("tool_calls are only allowed on assistant messages")
+        if self.reasoning_items and self.role is not MessageRole.ASSISTANT:
+            raise ValueError("reasoning_items are only allowed on assistant messages")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -109,6 +117,7 @@ class AssistantResponse:
     reasoning_content: str | None = None
     raw: dict | None = None
     response_id: str | None = None
+    reasoning_items: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, str):
@@ -119,6 +128,10 @@ class AssistantResponse:
             raise ValueError("AssistantResponse.response_id must be non-empty when provided")
         if not isinstance(self.tool_calls, tuple):
             object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+        if not isinstance(self.reasoning_items, tuple):
+            object.__setattr__(self, "reasoning_items", tuple(self.reasoning_items))
+        if any(not isinstance(item, dict) for item in self.reasoning_items):
+            raise TypeError("AssistantResponse.reasoning_items must contain dict values")
 
 
 class InterruptIdleSignal(Exception):  # noqa: N818 - this is an internal control-flow signal.

@@ -16,6 +16,7 @@ from codex_as_api.auth import (
 from codex_as_api.model_capabilities import (
     CODEX_METADATA_ENV,
     RESPONSES_LITE_ENV,
+    VERIFIED_HIDDEN_MODEL_WARNING,
     CatalogLoadResult,
     ModelCatalogCache,
     apply_model_capability_fields,
@@ -281,9 +282,83 @@ def test_catalog_parser_preserves_comp_hash_empty_slugs_and_custom_reasoning_val
 def test_catalog_parser_accepts_empty_models_but_default_selection_fails() -> None:
     snapshot = _parse({"models": []})
 
-    assert snapshot.models == ()
+    assert tuple(model.slug for model in snapshot.models) == (
+        "gpt-6-chat-thinking",
+        "gpt-reserve",
+        "codex-auto-review",
+    )
+    assert resolve_model(snapshot, "gpt-6-chat-thinking", None).slug == "gpt-6-chat-thinking"
     with pytest.raises(ChatGPTOAuthCatalogUnavailableError):
         resolve_model(snapshot, None, None)
+
+
+def test_verified_hidden_models_merge_without_duplicates_and_preserve_live_capabilities(
+    model_catalog_document,
+) -> None:
+    document = deepcopy(model_catalog_document)
+    for model in document["models"]:
+        model["priority"] = 100
+    live_thinking = deepcopy(document["models"][0])
+    live_thinking.update(
+        slug="gpt-6-chat-thinking",
+        display_name="Live GPT-6 Chat Thinking",
+        description="Upstream hidden description",
+        priority=0,
+        visibility="hide",
+        supported_in_api=False,
+        context_window=512_000,
+        max_context_window=512_000,
+        support_verbosity=True,
+        default_verbosity="high",
+        supports_reasoning_summary_parameter=True,
+        default_reasoning_summary="detailed",
+    )
+    document["models"].insert(0, live_thinking)
+
+    snapshot = _parse(document)
+
+    slugs = [model.slug for model in snapshot.models]
+    assert slugs.count("gpt-6-chat-thinking") == 1
+    assert slugs.count("gpt-reserve") == 1
+    assert slugs.count("codex-auto-review") == 1
+    assert resolve_model(snapshot, None, None).slug == "gpt-5.6-sol"
+
+    thinking = snapshot.model("gpt-6-chat-thinking")
+    assert thinking.display_name == "Live GPT-6 Chat Thinking"
+    assert thinking.description == VERIFIED_HIDDEN_MODEL_WARNING
+    assert thinking.visibility == "list"
+    assert thinking.supported_in_api is True
+    assert thinking.priority == 0
+    assert thinking.context_window == 512_000
+    assert thinking.max_context_window == 512_000
+    assert thinking.support_verbosity is True
+    assert thinking.default_verbosity == "high"
+    assert thinking.supports_reasoning_summary_parameter is True
+    assert thinking.default_reasoning_summary == "detailed"
+
+    reserve = snapshot.model("gpt-reserve")
+    assert reserve.display_name == "GPT-Reserve"
+    assert reserve.description == VERIFIED_HIDDEN_MODEL_WARNING
+    assert reserve.visibility == "list"
+    assert reserve.supported_in_api is True
+    assert reserve.context_window == 272_000
+    assert reserve.max_context_window == 872_000
+    assert reserve.use_responses_lite is True
+    assert reserve.supports_reasoning_summary_parameter is True
+    assert reserve.default_reasoning_summary == "none"
+
+    auto_review = snapshot.model("codex-auto-review")
+    assert auto_review.display_name == "Codex Auto Review"
+    assert auto_review.description == VERIFIED_HIDDEN_MODEL_WARNING
+    assert auto_review.visibility == "list"
+    assert auto_review.supported_in_api is True
+    assert auto_review.priority == 43
+
+    assert resolve_model(snapshot, "gpt-6-chat-thinking", None).slug == "gpt-6-chat-thinking"
+    assert resolve_model(snapshot, "gpt-reserve", None).slug == "gpt-reserve"
+    assert resolve_model(snapshot, "codex-auto-review", None).slug == "codex-auto-review"
+    with pytest.raises(ChatGPTOAuthModelNotFoundError):
+        resolve_model(snapshot, "unknown-hidden-model", None)
 
 
 def test_catalog_parser_preserves_remaining_officially_unconstrained_values(model_catalog_document) -> None:

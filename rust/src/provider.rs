@@ -17,7 +17,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 pub const CHATGPT_OAUTH_DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 // The pinned Codex provider applies a 300-second idle timeout to each stream read rather than a
@@ -26,9 +28,10 @@ pub const CHATGPT_OAUTH_DEFAULT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
 pub(crate) const MODEL_CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const REMOTE_COMPACTION_MARKER: &str = "[Remote Responses compacted history]";
-const CODEX_CLI_ORIGINATOR: &str = "codex_cli_rs";
+#[cfg(test)]
 const CODEX_UPSTREAM_CONTRACT_JSON: &str =
     include_str!("../../config/codex-upstream-contract.json");
+#[cfg(test)]
 static CODEX_COMPATIBILITY_VERSION: OnceLock<String> = OnceLock::new();
 const RESPONSE_CHAIN_CAPACITY: usize = 256;
 
@@ -738,6 +741,7 @@ mod live_catalog_tests {
     }
 }
 
+#[cfg(test)]
 fn pinned_codex_compatibility_version() -> &'static str {
     CODEX_COMPATIBILITY_VERSION.get_or_init(|| {
         let contract: Value = serde_json::from_str(CODEX_UPSTREAM_CONTRACT_JSON)
@@ -752,87 +756,27 @@ fn pinned_codex_compatibility_version() -> &'static str {
     })
 }
 
+#[cfg(test)]
 fn normalize_codex_cli_version(value: &str) -> Option<String> {
-    if value != value.trim() {
-        return None;
-    }
-    let version = value;
-    if version.is_empty() {
-        return None;
-    }
-    let mut chars = version.chars().peekable();
-    let mut numeric_parts = 0usize;
-    loop {
-        let mut digits = 0usize;
-        while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
-            chars.next();
-            digits += 1;
-        }
-        if digits == 0 {
-            return None;
-        }
-        numeric_parts += 1;
-        if !matches!(chars.peek(), Some('.')) {
-            break;
-        }
-        chars.next();
-    }
-    if !(2..=4).contains(&numeric_parts) {
-        return None;
-    }
-    let rest: String = chars.collect();
-    if !rest.is_empty() {
-        let mut rest_chars = rest.chars();
-        if !matches!(rest_chars.next(), Some('-' | '+')) {
-            return None;
-        }
-        let mut suffix = 0usize;
-        for ch in rest_chars {
-            if !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-') {
-                return None;
-            }
-            suffix += 1;
-        }
-        if suffix == 0 {
-            return None;
-        }
-    }
-    Some(version.to_string())
+    crate::codex_version::require_explicit_codex_version(value).ok()
 }
 
-fn codex_cli_headers() -> HashMap<String, String> {
-    let version = pinned_codex_compatibility_version();
-    let mut headers = HashMap::new();
-    headers.insert("originator".to_string(), CODEX_CLI_ORIGINATOR.to_string());
-    headers.insert(
-        "User-Agent".to_string(),
-        sanitize_header_value(&format!(
-            "{CODEX_CLI_ORIGINATOR}/{version} ({}) codex-as-api/{}",
-            codex_os_info(),
-            env!("CARGO_PKG_VERSION")
-        )),
-    );
-    headers
-}
-
-fn codex_os_info() -> String {
-    format!("{} unknown; {}", codex_os_name(), std::env::consts::ARCH)
-}
-
-fn codex_os_name() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "Mac OS",
-        "windows" => "Windows",
-        "linux" => "Linux",
-        other => other,
+fn provider_error_from_version_error(
+    error: crate::codex_version::CodexVersionError,
+) -> ProviderError {
+    match error {
+        crate::codex_version::CodexVersionError::Unavailable(message) => {
+            ProviderError::CatalogUnavailable(message)
+        }
+        crate::codex_version::CodexVersionError::InvalidVersion(message) => {
+            ProviderError::InvalidRequest(message)
+        }
     }
 }
 
-fn sanitize_header_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if matches!(ch, ' '..='~') { ch } else { '_' })
-        .collect()
+fn codex_cli_headers(client_version: &str) -> Result<HashMap<String, String>, ProviderError> {
+    crate::codex_version::codex_cli_headers_for_version(client_version)
+        .map_err(provider_error_from_version_error)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -887,6 +831,7 @@ struct FinalizedResponsesRequest {
     use_responses_lite: bool,
     conversation_input: Vec<Value>,
     account_id: String,
+    client_version: String,
     comp_hash: Option<String>,
 }
 
@@ -910,6 +855,12 @@ struct ChatStreamState {
     text_parts: Vec<String>,
     reasoning_summary_parts: Vec<String>,
     reasoning_raw_parts: Vec<String>,
+    active_reasoning_item_id: Option<String>,
+    current_item_delta_id: Option<String>,
+    current_item_summary_parts: Vec<String>,
+    current_item_raw_parts: Vec<String>,
+    current_item_saw_summary_delta: bool,
+    current_item_saw_raw_delta: bool,
     emitted_tool_call: bool,
     emitted_web_search: bool,
     saw_text_delta: bool,
@@ -1070,6 +1021,7 @@ pub struct ChatGPTOAuthProvider {
     pub timeout: std::time::Duration,
     response_chains: ResponseChainStore,
     model_catalog: ModelCatalogCache,
+    version_resolver: crate::codex_version::CodexVersionResolver,
 }
 
 impl ChatGPTOAuthProvider {
@@ -1086,6 +1038,15 @@ impl ChatGPTOAuthProvider {
             timeout,
             DEFAULT_CATALOG_TTL,
         )
+    }
+
+    #[cfg(test)]
+    pub fn with_version_resolver(
+        mut self,
+        version_resolver: crate::codex_version::CodexVersionResolver,
+    ) -> Self {
+        self.version_resolver = version_resolver;
+        self
     }
 
     fn with_catalog_ttl(
@@ -1160,6 +1121,7 @@ impl ChatGPTOAuthProvider {
             timeout,
             response_chains: ResponseChainStore::new(RESPONSE_CHAIN_CAPACITY),
             model_catalog: ModelCatalogCache::new(catalog_ttl),
+            version_resolver: crate::codex_version::default_codex_version_resolver().clone(),
         })
     }
 
@@ -1176,7 +1138,10 @@ impl ChatGPTOAuthProvider {
 
     pub fn model_catalog_snapshot(&self) -> Result<Arc<ModelCatalogSnapshot>, ProviderError> {
         let token = auth::token_for_request(self.auth_json_path.as_deref())?;
-        let client_version = pinned_codex_compatibility_version().to_string();
+        let client_version = self
+            .version_resolver
+            .resolve_blocking()
+            .map_err(provider_error_from_version_error)?;
         let key = CatalogKey {
             account_id: token.account_id.clone(),
             base_url: self.base_url.clone(),
@@ -1281,7 +1246,7 @@ impl ChatGPTOAuthProvider {
         let initial_account_id = initial_token.account_id.clone();
         let mut token = initial_token;
         for attempt in 0..2 {
-            let headers = headers_for_token(&token)
+            let headers = headers_for_token(&token, client_version)
                 .map_err(|error| CatalogError::Request(error.to_string()))?;
             let url = format!("{}/models?client_version={client_version}", self.base_url);
             let client = reqwest::blocking::Client::builder()
@@ -1379,6 +1344,7 @@ impl ChatGPTOAuthProvider {
     ) -> Result<AssistantResponse, ProviderError> {
         let mut content_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
+        let mut reasoning_items: Vec<Value> = Vec::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish_reason: Option<String> = None;
         let mut saw_finish = false;
@@ -1416,6 +1382,23 @@ impl ChatGPTOAuthProvider {
                         )
                     })?;
                     reasoning_parts.push(text.to_string());
+                }
+                "reasoning_item" => {
+                    let item = event
+                        .get("item")
+                        .filter(|value| value.is_object())
+                        .ok_or_else(|| {
+                            ProviderError::UpstreamProtocol(
+                                "reasoning_item event requires an object item".to_string(),
+                            )
+                        })?;
+                    validate_response_output_item(item)?;
+                    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                        return Err(ProviderError::UpstreamProtocol(
+                            "reasoning_item event item must have type 'reasoning'".to_string(),
+                        ));
+                    }
+                    reasoning_items.push(item.clone());
                 }
                 "tool_call" => {
                     let id = event
@@ -1537,6 +1520,7 @@ impl ChatGPTOAuthProvider {
             finish_reason,
             usage,
             reasoning_content,
+            reasoning_items: (!reasoning_items.is_empty()).then_some(reasoning_items),
             raw: Some(json!({"events": tail_events})),
             response_id: Some(response_id),
         })
@@ -1604,7 +1588,7 @@ impl ChatGPTOAuthProvider {
                 if mg { "true" } else { "false" }.to_string(),
             );
         }
-        let _ = self.headers_for_account(&request.account_id)?;
+        let _ = self.headers_for_account(&request.account_id, &request.client_version)?;
 
         Ok(PreparedChatStream {
             request,
@@ -1623,7 +1607,15 @@ impl ChatGPTOAuthProvider {
     {
         let conversation_input = prepared.request.conversation_input.clone();
         let account_id = prepared.request.account_id.clone();
+        let client_version = prepared.request.client_version.clone();
         let comp_hash = prepared.request.comp_hash.clone();
+        let model_slug = prepared
+            .request
+            .payload
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let mut state = ChatStreamState::default();
 
         self.request_sse_each(
@@ -1631,6 +1623,7 @@ impl ChatGPTOAuthProvider {
             &prepared.request.payload,
             Some(&prepared.extra_headers),
             &account_id,
+            &client_version,
             prepared.cancellation,
             |event| {
                 let typ = event
@@ -1642,6 +1635,27 @@ impl ChatGPTOAuthProvider {
                         )
                     })?;
                 match typ {
+                    "response.output_item.added" => {
+                        if let Some(item) = event.get("item") {
+                            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                                if state.active_reasoning_item_id.is_some()
+                                    || state.current_item_delta_id.is_some()
+                                    || state.current_item_saw_summary_delta
+                                    || state.current_item_saw_raw_delta
+                                {
+                                    return Err(ProviderError::UpstreamProtocol(
+                                        "overlapping reasoning output items are not supported"
+                                            .to_string(),
+                                    ));
+                                }
+                                state.active_reasoning_item_id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_string);
+                            }
+                        }
+                    }
                     "response.output_text.delta" => {
                         let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                             ProviderError::UpstreamProtocol(
@@ -1678,6 +1692,98 @@ impl ChatGPTOAuthProvider {
                             }
                         }
                         state.final_output.push(item.clone());
+                        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                            let done_id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty());
+                            if let Some(active_id) = state.active_reasoning_item_id.as_deref() {
+                                if done_id != Some(active_id) {
+                                    return Err(ProviderError::UpstreamProtocol(
+                                        "response.output_item.done reasoning id does not match response.output_item.added id"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            if let Some(delta_id) = state.current_item_delta_id.as_deref() {
+                                if done_id != Some(delta_id) {
+                                    return Err(ProviderError::UpstreamProtocol(
+                                        "response.output_item.done reasoning id does not match streamed reasoning delta item_id"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            let (item_summary, item_raw) =
+                                reasoning_parts_from_response_items(std::slice::from_ref(item))
+                                    .map_err(ProviderError::UpstreamProtocol)?;
+                            if state.current_item_saw_summary_delta {
+                                if state.current_item_summary_parts.join("") != item_summary {
+                                    return Err(ProviderError::UpstreamProtocol(
+                                        "response.completed reasoning summary does not match streamed reasoning summary"
+                                            .to_string(),
+                                    ));
+                                }
+                            } else if !item_summary.is_empty() {
+                                if !state.reasoning_summary_parts.is_empty() {
+                                    let mut break_event = json!({
+                                        "type": "reasoning_section_break",
+                                    });
+                                    if let Some(id) = done_id {
+                                        break_event
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .insert("item_id".to_string(), Value::String(id.to_string()));
+                                    }
+                                    emit(break_event)?;
+                                }
+                                state.saw_reasoning_summary_delta = true;
+                                state.reasoning_summary_parts.push(item_summary.clone());
+                                let mut delta_event = json!({
+                                    "type": "reasoning_delta",
+                                    "text": item_summary,
+                                });
+                                if let Some(id) = done_id {
+                                    delta_event
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .insert("item_id".to_string(), Value::String(id.to_string()));
+                                }
+                                emit(delta_event)?;
+                            }
+                            if state.current_item_saw_raw_delta {
+                                if state.current_item_raw_parts.join("") != item_raw {
+                                    return Err(ProviderError::UpstreamProtocol(
+                                        "response.completed reasoning content does not match streamed reasoning content"
+                                            .to_string(),
+                                    ));
+                                }
+                            } else if !item_raw.is_empty() {
+                                state.saw_reasoning_raw_delta = true;
+                                state.reasoning_raw_parts.push(item_raw.clone());
+                                let mut raw_event = json!({
+                                    "type": "reasoning_raw_delta",
+                                    "text": item_raw,
+                                });
+                                if let Some(id) = done_id {
+                                    raw_event
+                                        .as_object_mut()
+                                        .unwrap()
+                                        .insert("item_id".to_string(), Value::String(id.to_string()));
+                                }
+                                emit(raw_event)?;
+                            }
+                            emit(json!({
+                                "type": "reasoning_item",
+                                "item": item,
+                                "model": model_slug,
+                            }))?;
+                            state.active_reasoning_item_id = None;
+                            state.current_item_delta_id = None;
+                            state.current_item_summary_parts.clear();
+                            state.current_item_raw_parts.clear();
+                            state.current_item_saw_summary_delta = false;
+                            state.current_item_saw_raw_delta = false;
+                        }
                         if let Some(tc) = tool_call {
                             state.emitted_tool_call = true;
                             emit(json!({
@@ -1693,10 +1799,22 @@ impl ChatGPTOAuthProvider {
                         }
                     }
                     "response.reasoning_summary_part.added" => {
-                        emit(json!({
+                        let effective_item_id = resolve_streamed_reasoning_item_id(
+                            &event,
+                            &state.active_reasoning_item_id,
+                            &mut state.current_item_delta_id,
+                        )?;
+                        let mut section_event = json!({
                             "type": "reasoning_section_break",
                             "summary_index": event.get("summary_index"),
-                        }))?;
+                        });
+                        if let Some(item_id) = effective_item_id {
+                            section_event
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("item_id".to_string(), Value::String(item_id));
+                        }
+                        emit(section_event)?;
                     }
                     "response.reasoning_summary_text.delta" => {
                         let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
@@ -1705,14 +1823,28 @@ impl ChatGPTOAuthProvider {
                                     .to_string(),
                             )
                         })?;
+                        let effective_item_id = resolve_streamed_reasoning_item_id(
+                            &event,
+                            &state.active_reasoning_item_id,
+                            &mut state.current_item_delta_id,
+                        )?;
                         state.saw_reasoning_summary_delta = true;
                         state.reasoning_summary_parts.push(delta.to_string());
+                        state.current_item_saw_summary_delta = true;
+                        state.current_item_summary_parts.push(delta.to_string());
                         if !delta.is_empty() {
-                            emit(json!({
+                            let mut delta_event = json!({
                                 "type": "reasoning_delta",
                                 "text": delta,
                                 "summary_index": event.get("summary_index"),
-                            }))?;
+                            });
+                            if let Some(item_id) = effective_item_id {
+                                delta_event
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .insert("item_id".to_string(), Value::String(item_id));
+                            }
+                            emit(delta_event)?;
                         }
                     }
                     "response.reasoning_text.delta" => {
@@ -1721,14 +1853,28 @@ impl ChatGPTOAuthProvider {
                                 "response.reasoning_text.delta requires a string delta".to_string(),
                             )
                         })?;
+                        let effective_item_id = resolve_streamed_reasoning_item_id(
+                            &event,
+                            &state.active_reasoning_item_id,
+                            &mut state.current_item_delta_id,
+                        )?;
                         state.saw_reasoning_raw_delta = true;
                         state.reasoning_raw_parts.push(delta.to_string());
+                        state.current_item_saw_raw_delta = true;
+                        state.current_item_raw_parts.push(delta.to_string());
                         if !delta.is_empty() {
-                            emit(json!({
+                            let mut raw_event = json!({
                                 "type": "reasoning_raw_delta",
                                 "text": delta,
                                 "content_index": event.get("content_index"),
-                            }))?;
+                            });
+                            if let Some(item_id) = effective_item_id {
+                                raw_event
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .insert("item_id".to_string(), Value::String(item_id));
+                            }
+                            emit(raw_event)?;
                         }
                     }
                     "response.failed" => {
@@ -1743,6 +1889,12 @@ impl ChatGPTOAuthProvider {
                         )));
                     }
                     "response.completed" => {
+                        if state.active_reasoning_item_id.is_some() {
+                            return Err(ProviderError::UpstreamProtocol(
+                                "response.completed arrived before active reasoning output item completed"
+                                    .to_string(),
+                            ));
+                        }
                         state.saw_completed = true;
                         let response = event
                             .get("response")
@@ -2018,7 +2170,8 @@ impl ChatGPTOAuthProvider {
         responses_lite: Option<&Value>,
         controls: &CompactControls,
     ) -> Result<String, ProviderError> {
-        let (base_instructions, mut input_items) = split_instructions_and_input(messages)?;
+        let (base_instructions, mut input_items) =
+            split_instructions_and_input_for_model(messages, Some(&resolved.model.slug))?;
         let tools_payload: Vec<Value> = match tools {
             Some(tools) => tools
                 .iter()
@@ -2089,6 +2242,7 @@ impl ChatGPTOAuthProvider {
             &request.payload,
             Some(&extra_headers),
             &request.account_id,
+            &request.client_version,
         )?;
 
         let output = data
@@ -2118,6 +2272,7 @@ impl ChatGPTOAuthProvider {
             &request.payload,
             Some(&extra_headers),
             &request.account_id,
+            &request.client_version,
         )?;
         for event in &events {
             let typ = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -2178,7 +2333,8 @@ impl ChatGPTOAuthProvider {
         validate_private_request_controls(None, max_tokens, stop)?;
         validate_normalized_tool_choice(tool_choice)?;
         validate_client_metadata_reserved_keys(client_metadata)?;
-        let (instructions, mut input_items) = split_instructions_and_input(messages)?;
+        let (instructions, mut input_items) =
+            split_instructions_and_input_for_model(messages, Some(&resolved.model.slug))?;
 
         let tools_array: Vec<Value> = match tools {
             Some(ts) => ts
@@ -2281,17 +2437,21 @@ impl ChatGPTOAuthProvider {
         )
     }
 
-    fn headers(&self) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
+    fn headers(
+        &self,
+        client_version: &str,
+    ) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
         let token = auth::token_for_request(self.auth_json_path.as_deref())?;
-        let headers = headers_for_token(&token)?;
+        let headers = headers_for_token(&token, client_version)?;
         Ok((headers, token))
     }
 
     fn headers_for_account(
         &self,
         expected_account_id: &str,
+        client_version: &str,
     ) -> Result<(HashMap<String, String>, ChatGPTTokenData), ProviderError> {
-        let (headers, token) = self.headers()?;
+        let (headers, token) = self.headers(client_version)?;
         if token.account_id != expected_account_id {
             return Err(ProviderError::Auth(AuthError::Refresh(
                 "ChatGPT OAuth account changed after model resolution".to_string(),
@@ -2304,17 +2464,17 @@ impl ChatGPTOAuthProvider {
         &self,
         token: &ChatGPTTokenData,
         headers: &reqwest::header::HeaderMap,
+        client_version: &str,
     ) -> Result<(), ProviderError> {
         let Some(etag) = optional_header_text(headers, "x-models-etag") else {
             return Ok(());
         };
-        let client_version = pinned_codex_compatibility_version().to_string();
         self.model_catalog
             .observe_etag(
                 &CatalogKey {
                     account_id: token.account_id.clone(),
                     base_url: self.base_url.clone(),
-                    client_version,
+                    client_version: client_version.to_string(),
                 },
                 Some(etag),
             )
@@ -2327,8 +2487,15 @@ impl ChatGPTOAuthProvider {
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
         expected_account_id: &str,
+        client_version: &str,
     ) -> Result<Value, ProviderError> {
-        let raw = self.request_json(path, payload, extra_headers, expected_account_id)?;
+        let raw = self.request_json(
+            path,
+            payload,
+            extra_headers,
+            expected_account_id,
+            client_version,
+        )?;
         let data = strict_json::parse_slice(&raw).map_err(|error| {
             ProviderError::UpstreamProtocol(format!(
                 "ChatGPT OAuth response must be valid JSON: {error}"
@@ -2348,8 +2515,15 @@ impl ChatGPTOAuthProvider {
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
         expected_account_id: &str,
+        client_version: &str,
     ) -> Result<Vec<Value>, ProviderError> {
-        self.request_sse(path, payload, extra_headers, expected_account_id)
+        self.request_sse(
+            path,
+            payload,
+            extra_headers,
+            expected_account_id,
+            client_version,
+        )
     }
 
     fn request_sse(
@@ -2358,6 +2532,7 @@ impl ChatGPTOAuthProvider {
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
         expected_account_id: &str,
+        client_version: &str,
     ) -> Result<Vec<Value>, ProviderError> {
         let mut events = Vec::new();
         self.request_sse_each(
@@ -2365,6 +2540,7 @@ impl ChatGPTOAuthProvider {
             payload,
             extra_headers,
             expected_account_id,
+            client_version,
             None,
             |event| {
                 events.push(event);
@@ -2374,12 +2550,14 @@ impl ChatGPTOAuthProvider {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request_sse_each<F>(
         &self,
         path: &str,
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
         expected_account_id: &str,
+        client_version: &str,
         cancellation: Option<Arc<AtomicBool>>,
         mut on_event: F,
     ) -> Result<(), ProviderError>
@@ -2394,6 +2572,7 @@ impl ChatGPTOAuthProvider {
             for attempt in 0..2 {
                 let auth_json_path = self.auth_json_path.clone();
                 let expected_account_id = expected_account_id.to_string();
+                let client_version_owned = client_version.to_string();
                 let (mut headers, token) = tokio::task::spawn_blocking(move || {
                     let token = auth::token_for_request(auth_json_path.as_deref())?;
                     if token.account_id != expected_account_id {
@@ -2401,7 +2580,7 @@ impl ChatGPTOAuthProvider {
                             "ChatGPT OAuth account changed after model resolution".to_string(),
                         )));
                     }
-                    let headers = headers_for_token(&token)?;
+                    let headers = headers_for_token(&token, &client_version_owned)?;
                     Ok((headers, token))
                 })
                 .await
@@ -2495,7 +2674,7 @@ impl ChatGPTOAuthProvider {
                     });
                 }
 
-                self.observe_models_etag(&token, response.headers())?;
+                self.observe_models_etag(&token, response.headers(), client_version)?;
                 let mut bytes_stream = response.bytes_stream();
                 let mut raw_buffer = Vec::<u8>::new();
                 let mut block = Vec::<String>::new();
@@ -2563,9 +2742,11 @@ impl ChatGPTOAuthProvider {
         payload: &Value,
         extra_headers: Option<&HashMap<String, String>>,
         expected_account_id: &str,
+        client_version: &str,
     ) -> Result<Vec<u8>, ProviderError> {
         for attempt in 0..2 {
-            let (mut headers, token) = self.headers_for_account(expected_account_id)?;
+            let (mut headers, token) =
+                self.headers_for_account(expected_account_id, client_version)?;
             if let Some(eh) = extra_headers {
                 for (k, v) in eh {
                     headers.insert(k.clone(), v.clone());
@@ -2624,7 +2805,7 @@ impl ChatGPTOAuthProvider {
                             ),
                         });
                     }
-                    self.observe_models_etag(&token, response.headers())?;
+                    self.observe_models_etag(&token, response.headers(), client_version)?;
                     let bytes = response.bytes().map_err(|e| {
                         ProviderError::UpstreamTransport(format!(
                             "ChatGPT OAuth request failed: {}",
@@ -2657,8 +2838,11 @@ async fn wait_for_cancellation(cancellation: Option<Arc<AtomicBool>>) {
     }
 }
 
-fn headers_for_token(token: &ChatGPTTokenData) -> Result<HashMap<String, String>, ProviderError> {
-    let mut headers = codex_cli_headers();
+fn headers_for_token(
+    token: &ChatGPTTokenData,
+    client_version: &str,
+) -> Result<HashMap<String, String>, ProviderError> {
+    let mut headers = codex_cli_headers(client_version)?;
     headers.insert(
         "Authorization".to_string(),
         format!("Bearer {}", token.access_token),
@@ -3143,6 +3327,19 @@ fn validate_response_event(event: &Value) -> Result<(), ProviderError> {
             "response.reasoning_summary_part.added requires integer summary_index".to_string(),
         ));
     }
+    if matches!(
+        event_type,
+        "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_part.added"
+    ) && event
+        .get("item_id")
+        .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(ProviderError::UpstreamProtocol(format!(
+            "{event_type} item_id must be a non-empty string when provided"
+        )));
+    }
     if event_type != "response.completed" {
         return Ok(());
     }
@@ -3459,7 +3656,18 @@ fn validate_response_item_optional_fields(
                 ));
             }
         },
-        "reasoning" => nullable_string("encrypted_content")?,
+        "reasoning" => {
+            nullable_string("encrypted_content")?;
+            if item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty)
+            {
+                return Err(ProviderError::UpstreamProtocol(
+                    "reasoning id must be a non-empty string when present".to_string(),
+                ));
+            }
+        }
         "function_call" => {
             nullable_string("namespace")?;
             if let Some(encrypted_args) = item
@@ -3487,8 +3695,48 @@ fn validate_response_item_optional_fields(
     Ok(())
 }
 
+fn resolve_streamed_reasoning_item_id(
+    event: &Value,
+    active_reasoning_item_id: &Option<String>,
+    current_item_delta_id: &mut Option<String>,
+) -> Result<Option<String>, ProviderError> {
+    if let Some(event_item_id) = event
+        .get("item_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(active_id) = active_reasoning_item_id.as_deref() {
+            if active_id != event_item_id {
+                return Err(ProviderError::UpstreamProtocol(
+                    "reasoning delta item_id does not match active reasoning item id".to_string(),
+                ));
+            }
+        }
+        if let Some(prev_id) = current_item_delta_id.as_deref() {
+            if prev_id != event_item_id {
+                return Err(ProviderError::UpstreamProtocol(
+                    "reasoning delta item_id changed before reasoning item completed".to_string(),
+                ));
+            }
+        }
+        *current_item_delta_id = Some(event_item_id.to_string());
+        return Ok(Some(event_item_id.to_string()));
+    }
+    Ok(active_reasoning_item_id
+        .clone()
+        .or_else(|| current_item_delta_id.clone()))
+}
+
+#[cfg(test)]
 pub fn split_instructions_and_input(
     messages: &[Message],
+) -> Result<(String, Vec<Value>), ProviderError> {
+    split_instructions_and_input_for_model(messages, None)
+}
+
+pub fn split_instructions_and_input_for_model(
+    messages: &[Message],
+    target_model: Option<&str>,
 ) -> Result<(String, Vec<Value>), ProviderError> {
     let mut instructions: Vec<String> = Vec::new();
     let mut input_messages: Vec<&Message> = Vec::new();
@@ -3513,17 +3761,28 @@ pub fn split_instructions_and_input(
 
     Ok((
         instructions.join("\n\n"),
-        messages_to_response_items_refs(&input_messages)?,
+        messages_to_response_items_refs_for_model(&input_messages, target_model)?,
     ))
 }
 
 #[cfg(test)]
 pub fn messages_to_response_items(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
-    let refs: Vec<&Message> = messages.iter().collect();
-    messages_to_response_items_refs(&refs)
+    messages_to_response_items_for_model(messages, None)
 }
 
-fn messages_to_response_items_refs(messages: &[&Message]) -> Result<Vec<Value>, ProviderError> {
+#[cfg(test)]
+pub fn messages_to_response_items_for_model(
+    messages: &[Message],
+    target_model: Option<&str>,
+) -> Result<Vec<Value>, ProviderError> {
+    let refs: Vec<&Message> = messages.iter().collect();
+    messages_to_response_items_refs_for_model(&refs, target_model)
+}
+
+fn messages_to_response_items_refs_for_model(
+    messages: &[&Message],
+    target_model: Option<&str>,
+) -> Result<Vec<Value>, ProviderError> {
     let mut items: Vec<Value> = Vec::new();
 
     for message in messages {
@@ -3577,24 +3836,50 @@ fn messages_to_response_items_refs(messages: &[&Message]) -> Result<Vec<Value>, 
             continue;
         }
 
-        if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
-            if !message.content.is_empty() || message.structured_content.is_some() {
-                items.push(message_item(
-                    "assistant",
-                    &message.content,
-                    &[],
-                    message.structured_content.as_deref(),
-                ));
+        if message.role == MessageRole::Assistant {
+            let mut emitted_reasoning = false;
+            if let Some(reasoning_items) = message.reasoning_items.as_ref() {
+                for raw_item in reasoning_items {
+                    if let Some(normalized) =
+                        crate::reasoning_signature::normalize_reasoning_item_for_replay(
+                            raw_item,
+                            target_model,
+                        )
+                        .map_err(ProviderError::InvalidRequest)?
+                    {
+                        items.push(normalized);
+                        emitted_reasoning = true;
+                    }
+                }
             }
-            for tc in &message.tool_calls {
-                items.push(json!({
-                    "type": "function_call",
-                    "call_id": tc.id,
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }));
+
+            if !message.tool_calls.is_empty() {
+                if !message.content.is_empty() || message.structured_content.is_some() {
+                    items.push(message_item(
+                        "assistant",
+                        &message.content,
+                        &[],
+                        message.structured_content.as_deref(),
+                    ));
+                }
+                for tc in &message.tool_calls {
+                    items.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }));
+                }
+                continue;
             }
-            continue;
+
+            if emitted_reasoning
+                && message.content.is_empty()
+                && message.images.is_empty()
+                && message.structured_content.is_none()
+            {
+                continue;
+            }
         }
 
         let role = match message.role {
@@ -3918,6 +4203,7 @@ fn finalize_responses_request_with_reasoning_controls(
         use_responses_lite: lite,
         conversation_input,
         account_id: resolved.snapshot.key.account_id.clone(),
+        client_version: resolved.snapshot.key.client_version.clone(),
         comp_hash: resolved.model.comp_hash.clone(),
     })
 }
@@ -5513,6 +5799,7 @@ mod tests {
                 use_responses_lite: false,
                 conversation_input: Vec::new(),
                 account_id: TEST_ACCOUNT_ID.to_string(),
+                client_version: pinned_codex_compatibility_version().to_string(),
                 comp_hash: None,
             })
             .unwrap_err()
@@ -5581,6 +5868,7 @@ mod tests {
                 use_responses_lite: false,
                 conversation_input: Vec::new(),
                 account_id: TEST_ACCOUNT_ID.to_string(),
+                client_version: pinned_codex_compatibility_version().to_string(),
                 comp_hash: None,
             },
             extra_headers: HashMap::new(),
@@ -5999,6 +6287,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6009,6 +6298,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6195,6 +6485,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6205,6 +6496,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6271,6 +6563,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6281,6 +6574,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6331,6 +6625,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6341,6 +6636,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6419,6 +6715,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6429,6 +6726,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6479,6 +6777,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: None,
         }];
@@ -6531,6 +6830,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: None,
         }];
@@ -6582,6 +6882,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6592,6 +6893,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6639,24 +6941,24 @@ mod tests {
 
     #[test]
     fn test_codex_cli_headers_include_official_originator_and_pinned_user_agent() {
-        let headers = codex_cli_headers();
+        let headers = codex_cli_headers(pinned_codex_compatibility_version()).unwrap();
 
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         let user_agent = headers.get("User-Agent").unwrap();
-        assert!(user_agent.starts_with("codex_cli_rs/0.153.3 ("));
-        assert!(user_agent.ends_with(") codex-as-api/0.8.3"));
+        assert!(user_agent.starts_with("codex_cli_rs/0.164.0 ("));
+        assert!(user_agent.ends_with(&format!(") codex-as-api/{}", env!("CARGO_PKG_VERSION"))));
     }
 
     #[test]
     fn test_codex_cli_version_parser_rejects_invalid_version() {
         assert!(normalize_codex_cli_version("not-a-version").is_none());
-        assert!(normalize_codex_cli_version(" 0.153.3").is_none());
-        assert!(normalize_codex_cli_version("0.153.3 ").is_none());
+        assert!(normalize_codex_cli_version(" 0.164.0").is_none());
+        assert!(normalize_codex_cli_version("0.164.0 ").is_none());
     }
 
     #[test]
     fn test_codex_cli_version_defaults_to_pinned_upstream_contract() {
-        assert_eq!(pinned_codex_compatibility_version(), "0.153.3");
+        assert_eq!(pinned_codex_compatibility_version(), "0.164.0");
     }
 
     #[test]
@@ -6669,6 +6971,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6679,6 +6982,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             },
@@ -6752,6 +7056,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                reasoning_items: None,
                 images: vec![],
                 structured_content: None,
             };
@@ -7937,6 +8242,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             name: Some("my_tool".to_string()),
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: None,
         };
@@ -8122,6 +8428,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: Some(vec![json!({
                 "type": "input_text",
@@ -8190,6 +8497,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: Some(vec![
                 json!({
@@ -8219,6 +8527,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: Some(vec![json!({
                 "type": "input_text",
@@ -8243,6 +8552,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: Some(vec![json!({
                 "type": "input_text",
@@ -8259,6 +8569,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: Some(vec![json!({
                 "type": "output_text",
@@ -8358,5 +8669,427 @@ mod tests {
             2
         );
         assert_eq!(compacted.len(), 22);
+    }
+
+    #[test]
+    fn messages_to_response_items_replays_matching_reasoning_items_and_filters_mismatched_models() {
+        let mut assistant = Message::new(
+            MessageRole::Assistant,
+            String::new(),
+            vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "lookup".to_string(),
+                arguments: "{\"q\":\"weather\"}".to_string(),
+            }],
+            None,
+            None,
+        )
+        .unwrap();
+        assistant.reasoning_items = Some(vec![
+            json!({
+                "v": 1,
+                "model": "gpt-6-luna",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_match",
+                    "summary": [{"type": "summary_text", "text": "Need tool"}],
+                    "encrypted_content": "enc_match"
+                }
+            }),
+            json!({
+                "v": 1,
+                "model": "gpt-5.4",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_mismatch",
+                    "summary": [],
+                    "encrypted_content": "enc_mismatch"
+                }
+            }),
+        ]);
+
+        let items =
+            messages_to_response_items_for_model(&[assistant], Some("gpt-6.1-sol")).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_match",
+                    "summary": [{"type": "summary_text", "text": "Need tool"}],
+                    "encrypted_content": "enc_match"
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"weather\"}"
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn thinking_only_assistant_turn_with_replayed_reasoning_omits_fabricated_empty_message() {
+        let mut thinking_only =
+            Message::new(MessageRole::Assistant, String::new(), vec![], None, None).unwrap();
+        thinking_only.reasoning_items = Some(vec![json!({
+            "v": 1,
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Thought only"}],
+                "encrypted_content": "enc_1"
+            }
+        })]);
+
+        let items =
+            messages_to_response_items_for_model(&[thinking_only], Some("gpt-5.6-sol")).unwrap();
+        assert_eq!(
+            items,
+            vec![json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Thought only"}],
+                "encrypted_content": "enc_1"
+            })]
+        );
+    }
+
+    #[test]
+    fn validate_response_event_rejects_empty_or_non_string_reasoning_ids() {
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "reasoning", "id": ""}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {"type": "reasoning", "id": "", "summary": [], "encrypted_content": "enc"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {"type": "reasoning", "id": 42, "summary": [], "encrypted_content": "enc"}
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "step",
+                "summary_index": 0,
+                "item_id": ""
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "step",
+                "summary_index": 0,
+                "item_id": 42
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "raw",
+                "content_index": 0,
+                "item_id": ""
+            }),
+            json!({
+                "type": "response.reasoning_summary_part.added",
+                "summary_index": 0,
+                "item_id": ""
+            }),
+        ] {
+            assert!(
+                matches!(
+                    validate_response_event(&event),
+                    Err(ProviderError::UpstreamProtocol(_))
+                ),
+                "expected UpstreamProtocol for {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_and_nonstream_emit_reasoning_item_and_synthesize_unstreamed_summary_before_item() {
+        use std::io::{Read, Write};
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-reasoning-item-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "header.e30.signature",
+                    "refresh_token": "refresh-token",
+                    "id_token": "header.e30.signature",
+                    "account_id": TEST_ACCOUNT_ID
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let sse_events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_done_only",
+                    "summary": [{"type": "summary_text", "text": "Unstreamed summary"}],
+                    "encrypted_content": "enc_done_only"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_done_only_2",
+                    "summary": [{"type": "summary_text", "text": "Second unstreamed summary"}],
+                    "encrypted_content": "enc_done_only_2"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello"}]
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-reasoning-1",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15
+                    }
+                }
+            }),
+        ];
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_events_clone = sse_events.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request).unwrap();
+                let body = sse_events_clone
+                    .iter()
+                    .map(|event| format!("data: {}\n\n", serde_json::to_string(event).unwrap()))
+                    .collect::<String>();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            format!("http://{address}"),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let make_prepared = || PreparedChatStream {
+            request: FinalizedResponsesRequest {
+                payload: json!({"model": "gpt-5.6-sol"}),
+                use_responses_lite: false,
+                conversation_input: Vec::new(),
+                account_id: TEST_ACCOUNT_ID.to_string(),
+                client_version: pinned_codex_compatibility_version().to_string(),
+                comp_hash: None,
+            },
+            extra_headers: HashMap::new(),
+            cancellation: None,
+        };
+
+        let mut streamed = Vec::new();
+        provider
+            .stream_prepared_chat(make_prepared(), |event| {
+                streamed.push(event);
+                Ok(())
+            })
+            .unwrap();
+
+        let types: Vec<_> = streamed
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "reasoning_delta",
+                "reasoning_item",
+                "reasoning_section_break",
+                "reasoning_delta",
+                "reasoning_item",
+                "content",
+                "finish"
+            ]
+        );
+        assert_eq!(
+            streamed[0],
+            json!({
+                "type": "reasoning_delta",
+                "text": "Unstreamed summary",
+                "item_id": "rs_done_only"
+            })
+        );
+        assert_eq!(
+            streamed[1],
+            json!({
+                "type": "reasoning_item",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_done_only",
+                    "summary": [{"type": "summary_text", "text": "Unstreamed summary"}],
+                    "encrypted_content": "enc_done_only"
+                },
+                "model": "gpt-5.6-sol"
+            })
+        );
+        assert_eq!(
+            streamed[2],
+            json!({
+                "type": "reasoning_section_break",
+                "item_id": "rs_done_only_2"
+            })
+        );
+        assert_eq!(
+            streamed[3],
+            json!({
+                "type": "reasoning_delta",
+                "text": "Second unstreamed summary",
+                "item_id": "rs_done_only_2"
+            })
+        );
+
+        let response = provider.chat_prepared(make_prepared()).unwrap();
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Unstreamed summarySecond unstreamed summary")
+        );
+        assert_eq!(
+            response.reasoning_items,
+            Some(vec![
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_done_only",
+                    "summary": [{"type": "summary_text", "text": "Unstreamed summary"}],
+                    "encrypted_content": "enc_done_only"
+                }),
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_done_only_2",
+                    "summary": [{"type": "summary_text", "text": "Second unstreamed summary"}],
+                    "encrypted_content": "enc_done_only_2"
+                }),
+            ])
+        );
+
+        server.join().unwrap();
+        std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[test]
+    fn provider_model_catalog_uses_dynamic_version_resolver_and_fails_closed_when_unavailable() {
+        use std::io::{Read, Write};
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-dynamic-version-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "header.e30.signature",
+                    "refresh_token": "refresh-token",
+                    "id_token": "header.e30.signature",
+                    "account_id": TEST_ACCOUNT_ID
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cold_fail_resolver = crate::codex_version::CodexVersionResolver::new_for_test(
+            crate::codex_version::CODEX_NPM_LATEST_URL.to_string(),
+            crate::codex_version::CODEX_VERSION_CACHE_TTL,
+            std::time::Duration::from_secs(1),
+            || {
+                Err(crate::codex_version::CodexVersionError::Unavailable(
+                    "mock npm registry offline".to_string(),
+                ))
+            },
+        );
+        let failing_provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            "http://127.0.0.1:1".to_string(),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .unwrap()
+        .with_version_resolver(cold_fail_resolver);
+        assert!(matches!(
+            failing_provider.model_catalog_snapshot(),
+            Err(ProviderError::CatalogUnavailable(message)) if message.contains("mock npm registry offline")
+        ));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let model_row = live_model_row_for_test("gpt-6-sol", false, true);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read_len = stream.read(&mut request).unwrap();
+            let req_text = String::from_utf8_lossy(&request[..read_len]).to_string();
+            let body = serde_json::to_string(&json!({"models": [model_row]})).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            req_text
+        });
+
+        let dynamic_resolver = crate::codex_version::CodexVersionResolver::new_for_test(
+            crate::codex_version::CODEX_NPM_LATEST_URL.to_string(),
+            crate::codex_version::CODEX_VERSION_CACHE_TTL,
+            std::time::Duration::from_secs(1),
+            || Ok(br#"{"name":"@openai/codex","version":"0.165.0"}"#.to_vec()),
+        );
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            format!("http://{address}"),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap()
+        .with_version_resolver(dynamic_resolver);
+
+        let snapshot = provider.model_catalog_snapshot().unwrap();
+        assert_eq!(snapshot.key.client_version, "0.165.0");
+        let req_text = server.join().unwrap();
+        assert!(req_text.starts_with("GET /models?client_version=0.165.0 HTTP/1.1\r\n"));
+        assert!(req_text
+            .to_ascii_lowercase()
+            .contains("user-agent: codex_cli_rs/0.165.0 ("));
+        assert!(req_text.contains(&format!(") codex-as-api/{}\r\n", env!("CARGO_PKG_VERSION"))));
+
+        std::fs::remove_file(auth_path).unwrap();
     }
 }

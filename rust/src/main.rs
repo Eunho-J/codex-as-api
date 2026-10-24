@@ -1,12 +1,14 @@
 mod anthropic_adapter;
 mod auth;
 mod codex_config;
+mod codex_version;
 mod messages;
 mod model_capabilities;
 mod model_catalog;
 mod o200k_tokenizer;
 mod protocol;
 mod provider;
+mod reasoning_signature;
 mod server;
 mod strict_json;
 
@@ -65,7 +67,7 @@ fn reject_deprecated_environment(name: &str) -> Result<(), String> {
     match std::env::var_os(name) {
         None => Ok(()),
         Some(_) => Err(format!(
-            "{name} is no longer supported; the Codex compatibility version is pinned by config/codex-upstream-contract.json"
+            "{name} is no longer supported; the Codex compatibility version is resolved dynamically from the npm registry"
         )),
     }
 }
@@ -119,7 +121,21 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_u16, optional_env};
+    use super::{env_u16, optional_env, reject_deprecated_environment};
+
+    #[test]
+    fn deprecated_codex_cli_version_environment_is_rejected_with_dynamic_registry_message() {
+        let name = format!("CODEX_AS_API_TEST_DEPRECATED_{}", uuid::Uuid::new_v4());
+        std::env::set_var(&name, "0.164.0");
+        let result = reject_deprecated_environment(&name);
+        std::env::remove_var(&name);
+        assert_eq!(
+            result,
+            Err(format!(
+                "{name} is no longer supported; the Codex compatibility version is resolved dynamically from the npm registry"
+            ))
+        );
+    }
 
     #[test]
     fn explicit_empty_environment_values_are_rejected() {

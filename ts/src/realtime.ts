@@ -13,7 +13,9 @@ import {
 import {
   CHATGPT_OAUTH_DEFAULT_BASE_URL,
   codexCliHeadersForVersion,
-  resolveCodexCliVersion,
+  defaultCodexVersionResolver,
+  resolveLatestCodexVersion,
+  type CodexVersionProvider,
 } from "./provider.js";
 
 /** Default model used for ChatGPT Live (realtime) voice calls. */
@@ -52,6 +54,7 @@ export interface CreateRealtimeCallOptions {
   sessionId?: string;
   threadId?: string;
   fetchImpl?: typeof fetch;
+  versionResolver?: CodexVersionProvider;
 }
 
 export interface RealtimeCallResult {
@@ -171,11 +174,15 @@ export function buildRealtimeSessionPayload(
   };
 }
 
-async function realtimeAuthHeaders(authPath?: string | null): Promise<RealtimeAuthContext> {
+async function realtimeAuthHeaders(
+  authPath?: string | null,
+  versionResolver: CodexVersionProvider = defaultCodexVersionResolver,
+): Promise<RealtimeAuthContext> {
   const token = await tokenForRequest(authPath);
+  const version = await resolveLatestCodexVersion(versionResolver);
   const headers: Record<string, string> = {
-    ...codexCliHeadersForVersion(),
-    version: resolveCodexCliVersion(),
+    ...codexCliHeadersForVersion(version),
+    version,
     Authorization: `Bearer ${token.access_token}`,
     "ChatGPT-Account-Id": token.account_id,
     "Content-Type": "application/json",
@@ -207,7 +214,7 @@ export async function createRealtimeCall(
 ): Promise<RealtimeCallResult> {
   const sdp = requireSdp(options.sdp);
   const session = buildRealtimeSessionPayload(options.session);
-  const auth = await realtimeAuthHeaders(options.authPath);
+  const auth = await realtimeAuthHeaders(options.authPath, options.versionResolver);
   const baseUrl = resolveRealtimeBaseUrl(options.baseUrl);
   const sessionId = options.sessionId ?? randomUUID();
   const threadId = options.threadId ?? sessionId;
@@ -249,6 +256,7 @@ export interface SidebandRelayOptions {
   callId: string;
   authPath?: string | null;
   sidebandBaseUrl?: string;
+  versionResolver?: CodexVersionProvider;
 }
 
 /**
@@ -269,7 +277,7 @@ export async function relayRealtimeSideband(
   }
   let auth: RealtimeAuthContext;
   try {
-    auth = await realtimeAuthHeaders(options.authPath);
+    auth = await realtimeAuthHeaders(options.authPath, options.versionResolver);
   } catch {
     closeClient(client, 4501, "realtime auth unavailable");
     return;
@@ -365,7 +373,11 @@ function openUpstream(
 
 export function attachRealtimeSideband(
   server: Server,
-  options: { authPath?: string | null; sidebandBaseUrl?: string } = {},
+  options: {
+    authPath?: string | null;
+    sidebandBaseUrl?: string;
+    versionResolver?: CodexVersionProvider;
+  } = {},
 ): void {
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
@@ -377,6 +389,7 @@ export function attachRealtimeSideband(
         callId,
         authPath: options.authPath,
         sidebandBaseUrl: options.sidebandBaseUrl,
+        versionResolver: options.versionResolver,
       });
     });
   });

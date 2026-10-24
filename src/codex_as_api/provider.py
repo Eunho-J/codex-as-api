@@ -32,6 +32,20 @@ from .auth import (
     token_for_request,
     validate_auth_environment,
 )
+from .codex_version import (
+    CODEX_CLI_ORIGINATOR as CODEX_CLI_ORIGINATOR,
+)
+from .codex_version import (
+    CODEX_NPM_PACKAGE_NAME,
+    ChatGPTOAuthCodexVersionInvalidError,
+    CodexVersionProvider,
+    CodexVersionResolver,
+    default_codex_version_resolver,
+    validate_codex_version,
+)
+from .codex_version import (
+    codex_cli_headers_for_version as _codex_version_headers_for_version,
+)
 from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
 from .model_capabilities import (
     DEFAULT_MODEL_CATALOG_TIMEOUT_SECONDS,
@@ -58,12 +72,12 @@ from .protocol import (
     reasoning_parts_from_response_items,
     response_failure_message,
 )
+from .reasoning_signature import extract_reasoning_item_for_model
 from .strict_json import strict_json_loads
 
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CHATGPT_OAUTH_DEFAULT_TIMEOUT = 300.0
 REMOTE_COMPACTION_MARKER = "[Remote Responses compacted history]"
-CODEX_CLI_ORIGINATOR = "codex_cli_rs"
 CODEX_CLI_VERSION_ENV = "CODEX_AS_API_CODEX_CLI_VERSION"
 KNOWN_REASONING_MODES = frozenset({"standard", "pro"})
 KNOWN_REASONING_CONTEXTS = frozenset({"auto", "current_turn", "all_turns"})
@@ -241,30 +255,44 @@ class _TransportHeaders(dict[str, str]):
         self.catalog_key = catalog_key
 
 
-def resolve_codex_cli_version() -> str:
+def validate_codex_cli_version_environment() -> None:
     raw = os.getenv(CODEX_CLI_VERSION_ENV)
     if raw is not None:
         raise ValueError(
-            f"{CODEX_CLI_VERSION_ENV} is not supported; the private wire version is pinned to "
-            f"{CODEX_COMPATIBILITY_VERSION}"
+            f"{CODEX_CLI_VERSION_ENV} is not supported; Codex CLI wire version is resolved dynamically "
+            f"from npm {CODEX_NPM_PACKAGE_NAME}"
         )
-    return CODEX_COMPATIBILITY_VERSION
 
 
-def codex_cli_headers_for_version(version: str | None) -> dict[str, str]:
-    if version is not None and version != CODEX_COMPATIBILITY_VERSION:
-        raise ValueError(f"Codex compatibility version is pinned to {CODEX_COMPATIBILITY_VERSION}")
-    normalized = CODEX_COMPATIBILITY_VERSION
-    return {
-        "originator": CODEX_CLI_ORIGINATOR,
-        "User-Agent": _sanitize_header_value(
-            f"{CODEX_CLI_ORIGINATOR}/{normalized} ({_codex_os_info()}) codex-as-api/{__version__}"
-        ),
-    }
+def resolve_codex_cli_version(
+    resolver: CodexVersionResolver | CodexVersionProvider | None = None,
+) -> str:
+    validate_codex_cli_version_environment()
+    target = default_codex_version_resolver if resolver is None else resolver
+    if isinstance(target, CodexVersionResolver):
+        return target.resolve()
+    if callable(target):
+        return validate_codex_version(target(), source="Codex version resolver")
+    raise ChatGPTOAuthCodexVersionInvalidError(
+        "version_resolver must be a CodexVersionResolver or callable returning a version string"
+    )
 
 
-def _codex_cli_headers() -> dict[str, str]:
-    return codex_cli_headers_for_version(PINNED_CODEX_CLI_VERSION)
+def codex_cli_headers_for_version(
+    version: str | None,
+    *,
+    codex_as_api_version: str | None = None,
+) -> dict[str, str]:
+    effective_package_version = __version__ if codex_as_api_version is None else codex_as_api_version
+    return _codex_version_headers_for_version(
+        cast(str, version),
+        codex_as_api_version=effective_package_version,
+    )
+
+
+def _codex_cli_headers(client_version: str | None = None) -> dict[str, str]:
+    resolved = resolve_codex_cli_version() if client_version is None else client_version
+    return codex_cli_headers_for_version(resolved)
 
 
 def _codex_os_info() -> str:
@@ -282,7 +310,7 @@ def _sanitize_header_value(value: str) -> str:
     return "".join(ch if " " <= ch <= "~" else "_" for ch in value)
 
 
-PINNED_CODEX_CLI_VERSION = resolve_codex_cli_version()
+PINNED_CODEX_CLI_VERSION = CODEX_COMPATIBILITY_VERSION
 
 
 def _normalize_base_url(value: str) -> str:
@@ -395,10 +423,17 @@ class ChatGPTOAuthProvider:
         timeout: float | None = None,
         catalog_timeout: float | None = None,
         catalog_ttl: float | None = None,
+        version_resolver: CodexVersionResolver | CodexVersionProvider | None = None,
     ) -> None:
-        resolve_codex_cli_version()
+        validate_codex_cli_version_environment()
         validate_auth_environment()
         validate_model_capability_environment()
+        if version_resolver is not None and not (
+            isinstance(version_resolver, CodexVersionResolver) or callable(version_resolver)
+        ):
+            raise ChatGPTOAuthCodexVersionInvalidError(
+                "version_resolver must be a CodexVersionResolver or callable returning a version string"
+            )
         if model is not None and (not isinstance(model, str) or not model.strip() or model != model.strip()):
             raise ValueError("model must be a non-empty string when provided")
         if auth_json_path is not None and not auth_json_path.strip():
@@ -420,10 +455,16 @@ class ChatGPTOAuthProvider:
             else _validate_positive_finite(catalog_ttl, "catalog_ttl")
         )
         self.api_key = None
+        self._version_resolver: CodexVersionResolver | CodexVersionProvider = (
+            default_codex_version_resolver if version_resolver is None else version_resolver
+        )
         self._active_response_lock = threading.Lock()
         self._active_responses: set[Any] = set()
         self._model_catalog_cache = ModelCatalogCache()
         self._response_chains = _ResponseChainStore()
+
+    def _resolve_client_version(self) -> str:
+        return resolve_codex_cli_version(self._version_resolver)
 
     def cancel_current_requests(self) -> None:
         with self._active_response_lock:
@@ -441,7 +482,7 @@ class ChatGPTOAuthProvider:
 
     def get_model_catalog(self) -> ModelCatalogSnapshot:
         token = token_for_request(self.auth_json_path)
-        version = PINNED_CODEX_CLI_VERSION
+        version = self._resolve_client_version()
         key = (token.account_id, self.base_url, version)
         return self._model_catalog_cache.get(
             key,
@@ -476,7 +517,7 @@ class ChatGPTOAuthProvider:
         query = urllib.parse.urlencode({"client_version": version})
         url = f"{self.base_url}/models?{query}"
         for attempt in range(2):
-            headers = self._headers(token)
+            headers = self._headers(token, client_version=version)
             headers["Accept"] = "application/json"
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
             request = urllib.request.Request(url, headers=headers, method="GET")
@@ -610,6 +651,7 @@ class ChatGPTOAuthProvider:
     ) -> AssistantResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_items: list[dict[str, Any]] = []
         tool_calls: list[ToolCall] = []
         finish_reason: str | None = None
         saw_finish = False
@@ -650,6 +692,19 @@ class ChatGPTOAuthProvider:
                 content_parts.append(_required_event_text(event, "content"))
             elif event.get("type") in {"reasoning_delta", "reasoning_raw_delta"}:
                 reasoning_parts.append(_required_event_text(event, str(event["type"])))
+            elif event.get("type") == "reasoning_item":
+                raw_item = event.get("item")
+                if not isinstance(raw_item, dict) or raw_item.get("type") != "reasoning":
+                    raise ChatGPTOAuthProtocolError("reasoning_item event requires a reasoning item object")
+                _validate_response_output_item(raw_item)
+                item_entry = deepcopy(raw_item)
+                event_model = event.get("model")
+                if event_model is not None:
+                    if not isinstance(event_model, str) or not event_model:
+                        raise ChatGPTOAuthProtocolError("reasoning_item event model must be a non-empty string")
+                    reasoning_items.append({"model": event_model, "item": item_entry})
+                else:
+                    reasoning_items.append({"item": item_entry})
             elif event.get("type") == "tool_call":
                 event_id = event.get("id")
                 event_name = event.get("name")
@@ -689,6 +744,7 @@ class ChatGPTOAuthProvider:
             reasoning_content="".join(reasoning_parts) or None,
             response_id=response_id,
             raw={"events": _compact_raw_events(raw_events)},
+            reasoning_items=tuple(reasoning_items),
         )
 
     def chat_stream(
@@ -767,6 +823,11 @@ class ChatGPTOAuthProvider:
         final_output: list[dict[str, Any]] = []
         reasoning_summary_parts: list[str] = []
         reasoning_raw_parts: list[str] = []
+        current_item_summary_parts: list[str] = []
+        current_item_raw_parts: list[str] = []
+        active_reasoning_item_id: str | None = None
+        saw_current_item_summary_delta = False
+        saw_current_item_raw_delta = False
         streamed_text_parts: list[str] = []
         yielded_web_search_ids: set[str] = set()
         yielded_tool_call_ids: set[str] = set()
@@ -777,7 +838,23 @@ class ChatGPTOAuthProvider:
         for event in stream:
             _validate_response_event(event)
             typ = event.get("type")
-            if typ == "response.output_text.delta":
+            if typ == "response.output_item.added":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    if (
+                        saw_current_item_summary_delta
+                        or saw_current_item_raw_delta
+                        or active_reasoning_item_id is not None
+                    ):
+                        raise ChatGPTOAuthProtocolError(
+                            "response.output_item.added reasoning item started before prior reasoning item completed"
+                        )
+                    added_id = item.get("id")
+                    if added_id == "":
+                        raise ChatGPTOAuthProtocolError("reasoning id must be a non-empty string or null")
+                    if isinstance(added_id, str) and added_id:
+                        active_reasoning_item_id = added_id
+            elif typ == "response.output_text.delta":
                 delta = event.get("delta")
                 if not isinstance(delta, str):
                     raise ChatGPTOAuthProtocolError("response.output_text.delta requires a string delta")
@@ -792,6 +869,56 @@ class ChatGPTOAuthProvider:
                 if item.get("type") == "image_generation_call":
                     raise ChatGPTOAuthProtocolError("image_generation_call cannot be represented by normal chat")
                 final_output.append(item)
+                if item.get("type") == "reasoning":
+                    raw_item_id = item.get("id")
+                    if raw_item_id == "":
+                        raise ChatGPTOAuthProtocolError("reasoning id must be a non-empty string or null")
+                    item_id = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else None
+                    if active_reasoning_item_id is not None and item_id != active_reasoning_item_id:
+                        raise ChatGPTOAuthProtocolError(
+                            "response.output_item.done reasoning id does not match streamed reasoning deltas"
+                        )
+                    item_summary, item_raw = reasoning_parts_from_response_items([item])
+                    if saw_current_item_summary_delta:
+                        if "".join(current_item_summary_parts) != item_summary:
+                            raise ChatGPTOAuthProtocolError(
+                                "response.completed reasoning summary does not match streamed reasoning summary"
+                            )
+                    elif item_summary:
+                        saw_reasoning_summary_delta = True
+                        reasoning_summary_parts.append(item_summary)
+                        fallback_summary_event: dict[str, Any] = {
+                            "type": "reasoning_delta",
+                            "text": item_summary,
+                        }
+                        if item_id is not None:
+                            fallback_summary_event["item_id"] = item_id
+                        yield fallback_summary_event
+                    if saw_current_item_raw_delta:
+                        if "".join(current_item_raw_parts) != item_raw:
+                            raise ChatGPTOAuthProtocolError(
+                                "response.completed reasoning content does not match streamed reasoning content"
+                            )
+                    elif item_raw:
+                        saw_reasoning_raw_delta = True
+                        reasoning_raw_parts.append(item_raw)
+                        fallback_raw_event: dict[str, Any] = {
+                            "type": "reasoning_raw_delta",
+                            "text": item_raw,
+                        }
+                        if item_id is not None:
+                            fallback_raw_event["item_id"] = item_id
+                        yield fallback_raw_event
+                    yield {
+                        "type": "reasoning_item",
+                        "item": _normalize_completed_reasoning_item(item),
+                        "model": prepared.capability.slug,
+                    }
+                    active_reasoning_item_id = None
+                    current_item_summary_parts = []
+                    current_item_raw_parts = []
+                    saw_current_item_summary_delta = False
+                    saw_current_item_raw_delta = False
                 tool = _tool_call_from_response_item(item)
                 if tool is not None:
                     if tool.id in yielded_tool_call_ids:
@@ -806,34 +933,76 @@ class ChatGPTOAuthProvider:
                     yielded_web_search_ids.add(str(web_search["id"]))
                     yield web_search
             elif typ == "response.reasoning_summary_part.added":
-                yield {
+                event_item_id = event.get("item_id")
+                if isinstance(event_item_id, str) and event_item_id:
+                    if active_reasoning_item_id is not None and event_item_id != active_reasoning_item_id:
+                        raise ChatGPTOAuthProtocolError(
+                            "reasoning summary part item_id does not match active reasoning item"
+                        )
+                    active_reasoning_item_id = event_item_id
+                section_event: dict[str, Any] = {
                     "type": "reasoning_section_break",
                     "summary_index": event.get("summary_index"),
                 }
+                if active_reasoning_item_id is not None:
+                    section_event["item_id"] = active_reasoning_item_id
+                yield section_event
             elif typ == "response.reasoning_summary_text.delta":
                 delta = event.get("delta")
                 if not isinstance(delta, str):
                     raise ChatGPTOAuthProtocolError("response.reasoning_summary_text.delta requires a string delta")
+                event_item_id = event.get("item_id")
+                if isinstance(event_item_id, str) and event_item_id:
+                    if active_reasoning_item_id is not None and event_item_id != active_reasoning_item_id:
+                        raise ChatGPTOAuthProtocolError(
+                            "reasoning summary delta item_id does not match active reasoning item"
+                        )
+                    active_reasoning_item_id = event_item_id
                 saw_reasoning_summary_delta = True
+                saw_current_item_summary_delta = True
                 reasoning_summary_parts.append(delta)
+                current_item_summary_parts.append(delta)
                 if delta:
-                    yield {
+                    delta_event: dict[str, Any] = {
                         "type": "reasoning_delta",
                         "text": delta,
                         "summary_index": event.get("summary_index"),
                     }
+                    if active_reasoning_item_id is not None:
+                        delta_event["item_id"] = active_reasoning_item_id
+                    yield delta_event
+            elif typ == "response.reasoning_summary_text.done":
+                event_item_id = event.get("item_id")
+                if isinstance(event_item_id, str) and event_item_id:
+                    if active_reasoning_item_id is not None and event_item_id != active_reasoning_item_id:
+                        raise ChatGPTOAuthProtocolError(
+                            "reasoning summary done item_id does not match active reasoning item"
+                        )
+                    active_reasoning_item_id = event_item_id
             elif typ == "response.reasoning_text.delta":
                 delta = event.get("delta")
                 if not isinstance(delta, str):
                     raise ChatGPTOAuthProtocolError("response.reasoning_text.delta requires a string delta")
+                event_item_id = event.get("item_id")
+                if isinstance(event_item_id, str) and event_item_id:
+                    if active_reasoning_item_id is not None and event_item_id != active_reasoning_item_id:
+                        raise ChatGPTOAuthProtocolError(
+                            "reasoning text delta item_id does not match active reasoning item"
+                        )
+                    active_reasoning_item_id = event_item_id
                 saw_reasoning_raw_delta = True
+                saw_current_item_raw_delta = True
                 reasoning_raw_parts.append(delta)
+                current_item_raw_parts.append(delta)
                 if delta:
-                    yield {
+                    raw_delta_event: dict[str, Any] = {
                         "type": "reasoning_raw_delta",
                         "text": delta,
                         "content_index": event.get("content_index"),
                     }
+                    if active_reasoning_item_id is not None:
+                        raw_delta_event["item_id"] = active_reasoning_item_id
+                    yield raw_delta_event
             elif typ == "response.failed":
                 raise ChatGPTOAuthUpstreamError(
                     502,
@@ -872,23 +1041,23 @@ class ChatGPTOAuthProvider:
                 if not saw_text_delta and final_text:
                     saw_text_delta = True
                     yield {"type": "content", "text": final_text}
+                if saw_current_item_raw_delta and not saw_current_item_summary_delta:
+                    raise ChatGPTOAuthProtocolError(
+                        "response.completed reasoning content does not match streamed reasoning content"
+                    )
+                if saw_current_item_summary_delta or active_reasoning_item_id is not None:
+                    raise ChatGPTOAuthProtocolError(
+                        "response.completed reasoning summary does not match streamed reasoning summary"
+                    )
                 completed_summary, completed_raw = reasoning_parts_from_response_items(display_output)
-                if saw_reasoning_summary_delta:
-                    if "".join(reasoning_summary_parts) != completed_summary:
-                        raise ChatGPTOAuthProtocolError(
-                            "response.completed reasoning summary does not match streamed reasoning summary"
-                        )
-                elif completed_summary:
-                    reasoning_summary_parts.append(completed_summary)
-                    yield {"type": "reasoning_delta", "text": completed_summary}
-                if saw_reasoning_raw_delta:
-                    if "".join(reasoning_raw_parts) != completed_raw:
-                        raise ChatGPTOAuthProtocolError(
-                            "response.completed reasoning content does not match streamed reasoning content"
-                        )
-                elif completed_raw:
-                    reasoning_raw_parts.append(completed_raw)
-                    yield {"type": "reasoning_raw_delta", "text": completed_raw}
+                if saw_reasoning_summary_delta and "".join(reasoning_summary_parts) != completed_summary:
+                    raise ChatGPTOAuthProtocolError(
+                        "response.completed reasoning summary does not match streamed reasoning summary"
+                    )
+                if saw_reasoning_raw_delta and "".join(reasoning_raw_parts) != completed_raw:
+                    raise ChatGPTOAuthProtocolError(
+                        "response.completed reasoning content does not match streamed reasoning content"
+                    )
                 self._response_chains.commit(
                     response["id"],
                     replay_input,
@@ -1083,7 +1252,10 @@ class ChatGPTOAuthProvider:
     ) -> str:
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
-        base_instructions, input_items = _split_instructions_and_input(messages)
+        base_instructions, input_items = _split_instructions_and_input(
+            messages,
+            backend_model=request_model,
+        )
         if previous_response_id is not None:
             validated_previous_response_id = _validate_previous_response_id(previous_response_id)
             input_items = (
@@ -1234,6 +1406,11 @@ class ChatGPTOAuthProvider:
         instructions, input_items = _split_instructions_and_input(messages)
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
+        if any(msg.reasoning_items for msg in messages):
+            instructions, input_items = _split_instructions_and_input(
+                messages,
+                backend_model=request_model,
+            )
         if previous_response_id is not None:
             validated_previous_response_id = _validate_previous_response_id(previous_response_id)
             input_items = (
@@ -1308,10 +1485,16 @@ class ChatGPTOAuthProvider:
             capability=capability,
         )
 
-    def _headers(self, token: Any | None = None) -> dict[str, str]:
+    def _headers(
+        self,
+        token: Any | None = None,
+        *,
+        client_version: str | None = None,
+    ) -> dict[str, str]:
         token = token or token_for_request(self.auth_json_path)
+        resolved_version = self._resolve_client_version() if client_version is None else client_version
         headers = {
-            **_codex_cli_headers(),
+            **codex_cli_headers_for_version(resolved_version),
             "Authorization": f"Bearer {token.access_token}",
             "ChatGPT-Account-Id": token.account_id,
             "Content-Type": "application/json",
@@ -1367,10 +1550,13 @@ class ChatGPTOAuthProvider:
         catalog_key: CatalogKey | None = None,
     ) -> Iterator[dict[str, Any]]:
         token_values: tuple[str | None, ...] = (None,)
+        resolved_client_version = (
+            catalog_key[2] if catalog_key is not None else self._resolve_client_version()
+        )
         for attempt in range(2):
             token = token_for_request(self.auth_json_path)
             _require_catalog_account(token.account_id, catalog_key)
-            headers = self._headers(token)
+            headers = self._headers(token, client_version=resolved_client_version)
             headers["Accept"] = "text/event-stream"
             if extra_headers:
                 headers.update(extra_headers)
@@ -1456,10 +1642,13 @@ class ChatGPTOAuthProvider:
         catalog_key: CatalogKey | None = None,
     ) -> bytes:
         token_values: tuple[str | None, ...] = (None,)
+        resolved_client_version = (
+            catalog_key[2] if catalog_key is not None else self._resolve_client_version()
+        )
         for attempt in range(2):
             token = token_for_request(self.auth_json_path)
             _require_catalog_account(token.account_id, catalog_key)
-            headers = self._headers(token)
+            headers = self._headers(token, client_version=resolved_client_version)
             if extra_headers:
                 headers.update(extra_headers)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
@@ -1740,7 +1929,13 @@ def _validate_response_event(event: object) -> dict[str, Any]:
     elif event_type == "response.reasoning_summary_text.delta":
         delta = event.get("delta")
         summary_index = event.get("summary_index")
-        if not isinstance(delta, str) or not isinstance(summary_index, int) or isinstance(summary_index, bool):
+        item_id = event.get("item_id")
+        if (
+            not isinstance(delta, str)
+            or not isinstance(summary_index, int)
+            or isinstance(summary_index, bool)
+            or (item_id is not None and not isinstance(item_id, str))
+        ):
             raise ChatGPTOAuthProtocolError(
                 "response.reasoning_summary_text.delta requires a string delta and integer summary_index"
             )
@@ -1760,13 +1955,24 @@ def _validate_response_event(event: object) -> dict[str, Any]:
     elif event_type == "response.reasoning_text.delta":
         delta = event.get("delta")
         content_index = event.get("content_index")
-        if not isinstance(delta, str) or not isinstance(content_index, int) or isinstance(content_index, bool):
+        item_id = event.get("item_id")
+        if (
+            not isinstance(delta, str)
+            or not isinstance(content_index, int)
+            or isinstance(content_index, bool)
+            or (item_id is not None and not isinstance(item_id, str))
+        ):
             raise ChatGPTOAuthProtocolError(
                 "response.reasoning_text.delta requires a string delta and integer content_index"
             )
     elif event_type == "response.reasoning_summary_part.added":
         value = event.get("summary_index")
-        if not isinstance(value, int) or isinstance(value, bool):
+        item_id = event.get("item_id")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or (item_id is not None and not isinstance(item_id, str))
+        ):
             raise ChatGPTOAuthProtocolError("response.reasoning_summary_part.added requires integer summary_index")
     elif event_type == "response.completed":
         _validated_completed_response(event)
@@ -1940,7 +2146,59 @@ def _validated_completed_response(event: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
-def _split_instructions_and_input(messages: Sequence[Message]) -> tuple[str, list[dict[str, Any]]]:
+def _normalize_completed_reasoning_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {"type": "reasoning"}
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item_id:
+        normalized["id"] = item_id
+    encrypted_content = item.get("encrypted_content")
+    if isinstance(encrypted_content, str) and encrypted_content:
+        normalized["encrypted_content"] = encrypted_content
+    raw_summary = item.get("summary")
+    summary_parts: list[dict[str, str]] = []
+    if isinstance(raw_summary, list):
+        for part in raw_summary:
+            if isinstance(part, dict) and part.get("type") == "summary_text" and isinstance(part.get("text"), str):
+                summary_parts.append({"type": "summary_text", "text": part["text"]})
+    normalized["summary"] = summary_parts
+    raw_content = item.get("content")
+    if isinstance(raw_content, list) and raw_content:
+        content_parts: list[dict[str, str]] = []
+        for part in raw_content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") in {"text", "reasoning_text"}
+                and isinstance(part.get("text"), str)
+            ):
+                content_parts.append({"type": str(part["type"]), "text": part["text"]})
+        if content_parts:
+            normalized["content"] = content_parts
+    return normalized
+
+
+def _reasoning_items_for_message(
+    message: Message,
+    *,
+    backend_model: str | None = None,
+) -> list[dict[str, Any]]:
+    if not message.reasoning_items:
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in message.reasoning_items:
+        try:
+            extracted = extract_reasoning_item_for_model(entry, backend_model=backend_model)
+        except ValueError as exc:
+            raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
+        if extracted is not None:
+            out.append(extracted)
+    return out
+
+
+def _split_instructions_and_input(
+    messages: Sequence[Message],
+    *,
+    backend_model: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_messages: list[Message] = []
     for msg in messages:
@@ -1952,10 +2210,17 @@ def _split_instructions_and_input(messages: Sequence[Message]) -> tuple[str, lis
             instructions.append(msg.content)
         else:
             input_messages.append(msg)
-    return "\n\n".join(instructions), _messages_to_response_items(input_messages)
+    return "\n\n".join(instructions), _messages_to_response_items(
+        input_messages,
+        backend_model=backend_model,
+    )
 
 
-def _messages_to_response_items(messages: Sequence[Message]) -> list[dict[str, Any]]:
+def _messages_to_response_items(
+    messages: Sequence[Message],
+    *,
+    backend_model: str | None = None,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for message in messages:
         if message.role is MessageRole.SYSTEM and message.content.startswith(REMOTE_COMPACTION_MARKER):
@@ -1977,28 +2242,42 @@ def _messages_to_response_items(messages: Sequence[Message]) -> list[dict[str, A
                 }
             )
             continue
-        if message.role is MessageRole.ASSISTANT and message.tool_calls:
-            if message.content or message.content_parts is not None:
+        if message.role is MessageRole.ASSISTANT:
+            matched_reasoning_items = _reasoning_items_for_message(
+                message,
+                backend_model=backend_model,
+            )
+            items.extend(matched_reasoning_items)
+            if message.tool_calls:
+                if message.content or message.content_parts is not None:
+                    items.append(
+                        _message_item(
+                            "assistant",
+                            message.content,
+                            content_parts=message.content_parts,
+                        )
+                    )
+                for tool_call in message.tool_calls:
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        }
+                    )
+                continue
+            if message.content or message.content_parts is not None or message.images or not matched_reasoning_items:
                 items.append(
                     _message_item(
                         "assistant",
                         message.content,
-                        content_parts=message.content_parts,
+                        message.images,
+                        message.content_parts,
                     )
                 )
-            for tool_call in message.tool_calls:
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments,
-                    }
-                )
             continue
-        if message.role is MessageRole.ASSISTANT:
-            role = "assistant"
-        elif message.role is MessageRole.DEVELOPER:
+        if message.role is MessageRole.DEVELOPER:
             role = "developer"
         elif message.role is MessageRole.USER:
             role = "user"

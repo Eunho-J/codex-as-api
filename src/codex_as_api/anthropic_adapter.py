@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Iterator, Mapping
+from typing import Any, cast
 
 from .auth import ChatGPTOAuthProtocolError
 from .messages import AssistantResponse, Message, MessageRole, ToolCall, ToolSchema, Usage
+from .protocol import reasoning_parts_from_response_items
+from .reasoning_signature import (
+    decode_reasoning_signature,
+    encode_reasoning_signature,
+    extract_reasoning_item_for_model,
+    is_recognized_reasoning_signature,
+)
 from .strict_json import as_js_safe_integer, strict_json_loads
 
 # ---------------------------------------------------------------------------
@@ -27,6 +34,7 @@ def anthropic_request_to_internal(
     output_format: dict[str, Any] | None = None,
     output_config: object = None,
     metadata: object = None,
+    backend_model: str | None = None,
 ) -> tuple[
     list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
 ]:
@@ -36,6 +44,10 @@ def anthropic_request_to_internal(
     """
     if not isinstance(model, str) or not model:
         raise ValueError("model must be a non-empty string")
+    if backend_model is not None and (
+        not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
+    ):
+        raise ValueError("backend_model must be a non-empty string when provided")
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages must be a non-empty array")
     validate_anthropic_metadata(metadata)
@@ -61,7 +73,7 @@ def anthropic_request_to_internal(
         if role == "user":
             _convert_user_message(content, internal_messages)
         elif role == "assistant":
-            _convert_assistant_message(content, internal_messages)
+            _convert_assistant_message(content, internal_messages, backend_model=backend_model)
         else:
             raise ValueError(f"messages[{index}].role must be user or assistant")
 
@@ -219,7 +231,12 @@ def _convert_user_message(content: object, out: list[Message]) -> None:
         )
 
 
-def _convert_assistant_message(content: object, out: list[Message]) -> None:
+def _convert_assistant_message(
+    content: object,
+    out: list[Message],
+    *,
+    backend_model: str | None = None,
+) -> None:
     if isinstance(content, str):
         out.append(Message(role=MessageRole.ASSISTANT, content=content))
         return
@@ -231,6 +248,7 @@ def _convert_assistant_message(content: object, out: list[Message]) -> None:
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     tool_call_ids: set[str] = set()
+    reasoning_items: list[dict[str, Any]] = []
     for index, block in enumerate(content):
         if not isinstance(block, dict):
             raise ValueError(f"Anthropic assistant content block {index} must be an object")
@@ -288,6 +306,17 @@ def _convert_assistant_message(content: object, out: list[Message]) -> None:
             signature = block.get("signature")
             if signature is not None and not isinstance(signature, str):
                 raise ValueError(f"Anthropic assistant thinking block {index} signature must be a string")
+            if is_recognized_reasoning_signature(signature):
+                envelope = decode_reasoning_signature(cast(str, signature))
+                if backend_model is None:
+                    reasoning_items.append(envelope)
+                else:
+                    extracted = extract_reasoning_item_for_model(
+                        envelope,
+                        backend_model=backend_model,
+                    )
+                    if extracted is not None:
+                        reasoning_items.append(extracted)
         elif block_type == "redacted_thinking":
             _reject_unknown_fields(
                 block,
@@ -311,6 +340,7 @@ def _convert_assistant_message(content: object, out: list[Message]) -> None:
             role=MessageRole.ASSISTANT,
             content="".join(text_parts),
             tool_calls=tuple(tool_calls) if tool_calls else (),
+            reasoning_items=tuple(reasoning_items),
         )
     )
 
@@ -698,21 +728,80 @@ def _parse_anthropic_tool_arguments(value: object) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _extract_response_reasoning_entry(
+    entry: Mapping[str, Any],
+    *,
+    default_model: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    if not isinstance(entry, Mapping):
+        raise ChatGPTOAuthProtocolError("response reasoning_items entry must be an object")
+    raw_item = entry.get("item") if "item" in entry else entry
+    if not isinstance(raw_item, dict) or raw_item.get("type") != "reasoning":
+        raise ChatGPTOAuthProtocolError("response reasoning_items entry requires a reasoning item object")
+    raw_model = entry.get("model")
+    if raw_model is not None and (not isinstance(raw_model, str) or not raw_model or raw_model != raw_model.strip()):
+        raise ChatGPTOAuthProtocolError("response reasoning_items model must be a non-empty string")
+    return raw_item, raw_model or default_model
+
+
 def internal_response_to_anthropic(
     response: AssistantResponse,
     model: str,
     request_id: str,
     *,
     thinking_display: str = "summarized",
+    backend_model: str | None = None,
+    thinking_disabled: bool = False,
 ) -> dict[str, Any]:
     if thinking_display not in {"summarized", "omitted"}:
         raise ValueError("thinking_display must be 'summarized' or 'omitted'")
+    if backend_model is not None and (
+        not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
+    ):
+        raise ValueError("backend_model must be a non-empty string when provided")
     content: list[dict[str, Any]] = []
 
     _reject_unrepresentable_response_events(response.raw)
 
-    if thinking_display == "summarized" and response.reasoning_content:
-        content.append({"type": "thinking", "thinking": response.reasoning_content})
+    visible_reasoning_parts: list[str] = []
+    if not thinking_disabled:
+        if response.reasoning_items:
+            for entry in response.reasoning_items:
+                raw_item, item_model = _extract_response_reasoning_entry(
+                    entry,
+                    default_model=backend_model or model,
+                )
+                try:
+                    item_summary, item_raw = reasoning_parts_from_response_items([raw_item])
+                except ValueError as exc:
+                    raise ChatGPTOAuthProtocolError(str(exc)) from exc
+                item_text = item_summary + item_raw
+                if item_text:
+                    visible_reasoning_parts.append(item_text)
+                encrypted_content = raw_item.get("encrypted_content")
+                if encrypted_content is not None and not isinstance(encrypted_content, str):
+                    raise ChatGPTOAuthProtocolError("reasoning item encrypted_content must be a string or null")
+                if isinstance(encrypted_content, str) and encrypted_content:
+                    if not isinstance(item_model, str) or not item_model:
+                        raise ChatGPTOAuthProtocolError("encrypted reasoning item requires a backend model")
+                    try:
+                        signature = encode_reasoning_signature(item_model, raw_item)
+                    except ValueError as exc:
+                        raise ChatGPTOAuthProtocolError(str(exc)) from exc
+                    if signature is None:
+                        raise ChatGPTOAuthProtocolError("encrypted reasoning item failed to produce a signature")
+                    thinking_text = "" if thinking_display == "omitted" else item_text
+                    content.append(
+                        {
+                            "type": "thinking",
+                            "thinking": thinking_text,
+                            "signature": signature,
+                        }
+                    )
+                elif thinking_display == "summarized" and item_text:
+                    content.append({"type": "thinking", "thinking": item_text})
+        elif thinking_display == "summarized" and response.reasoning_content:
+            content.append({"type": "thinking", "thinking": response.reasoning_content})
 
     if response.content:
         content.append({"type": "text", "text": response.content, "citations": None})
@@ -749,8 +838,9 @@ def internal_response_to_anthropic(
         "stop_sequence": None,
         "usage": usage_dict,
     }
-    if thinking_display == "summarized" and response.reasoning_content:
-        result["codex_reasoning"] = response.reasoning_content
+    effective_reasoning = response.reasoning_content or "".join(visible_reasoning_parts)
+    if not thinking_disabled and thinking_display == "summarized" and effective_reasoning:
+        result["codex_reasoning"] = effective_reasoning
     return result
 
 
@@ -863,12 +953,23 @@ def anthropic_stream_adapter(
     request_id: str,
     *,
     thinking_display: str = "summarized",
+    backend_model: str | None = None,
+    thinking_disabled: bool = False,
 ) -> Iterator[str]:
     """Convert provider chat_stream events into Anthropic SSE strings."""
     if thinking_display not in {"summarized", "omitted"}:
         raise ValueError("thinking_display must be 'summarized' or 'omitted'")
+    if backend_model is not None and (
+        not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
+    ):
+        raise ValueError("backend_model must be a non-empty string when provided")
     yield _message_start_sse(model, request_id)
-    yield from _render_anthropic_stream_events(event_stream, thinking_display=thinking_display)
+    yield from _render_anthropic_stream_events(
+        event_stream,
+        thinking_display=thinking_display,
+        default_signature_model=backend_model or model,
+        thinking_disabled=thinking_disabled,
+    )
 
 
 def _message_start_sse(model: str, request_id: str) -> str:
@@ -1020,10 +1121,29 @@ def _render_anthropic_stream_events(
     events: Iterator[dict[str, Any]],
     *,
     thinking_display: str = "summarized",
+    default_signature_model: str | None = None,
+    thinking_disabled: bool = False,
 ) -> Iterator[str]:
     block_index = 0
     current_block: str | None = None
     has_tool_calls = False
+    pending_thinking_item_id: str | None = None
+    pending_thinking_parts: list[str] = []
+    saw_pending_thinking_delta = False
+    flushed_unsigned_thinking = False
+
+    def _flush_open_unsigned_thinking() -> None:
+        nonlocal pending_thinking_item_id, pending_thinking_parts, saw_pending_thinking_delta, flushed_unsigned_thinking
+        if not saw_pending_thinking_delta:
+            return
+        if pending_thinking_item_id is not None:
+            raise ChatGPTOAuthProtocolError(
+                "provider reasoning delta with item_id ended without matching reasoning_item"
+            )
+        flushed_unsigned_thinking = True
+        saw_pending_thinking_delta = False
+        pending_thinking_parts = []
+        pending_thinking_item_id = None
 
     for event in events:
         if not isinstance(event, dict):
@@ -1034,7 +1154,31 @@ def _render_anthropic_stream_events(
             text = event.get("text")
             if not isinstance(text, str):
                 raise ChatGPTOAuthProtocolError(f"provider {typ} event requires string text")
-            if thinking_display == "omitted":
+            event_item_id = event.get("item_id")
+            if event_item_id is not None and (not isinstance(event_item_id, str) or not event_item_id):
+                raise ChatGPTOAuthProtocolError(f"provider {typ} event item_id must be a non-empty string")
+            if saw_pending_thinking_delta:
+                if (pending_thinking_item_id is None) != (event_item_id is None):
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning delta item_id presence is inconsistent within one thinking block"
+                    )
+                if (
+                    pending_thinking_item_id is not None
+                    and event_item_id is not None
+                    and event_item_id != pending_thinking_item_id
+                ):
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning delta item_id changed before reasoning_item completion"
+                    )
+            else:
+                if pending_thinking_item_id is not None and event_item_id != pending_thinking_item_id:
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning delta item_id does not match open thinking section"
+                    )
+                pending_thinking_item_id = event_item_id
+            saw_pending_thinking_delta = True
+            pending_thinking_parts.append(text)
+            if thinking_disabled or thinking_display == "omitted":
                 continue
             if current_block != "thinking":
                 if current_block is not None:
@@ -1065,7 +1209,178 @@ def _render_anthropic_stream_events(
                 },
             )
 
+        elif typ == "reasoning_section_break":
+            event_item_id = event.get("item_id")
+            if event_item_id is not None and (not isinstance(event_item_id, str) or not event_item_id):
+                raise ChatGPTOAuthProtocolError(
+                    "provider reasoning_section_break event item_id must be a non-empty string"
+                )
+            if saw_pending_thinking_delta:
+                if (pending_thinking_item_id is None) != (event_item_id is None):
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning_section_break item_id presence is inconsistent with open thinking block"
+                    )
+                if (
+                    pending_thinking_item_id is not None
+                    and event_item_id is not None
+                    and event_item_id != pending_thinking_item_id
+                ):
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning_section_break item_id does not match open thinking block"
+                    )
+            elif event_item_id is not None:
+                if pending_thinking_item_id is not None and event_item_id != pending_thinking_item_id:
+                    raise ChatGPTOAuthProtocolError(
+                        "provider reasoning_section_break item_id changed before reasoning_item completion"
+                    )
+                pending_thinking_item_id = event_item_id
+            continue
+
+        elif typ == "reasoning_item":
+            if flushed_unsigned_thinking:
+                raise ChatGPTOAuthProtocolError("provider reasoning_item arrived after thinking block was closed")
+            raw_item = event.get("item")
+            if not isinstance(raw_item, dict) or raw_item.get("type") != "reasoning":
+                raise ChatGPTOAuthProtocolError("provider reasoning_item event requires a reasoning item object")
+            item_id = raw_item.get("id")
+            if item_id is not None and (not isinstance(item_id, str) or not item_id):
+                raise ChatGPTOAuthProtocolError("provider reasoning_item id must be a non-empty string when provided")
+            encrypted_content = raw_item.get("encrypted_content")
+            if encrypted_content is not None and not isinstance(encrypted_content, str):
+                raise ChatGPTOAuthProtocolError("provider reasoning_item encrypted_content must be a string or null")
+            try:
+                item_summary, item_raw = reasoning_parts_from_response_items([raw_item])
+            except ValueError as exc:
+                raise ChatGPTOAuthProtocolError(str(exc)) from exc
+            expected_text = item_summary + item_raw
+            if pending_thinking_item_id is not None and item_id != pending_thinking_item_id:
+                raise ChatGPTOAuthProtocolError("provider reasoning_item id does not match streamed reasoning deltas")
+            if saw_pending_thinking_delta and "".join(pending_thinking_parts) != expected_text:
+                raise ChatGPTOAuthProtocolError(
+                    "provider reasoning_item summary does not match streamed reasoning deltas"
+                )
+            event_model = event.get("model")
+            if event_model is not None and (
+                not isinstance(event_model, str) or not event_model or event_model != event_model.strip()
+            ):
+                raise ChatGPTOAuthProtocolError("provider reasoning_item model must be a non-empty string")
+            sig_model = event_model or default_signature_model
+
+            if not thinking_disabled:
+                if isinstance(encrypted_content, str) and encrypted_content:
+                    if not isinstance(sig_model, str) or not sig_model:
+                        raise ChatGPTOAuthProtocolError("provider reasoning_item requires a model for signature")
+                    try:
+                        signature = encode_reasoning_signature(sig_model, raw_item)
+                    except ValueError as exc:
+                        raise ChatGPTOAuthProtocolError(str(exc)) from exc
+                    if signature is None:
+                        raise ChatGPTOAuthProtocolError("provider reasoning_item failed to produce a signature")
+                    if thinking_display == "omitted":
+                        if current_block is not None:
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                            block_index += 1
+                            current_block = None
+                        yield _sse(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            },
+                        )
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "signature_delta", "signature": signature},
+                            },
+                        )
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                    else:
+                        if current_block != "thinking":
+                            if current_block is not None:
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                                block_index += 1
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {"type": "thinking", "thinking": ""},
+                                },
+                            )
+                            current_block = "thinking"
+                        if not saw_pending_thinking_delta and expected_text:
+                            yield _sse(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {"type": "thinking_delta", "thinking": expected_text},
+                                },
+                            )
+                            yield _sse(
+                                "codex_reasoning_delta",
+                                {
+                                    "type": "codex_reasoning_delta",
+                                    "delta": expected_text,
+                                },
+                            )
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "signature_delta", "signature": signature},
+                            },
+                        )
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                        current_block = None
+                elif thinking_display == "summarized":
+                    if not saw_pending_thinking_delta and expected_text:
+                        if current_block != "thinking":
+                            if current_block is not None:
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                                block_index += 1
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {"type": "thinking", "thinking": ""},
+                                },
+                            )
+                            current_block = "thinking"
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "thinking_delta", "thinking": expected_text},
+                            },
+                        )
+                        yield _sse(
+                            "codex_reasoning_delta",
+                            {
+                                "type": "codex_reasoning_delta",
+                                "delta": expected_text,
+                            },
+                        )
+                    if current_block == "thinking":
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                        block_index += 1
+                        current_block = None
+
+            saw_pending_thinking_delta = False
+            pending_thinking_parts = []
+            pending_thinking_item_id = None
+
         elif typ == "content":
+            _flush_open_unsigned_thinking()
             text = event.get("text")
             if not isinstance(text, str):
                 raise ChatGPTOAuthProtocolError("provider content event requires string text")
@@ -1092,6 +1407,7 @@ def _render_anthropic_stream_events(
             )
 
         elif typ == "tool_call":
+            _flush_open_unsigned_thinking()
             has_tool_calls = True
             if current_block is not None:
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
@@ -1135,10 +1451,8 @@ def _render_anthropic_stream_events(
                 "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
             )
 
-        elif typ == "reasoning_section_break":
-            continue
-
         elif typ == "finish":
+            _flush_open_unsigned_thinking()
             if current_block is not None:
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
                 current_block = None

@@ -25,6 +25,7 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
     pub reasoning_content: Option<String>,
+    pub reasoning_items: Option<Vec<serde_json::Value>>,
     pub images: Vec<String>,
     /// Normalized Responses API content blocks when the caller supplied
     /// structured Chat Completions content. `None` retains the legacy
@@ -68,6 +69,7 @@ impl Message {
             tool_call_id,
             name,
             reasoning_content: None,
+            reasoning_items: None,
             images: vec![],
             structured_content: None,
         })
@@ -96,6 +98,7 @@ pub struct AssistantResponse {
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
     pub reasoning_content: Option<String>,
+    pub reasoning_items: Option<Vec<serde_json::Value>>,
     pub raw: Option<serde_json::Value>,
     pub response_id: Option<String>,
 }

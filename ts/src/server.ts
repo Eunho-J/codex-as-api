@@ -23,9 +23,10 @@ import type {
 import { MessageRole } from "./messages.js";
 import {
   ChatGPTOAuthProvider,
+  type CodexVersionProvider,
   requireSubagentHeaderValue,
-  resolveCodexCliVersion,
   usageFromResponse,
+  validateCollectedReasoningItemEvent,
   validateImageContentItems,
   wireReasoningEffort,
 } from "./provider.js";
@@ -51,6 +52,7 @@ import {
   type RealtimeCallSessionPayload,
 } from "./realtime.js";
 import { decodeUtf8Strict, parseJsonStrict } from "./utf8-json.js";
+import { isReasoningModelCompatible } from "./reasoning-signature.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 18080;
@@ -482,6 +484,7 @@ export interface CreateAppOptions {
   codexConfig?: CodexConfig;
   model?: string;
   authPath?: string;
+  versionResolver?: CodexVersionProvider;
 }
 
 export function resolveServerHost(raw = process.env.CODEX_AS_API_HOST): string {
@@ -516,7 +519,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   resolveCodexMetadataEnabled();
   if (process.env.CODEX_AS_API_CODEX_CLI_VERSION !== undefined) {
     throw new ChatGPTOAuthInvalidRequestError(
-      `CODEX_AS_API_CODEX_CLI_VERSION is not supported; the wire contract is pinned to ${resolveCodexCliVersion()}`,
+      "CODEX_AS_API_CODEX_CLI_VERSION is not supported; Codex CLI version is resolved automatically from npm @openai/codex/latest",
     );
   }
   if (process.env.CODEX_HOME !== undefined && process.env.CODEX_HOME.trim().length === 0) {
@@ -550,7 +553,13 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     new ChatGPTOAuthProvider({
       model,
       authJsonPath: authPath,
+      versionResolver: opts?.versionResolver,
     });
+  const realtimeVersionResolver: CodexVersionProvider | undefined =
+    opts?.versionResolver ??
+    (typeof provider.resolveClientVersion === "function"
+      ? () => provider.resolveClientVersion()
+      : undefined);
   const prepareAnthropicRouteModel = async (
     requestedModel: string | undefined,
   ) => {
@@ -702,6 +711,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         sdp: body.sdp as string,
         session: session as RealtimeCallSessionPayload | undefined,
         authPath,
+        versionResolver: realtimeVersionResolver,
       });
       res
         .status(201)
@@ -1000,6 +1010,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
               await writeWithBackpressure(res, `data: ${JSON.stringify(chunk)}\n\n`, downstream.controller.signal);
             } else if (typ === "reasoning_section_break") {
               continue;
+            } else if (typ === "reasoning_item") {
+              validateCollectedReasoningItemEvent(event);
+              continue;
             } else if (typ === "web_search_call") {
               throw new ChatGPTOAuthProtocolError(
                 "provider web_search_call event cannot be represented by /v1/chat/completions",
@@ -1253,6 +1266,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         ? await prepareAnthropicRouteModel(requestedModel)
         : await provider.prepareModel(requestedModel ?? model);
       const requestModel = preparedModel.slug;
+      filterMessagesReasoningItemsForModel(messages, requestModel);
       const requestedReasoningEffort = mergeAnthropicReasoningEffort(
         body.reasoning_effort,
         reasoningEffort,
@@ -1335,6 +1349,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         outputConfig: body.output_config,
       });
       const preparedModel = await prepareAnthropicRouteModel(requestedModel);
+      filterMessagesReasoningItemsForModel(messages, preparedModel.slug);
       const inputTokens = estimateInputTokens(messages, tools);
       const contextWindow = getContextWindow(preparedModel.capability, codexConfig);
       res.json({
@@ -1434,6 +1449,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
 
       const preparedModel = await prepareAnthropicRouteModel(clientModel);
       const requestModel = preparedModel.slug;
+      filterMessagesReasoningItemsForModel(messages, requestModel);
       const requestedReasoningEffort = mergeAnthropicReasoningEffort(
         body.reasoning_effort,
         reasoningEffort,
@@ -1453,6 +1469,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         suppressReasoning: thinkingDisabled === true
           || resolvedReasoning?.effort === "none"
           || resolvedReasoning?.effort === "disabled",
+        backendModel: requestModel,
       };
       const chatOpts = {
         model: requestModel,
@@ -1533,6 +1550,27 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   });
 
   return app;
+}
+
+function filterMessagesReasoningItemsForModel(
+  messages: Message[],
+  targetModel: string,
+): void {
+  for (const msg of messages) {
+    if (msg.role !== MessageRole.ASSISTANT || !Array.isArray(msg.reasoning_items)) {
+      continue;
+    }
+    const filtered = msg.reasoning_items.filter(
+      (item) =>
+        item.model === undefined ||
+        isReasoningModelCompatible(item.model, targetModel),
+    );
+    if (filtered.length > 0) {
+      msg.reasoning_items = filtered;
+    } else {
+      delete msg.reasoning_items;
+    }
+  }
 }
 
 function compactReasoningEffort(

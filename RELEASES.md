@@ -1,5 +1,33 @@
 # Release Notes
 
+## v0.9.0
+
+### Encrypted reasoning continuity
+
+- Carry Codex reasoning items in a versioned proxy-specific `thinking.signature`
+  envelope and restore their opaque encrypted content on the following request.
+  The envelope is transport metadata, not a fabricated Anthropic signature.
+- Preserve one thinking block per reasoning item, including multiple summary
+  parts and encrypted-only items. Streaming signatures precede their block stops;
+  signed reasoning history stays out of ordinary assistant text.
+- Preserve reasoning across the verified GPT-6.1-Sol, GPT-6-Astra, GPT-6-Sol,
+  GPT-6-Luna and Daybreak Blue model combinations; authenticated replay passed
+  all 25 combinations. Daybreak availability remains account/authorization-gated.
+
+### Current client identity and experimental models
+
+- Resolve outbound Codex client identity from npm `@openai/codex`'s stable latest
+  version instead of a hardcoded source-reference version. Use a consistent
+  version for model-catalog lookup and request headers, with bounded lookup,
+  in-memory caching and last-successful-version retry behavior.
+- Explicitly include verified hidden models `gpt-6-chat-thinking`, `gpt-reserve`
+  and `codex-auto-review` in the effective catalog without choosing them as an
+  automatic default. Prefer current live capability metadata.
+- Document their experimental status: upstream support may end at any time;
+  users should report a discontinued model in an issue so it can be removed.
+  Basic authenticated conversation, function-call continuation and generated-code
+  execution checks passed for all three.
+
 ## v0.8.3
 
 ### Client-neutral Anthropic compatibility (all runtimes)

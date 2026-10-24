@@ -47,7 +47,9 @@ from .provider import (
     ChatGPTOAuthProvider,
     _usage_from_response,
     _validate_image_content_items,
+    _validate_response_output_item,
     resolve_model_reasoning_effort,
+    validate_codex_cli_version_environment,
 )
 from .strict_json import as_js_safe_integer, strict_json_loads
 
@@ -81,6 +83,7 @@ HOST = cast(str, _env_str("CODEX_AS_API_HOST", "127.0.0.1"))
 PORT = _env_int("CODEX_AS_API_PORT", 18080)
 validate_auth_environment()
 validate_model_capability_environment()
+validate_codex_cli_version_environment()
 CODEX_CONFIG = load_codex_config()
 MODEL = _env_str("CODEX_AS_API_MODEL", CODEX_CONFIG.model)
 AUTH_PATH = _env_str("CODEX_AS_API_AUTH_PATH", None)
@@ -462,7 +465,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="0.8.3",
+    version="0.9.0",
 )
 
 
@@ -780,6 +783,14 @@ def _validate_openai_provider_event(event: object) -> dict[str, Any]:
         _validated_openai_provider_usage(event.get("usage"))
     elif typ == "web_search_call":
         raise ChatGPTOAuthProtocolError("provider web_search_call event cannot be represented by /v1/chat/completions")
+    elif typ == "reasoning_item":
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            raise ChatGPTOAuthProtocolError("provider reasoning_item event requires a reasoning item object")
+        _validate_response_output_item(item)
+        event_model = event.get("model")
+        if event_model is not None and (not isinstance(event_model, str) or not event_model):
+            raise ChatGPTOAuthProtocolError("provider reasoning_item event model must be a non-empty string")
     elif typ != "reasoning_section_break":
         raise ChatGPTOAuthProtocolError(f"provider stream event type {typ!r} is unsupported")
     return event
@@ -2350,6 +2361,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             content=format_anthropic_error(status, _public_error_message(exc)),
         )
 
+    suppress_thinking_output = thinking_disabled or effective_reasoning_effort in {"none", "disabled"}
+
     if stream:
 
         def _stream() -> Iterator[str]:
@@ -2383,6 +2396,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                     model=client_model,
                     request_id=request_id,
                     thinking_display=thinking_display,
+                    backend_model=request_model,
+                    thinking_disabled=suppress_thinking_output,
                 )
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
@@ -2439,6 +2454,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             client_model,
             request_id,
             thinking_display=thinking_display,
+            backend_model=request_model,
+            thinking_disabled=suppress_thinking_output,
         )
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)

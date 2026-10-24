@@ -57,6 +57,8 @@ from codex_as_api.provider import (
     resolve_model_reasoning_effort,
 )
 
+_ORIGINAL_GET_MODEL_CATALOG = ChatGPTOAuthProvider.get_model_catalog
+
 
 @pytest.fixture(autouse=True)
 def _isolate_responses_lite_mode(monkeypatch, model_catalog_snapshot):
@@ -2186,23 +2188,23 @@ def test_output_item_collector_rejects_malformed_response_completed(monkeypatch)
 
 
 def test_codex_cli_headers_include_official_originator_and_versioned_user_agent():
-    headers = codex_cli_headers_for_version("0.153.3")
+    headers = codex_cli_headers_for_version("0.164.0")
 
     assert headers["originator"] == "codex_cli_rs"
-    assert headers["User-Agent"].startswith("codex_cli_rs/0.153.3 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.8.3")
+    assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.9.0")
 
 
 def test_codex_cli_headers_reject_unpinned_version():
     with pytest.raises(ValueError) as caught:
         codex_cli_headers_for_version("not-a-version")
-    assert "pinned" in str(caught.value)
+    assert "semantic version" in str(caught.value)
 
 
 def test_codex_cli_version_defaults_to_pinned_upstream_contract(monkeypatch):
     monkeypatch.delenv("CODEX_AS_API_CODEX_CLI_VERSION", raising=False)
 
-    assert resolve_codex_cli_version() == "0.153.3"
+    assert resolve_codex_cli_version() == "0.164.0"
 
 
 def test_packaged_upstream_contract_takes_precedence_over_source_checkout(
@@ -2929,8 +2931,8 @@ def test_provider_headers_include_codex_cli_headers(auth_json_factory):
     headers = provider._headers()  # noqa: SLF001 - regression test for backend request headers
 
     assert headers["originator"] == "codex_cli_rs"
-    assert headers["User-Agent"].startswith("codex_cli_rs/0.153.3 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.8.3")
+    assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.9.0")
     assert headers["Authorization"].startswith("Bearer ")
 
 
@@ -4288,3 +4290,395 @@ def test_upstream_protocol_diagnostics_do_not_reflect_unknown_values():
         with pytest.raises(ChatGPTOAuthError) as caught:
             invoke()
         assert secret not in str(caught.value)
+
+
+def test_chat_stream_and_chat_collect_reasoning_items_without_duplicating_fallback_deltas(
+    monkeypatch,
+):
+    provider = ChatGPTOAuthProvider()
+
+    def sse_events(_path, _payload, extra_headers=None):  # noqa: ANN001
+        del extra_headers
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "reasoning", "id": "rs_1", "summary": []},
+        }
+        yield {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "delta": "Streamed step.",
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "completed",
+                "encrypted_content": "enc_1",
+                "summary": [{"type": "summary_text", "text": "Streamed step."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [{"type": "summary_text", "text": "Fallback step."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Final answer"}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"id": "resp-reasoning-items", "usage": _provider_usage()},
+        }
+
+    monkeypatch.setattr(provider, "_post_sse", sse_events)
+
+    stream_events = list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    assert [event["type"] for event in stream_events] == [
+        "reasoning_delta",
+        "reasoning_item",
+        "reasoning_delta",
+        "reasoning_item",
+        "content",
+        "finish",
+    ]
+    assert stream_events[0] == {
+        "type": "reasoning_delta",
+        "text": "Streamed step.",
+        "summary_index": 0,
+        "item_id": "rs_1",
+    }
+    assert stream_events[1] == {
+        "type": "reasoning_item",
+        "model": "gpt-5.6-sol",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "enc_1",
+            "summary": [{"type": "summary_text", "text": "Streamed step."}],
+        },
+    }
+    assert stream_events[2] == {
+        "type": "reasoning_delta",
+        "text": "Fallback step.",
+        "item_id": "rs_2",
+    }
+    assert stream_events[3] == {
+        "type": "reasoning_item",
+        "model": "gpt-5.6-sol",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_2",
+            "encrypted_content": "enc_2",
+            "summary": [{"type": "summary_text", "text": "Fallback step."}],
+        },
+    }
+
+    response = provider.chat(_provider_messages(), model="gpt-5.6-sol")
+    assert response.content == "Final answer"
+    assert response.reasoning_content == "Streamed step.Fallback step."
+    assert response.reasoning_items == (
+        {
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_1",
+                "summary": [{"type": "summary_text", "text": "Streamed step."}],
+            },
+        },
+        {
+            "model": "gpt-5.6-sol",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_2",
+                "encrypted_content": "enc_2",
+                "summary": [{"type": "summary_text", "text": "Fallback step."}],
+            },
+        },
+    )
+
+
+def test_messages_to_response_items_and_responses_payload_replay_same_model_reasoning_items():
+    provider = ChatGPTOAuthProvider()
+    messages = [
+        Message(role=MessageRole.SYSTEM, content="You are helpful."),
+        Message(role=MessageRole.USER, content="Find the weather."),
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="Checking weather.",
+            reasoning_items=(
+                {
+                    "v": 1,
+                    "model": "gpt-5.6-sol",
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_match",
+                        "encrypted_content": "enc_match",
+                        "summary": [{"type": "summary_text", "text": "Need weather tool"}],
+                    },
+                },
+                {
+                    "v": 1,
+                    "model": "gpt-5.7-other",
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_mismatch",
+                        "encrypted_content": "enc_mismatch",
+                        "summary": [],
+                    },
+                },
+            ),
+            tool_calls=(ToolCall(id="call_1", name="weather", arguments='{"city":"Seoul"}'),),
+        ),
+        Message(
+            role=MessageRole.TOOL,
+            content='{"temp_c":18}',
+            tool_call_id="call_1",
+            name="weather",
+        ),
+        Message(role=MessageRole.USER, content="Summarize it."),
+    ]
+
+    payload = provider._responses_payload(  # noqa: SLF001
+        messages,
+        model="gpt-5.6-sol",
+        responses_lite=False,
+    )
+    assert payload["store"] is False
+    assert "previous_response_id" not in payload
+    assert [item["type"] for item in payload["input"]] == [
+        "message",
+        "reasoning",
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert payload["input"][1] == {
+        "type": "reasoning",
+        "id": "rs_match",
+        "encrypted_content": "enc_match",
+        "summary": [{"type": "summary_text", "text": "Need weather tool"}],
+    }
+    assert payload["input"][2] == {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Checking weather."}],
+    }
+    assert payload["input"][3] == {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "weather",
+        "arguments": '{"city":"Seoul"}',
+    }
+
+
+def test_provider_injects_dynamic_npm_version_across_catalog_responses_and_401_retry(
+    auth_json_factory,
+    model_catalog_document,
+    monkeypatch,
+):
+    from codex_as_api.codex_version import CodexVersionResolver
+
+    monkeypatch.setattr(ChatGPTOAuthProvider, "get_model_catalog", _ORIGINAL_GET_MODEL_CATALOG)
+    current_npm_version = "0.175.2"
+    resolver = CodexVersionResolver(
+        fetch=lambda _url, _timeout: json.dumps(
+            {"name": "@openai/codex", "version": current_npm_version}
+        ).encode("utf-8"),
+        ttl_seconds=3600.0,
+    )
+    auth_path = str(auth_json_factory())
+    provider = ChatGPTOAuthProvider(
+        auth_json_path=auth_path,
+        base_url="https://example.test/codex",
+        version_resolver=resolver,
+    )
+
+    observed_requests: list[tuple[str, dict[str, str]]] = []
+    attempt = 0
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001
+        nonlocal attempt, current_npm_version
+        del timeout
+        headers = {key.lower(): value for key, value in request.header_items()}
+        observed_requests.append((request.full_url, headers))
+        if "/models?" in request.full_url:
+            attempt += 1
+            if attempt == 1:
+                current_npm_version = "0.176.0"
+                resolver.reset()
+                raise _unread_unauthorized(_UnreadUnauthorizedBody())
+            body = json.dumps(model_catalog_document).encode("utf-8")
+            return _BufferedUpstreamResponse(body, {"ETag": '"etag-dyn"'})
+        raise AssertionError(f"unexpected URL {request.full_url}")
+
+    monkeypatch.setattr(provider_module, "_urlopen_no_redirect", fake_urlopen)
+    monkeypatch.setattr(provider_module, "refresh_after_unauthorized", lambda state: state)
+
+    snapshot = provider.get_model_catalog()
+    assert snapshot.key == ("acc-123", "https://example.test/codex", "0.175.2")
+    assert len(observed_requests) == 2
+    for full_url, headers in observed_requests:
+        assert full_url == "https://example.test/codex/models?client_version=0.175.2"
+        assert headers["user-agent"].startswith("codex_cli_rs/0.175.2 (")
+        assert headers["user-agent"].endswith(") codex-as-api/0.9.0")
+
+
+def test_provider_cold_version_resolver_failure_raises_typed_503(auth_json_factory, monkeypatch):
+    from codex_as_api.codex_version import (
+        ChatGPTOAuthCodexVersionUnavailableError,
+        CodexVersionResolver,
+    )
+
+    monkeypatch.setattr(ChatGPTOAuthProvider, "get_model_catalog", _ORIGINAL_GET_MODEL_CATALOG)
+
+    def failing_fetch(_url: str, _timeout: float) -> bytes:
+        raise OSError("unavailable")
+
+    resolver = CodexVersionResolver(
+        fetch=failing_fetch,
+        retry_backoff_seconds=0.1,
+    )
+    provider = ChatGPTOAuthProvider(
+        auth_json_path=str(auth_json_factory()),
+        base_url="https://example.test/codex",
+        version_resolver=resolver,
+    )
+
+    with pytest.raises(ChatGPTOAuthCodexVersionUnavailableError) as caught:
+        provider.get_model_catalog()
+    assert isinstance(caught.value, ChatGPTOAuthCatalogUnavailableError)
+
+
+def test_fallback_output_item_done_reasoning_does_not_duplicate_at_response_completed(
+    monkeypatch,
+):
+    provider = ChatGPTOAuthProvider()
+
+    def sse_events(_path, _payload, extra_headers=None, **_kwargs):  # noqa: ANN001
+        del extra_headers
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_done_1",
+                "encrypted_content": "enc_1",
+                "summary": [{"type": "summary_text", "text": "First step."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_done_2",
+                "encrypted_content": "enc_2",
+                "summary": [{"type": "summary_text", "text": "Second step."}],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Answer"}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-done-only",
+                "usage": _provider_usage(),
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_done_1",
+                        "encrypted_content": "enc_1",
+                        "summary": [{"type": "summary_text", "text": "First step."}],
+                    },
+                    {
+                        "type": "reasoning",
+                        "id": "rs_done_2",
+                        "encrypted_content": "enc_2",
+                        "summary": [{"type": "summary_text", "text": "Second step."}],
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(provider, "_post_sse", sse_events)
+
+    events = list(provider.chat_stream(_provider_messages(), model="gpt-5.6-sol"))
+    reasoning_deltas = [event["text"] for event in events if event["type"] == "reasoning_delta"]
+    assert reasoning_deltas == ["First step.", "Second step."]
+
+
+def test_responses_payload_replays_all_25_compatible_model_pairs(
+    monkeypatch,
+    model_catalog_document,
+):
+    from codex_as_api.model_capabilities import parse_model_catalog
+    from codex_as_api.reasoning_signature import REASONING_COMPATIBLE_MODELS
+
+    provider = ChatGPTOAuthProvider()
+    models = sorted(REASONING_COMPATIBLE_MODELS)
+    assert len(models) == 5
+
+    base_entry = deepcopy(model_catalog_document["models"][0])
+    base_entry["use_responses_lite"] = False
+    catalog_doc = deepcopy(model_catalog_document)
+    for idx, slug in enumerate(models, start=len(catalog_doc["models"])):
+        entry = deepcopy(base_entry)
+        entry["slug"] = slug
+        entry["display_name"] = slug
+        entry["priority"] = idx
+        catalog_doc["models"].append(entry)
+    snapshot = parse_model_catalog(
+        catalog_doc,
+        key=("test-account", "https://example.test/codex", "0.164.0"),
+        etag='"test-etag"',
+        fetched_at=1000.0,
+        expires_at=4600.0,
+    )
+    monkeypatch.setattr(provider, "get_model_catalog", lambda: snapshot)
+
+    for source_model in models:
+        for target_model in models:
+            messages = [
+                Message(role=MessageRole.USER, content="Question"),
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content="Answer",
+                    reasoning_items=(
+                        {
+                            "v": 1,
+                            "model": source_model,
+                            "item": {
+                                "type": "reasoning",
+                                "id": f"rs_{source_model}_{target_model}",
+                                "encrypted_content": "enc_payload",
+                                "summary": [{"type": "summary_text", "text": "summary"}],
+                            },
+                        },
+                    ),
+                ),
+                Message(role=MessageRole.USER, content="Follow-up"),
+            ]
+            payload = provider._responses_payload(messages, model=target_model)  # noqa: SLF001
+            assert payload["input"][1] == {
+                "type": "reasoning",
+                "id": f"rs_{source_model}_{target_model}",
+                "encrypted_content": "enc_payload",
+                "summary": [{"type": "summary_text", "text": "summary"}],
+            }
