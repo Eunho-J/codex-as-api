@@ -556,7 +556,8 @@ export class CodexVersionResolver {
         controller.abort(timeoutErr);
         reject(timeoutErr);
       }, this.timeoutMs);
-      timeoutHandle.unref?.();
+      // Keep the lookup deadline alive even if fetch has no active I/O handle.
+      // The finally block clears it as soon as the lookup settles.
     });
 
     const fetchAndParse = (async (): Promise<string> => {

@@ -1,5 +1,14 @@
 # Release Notes
 
+## v0.9.2
+
+### TypeScript version lookup deadline
+
+- Keep the Codex version lookup timeout alive until the lookup settles, including
+  fetch implementations without active I/O handles. Clear the timer on completion.
+- Fix Node 22 resolver timeout cancellation that blocked the v0.9.0 and v0.9.1
+  Release workflows. This release includes their reasoning and security updates.
+
 ## v0.9.1
 
 ### TypeScript dependency security updates
