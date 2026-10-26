@@ -1507,6 +1507,7 @@ export class ChatGPTOAuthProvider {
       const token = await tokenForRequest(this.authJsonPath);
       requireExpectedAccount(token, expectedAccountId);
       const headers = this.getHeaders(token, clientVersion);
+      Object.assign(headers, codexSessionHeaders(payload));
       if (isResponsesLitePayload(payload)) {
         headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
       }
@@ -1587,7 +1588,7 @@ export class ChatGPTOAuthProvider {
       requireExpectedAccount(token, expectedAccountId);
       const headers = this.getHeaders(token, clientVersion);
       headers.Accept = "text/event-stream";
-      Object.assign(headers, extraHeaders);
+      Object.assign(headers, codexSessionHeaders(payload), extraHeaders);
       if (isResponsesLitePayload(payload)) {
         headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE;
       }
@@ -2221,6 +2222,24 @@ function validateAddedReasoningParts(
       );
     }
   }
+}
+
+/**
+ * Session headers the official Codex CLI sends on every Responses request
+ * (codex-rs codex-api requests/headers.rs + endpoint/responses.rs). The ChatGPT
+ * Codex backend does not reuse its prompt cache from `prompt_cache_key` alone:
+ * measured 2026-10-27, an identical 7k-token prefix read 0 cached tokens on every
+ * request without these headers and 7,296 with them.
+ */
+export function codexSessionHeaders(payload: Record<string, unknown>): Record<string, string> {
+  const metadata = isRecordValue(payload.client_metadata) ? payload.client_metadata : undefined;
+  const nonEmpty = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim().length > 0 ? value : undefined;
+  const sessionId = nonEmpty(metadata?.session_id) ?? nonEmpty(payload.prompt_cache_key);
+  if (sessionId == null) return {};
+  const threadId = nonEmpty(metadata?.thread_id) ?? sessionId;
+  if (/[\r\n]/.test(sessionId) || /[\r\n]/.test(threadId)) return {};
+  return { "session-id": sessionId, "thread-id": threadId, "x-client-request-id": threadId };
 }
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {

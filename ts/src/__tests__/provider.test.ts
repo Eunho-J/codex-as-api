@@ -21,6 +21,7 @@ import {
   REMOTE_COMPACTION_MARKER,
   ChatGPTOAuthProvider,
   codexCliHeadersForVersion,
+  codexSessionHeaders,
   resolveCodexCliVersion,
 } from "../provider.js";
 import type { PreparedModel, StreamEvent } from "../provider.js";
@@ -3195,7 +3196,7 @@ describe("Codex CLI request headers", () => {
 
     assert.equal(headers.originator, "codex_cli_rs");
     assert.ok(headers["User-Agent"].startsWith("codex_cli_rs/0.164.0 ("));
-    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/0.9.2"));
+    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/0.9.3"));
 
     const dynamicHeaders = codexCliHeadersForVersion("1.2.3");
     assert.equal(dynamicHeaders.originator, "codex_cli_rs");
@@ -4755,6 +4756,59 @@ describe("encrypted reasoning items in provider stream, collector, and input rep
         provider.chat(providerMessages(), { model: "gpt-5.6-sol" }),
         ChatGPTOAuthProtocolError,
       );
+    }
+  });
+});
+
+describe("Codex session headers (prompt cache routing)", () => {
+  it("derives session-id / thread-id / x-client-request-id from the payload", () => {
+    assert.deepEqual(codexSessionHeaders({ prompt_cache_key: "key-1" }), {
+      "session-id": "key-1",
+      "thread-id": "key-1",
+      "x-client-request-id": "key-1",
+    });
+    assert.deepEqual(
+      codexSessionHeaders({ prompt_cache_key: "key-1", client_metadata: { session_id: "s-1", thread_id: "t-1" } }),
+      { "session-id": "s-1", "thread-id": "t-1", "x-client-request-id": "t-1" },
+    );
+    assert.deepEqual(
+      codexSessionHeaders({ client_metadata: { session_id: "s-2" } }),
+      { "session-id": "s-2", "thread-id": "s-2", "x-client-request-id": "s-2" },
+    );
+    assert.deepEqual(codexSessionHeaders({}), {});
+    assert.deepEqual(codexSessionHeaders({ prompt_cache_key: "   " }), {});
+    assert.deepEqual(codexSessionHeaders({ prompt_cache_key: "a\r\nInjected: 1" }), {});
+    assert.deepEqual(codexSessionHeaders({ client_metadata: { session_id: "s", thread_id: "t\nx" } }), {});
+  });
+
+  it("sends the session headers on the streamed and compact Responses requests only when a key exists", async () => {
+    const authPath = writeAuthFile();
+    const originalFetch = globalThis.fetch;
+    const seen: { url: string; headers: Record<string, string> }[] = [];
+    try {
+      globalThis.fetch = async (input, init) => {
+        seen.push({ url: String(input), headers: { ...(init?.headers as Record<string, string>) } });
+        return new Response("refused", { status: 400 });
+      };
+      const provider = testProvider({ authJsonPath: authPath });
+      const operations = [
+        () => provider.chat(providerMessages(), { model: "gpt-5.5", promptCacheKey: "cache-key-7" }),
+        () => provider.compactMessages(providerMessages(), { model: "gpt-5.5", responsesLite: false, promptCacheKey: "cache-key-7" }),
+        () => provider.chat(providerMessages(), { model: "gpt-5.5" }),
+      ];
+      for (const operation of operations) await assert.rejects(operation);
+      assert.equal(seen.length, 3);
+      for (const request of seen.slice(0, 2)) {
+        assert.equal(request.headers["session-id"], "cache-key-7");
+        assert.equal(request.headers["thread-id"], "cache-key-7");
+        assert.equal(request.headers["x-client-request-id"], "cache-key-7");
+      }
+      assert.equal(seen[1].url.endsWith("/responses/compact"), true);
+      assert.equal("session-id" in seen[2].headers, false);
+      assert.equal("thread-id" in seen[2].headers, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
     }
   });
 });

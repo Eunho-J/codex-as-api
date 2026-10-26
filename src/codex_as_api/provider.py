@@ -409,6 +409,29 @@ def _redact_failure_event(
     return value
 
 
+def codex_session_headers(payload: dict[str, Any]) -> dict[str, str]:
+    """Session headers the official Codex CLI sends on every Responses request.
+
+    The ChatGPT Codex backend does not reuse its prompt cache from
+    ``prompt_cache_key`` alone: measured 2026-10-27, an identical 7k-token prefix
+    read 0 cached tokens on every request without these headers and 7,296 with them.
+    """
+    metadata = payload.get("client_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    def non_empty(value: Any) -> str | None:
+        return value if isinstance(value, str) and value.strip() else None
+
+    session_id = non_empty(metadata.get("session_id")) or non_empty(payload.get("prompt_cache_key"))
+    if session_id is None:
+        return {}
+    thread_id = non_empty(metadata.get("thread_id")) or session_id
+    if any(ch in value for value in (session_id, thread_id) for ch in ("\r", "\n")):
+        return {}
+    return {"session-id": session_id, "thread-id": thread_id, "x-client-request-id": thread_id}
+
+
 class ChatGPTOAuthProvider:
     name: str = "chatgpt_oauth"
     provider_namespace: str = "agent.provider.chatgpt_oauth"
@@ -1558,6 +1581,7 @@ class ChatGPTOAuthProvider:
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
             headers["Accept"] = "text/event-stream"
+            headers.update(codex_session_headers(payload))
             if extra_headers:
                 headers.update(extra_headers)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)
@@ -1649,6 +1673,7 @@ class ChatGPTOAuthProvider:
             token = token_for_request(self.auth_json_path)
             _require_catalog_account(token.account_id, catalog_key)
             headers = self._headers(token, client_version=resolved_client_version)
+            headers.update(codex_session_headers(payload))
             if extra_headers:
                 headers.update(extra_headers)
             token_values = (token.access_token, token.refresh_token, token.id_token, token.account_id)

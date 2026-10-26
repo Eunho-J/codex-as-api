@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.9.3
+
+### Prompt cache routing headers
+
+- Send the session headers the official Codex CLI sends on every Responses
+  request: `session-id`, `thread-id` and `x-client-request-id`, derived from
+  `client_metadata.session_id` / `thread_id` or, failing those, from
+  `prompt_cache_key`. Applies to streamed `/responses` and `/responses/compact`
+  requests in Python, TypeScript and Rust. Values containing CR or LF are not sent.
+- Measured against the ChatGPT Codex backend: an identical 7k-token prefix sent
+  with `prompt_cache_key` alone read 0 cached tokens on every request; with the
+  headers, repeated requests read 7,296 cached tokens. The official Codex CLI on
+  the same account read ~30k cached tokens per turn.
+- No change when a request carries neither `prompt_cache_key` nor
+  `client_metadata.session_id`.
+
 ## v0.9.2
 
 ### TypeScript version lookup deadline

@@ -53,6 +53,7 @@ from codex_as_api.provider import (
     _validate_response_event,
     _web_search_event_from_response_item,
     codex_cli_headers_for_version,
+    codex_session_headers,
     resolve_codex_cli_version,
     resolve_model_reasoning_effort,
 )
@@ -2192,7 +2193,7 @@ def test_codex_cli_headers_include_official_originator_and_versioned_user_agent(
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.9.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.9.3")
 
 
 def test_codex_cli_headers_reject_unpinned_version():
@@ -2932,7 +2933,7 @@ def test_provider_headers_include_codex_cli_headers(auth_json_factory):
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.9.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/0.9.3")
     assert headers["Authorization"].startswith("Bearer ")
 
 
@@ -4533,7 +4534,7 @@ def test_provider_injects_dynamic_npm_version_across_catalog_responses_and_401_r
     for full_url, headers in observed_requests:
         assert full_url == "https://example.test/codex/models?client_version=0.175.2"
         assert headers["user-agent"].startswith("codex_cli_rs/0.175.2 (")
-        assert headers["user-agent"].endswith(") codex-as-api/0.9.2")
+        assert headers["user-agent"].endswith(") codex-as-api/0.9.3")
 
 
 def test_provider_cold_version_resolver_failure_raises_typed_503(auth_json_factory, monkeypatch):
@@ -4682,3 +4683,61 @@ def test_responses_payload_replays_all_25_compatible_model_pairs(
                 "encrypted_content": "enc_payload",
                 "summary": [{"type": "summary_text", "text": "summary"}],
             }
+
+
+def test_codex_session_headers_derive_from_cache_key_and_metadata():
+    assert codex_session_headers({"prompt_cache_key": "key-1"}) == {
+        "session-id": "key-1",
+        "thread-id": "key-1",
+        "x-client-request-id": "key-1",
+    }
+    assert codex_session_headers(
+        {"prompt_cache_key": "key-1", "client_metadata": {"session_id": "s-1", "thread_id": "t-1"}}
+    ) == {"session-id": "s-1", "thread-id": "t-1", "x-client-request-id": "t-1"}
+    assert codex_session_headers({"client_metadata": {"session_id": "s-2"}}) == {
+        "session-id": "s-2",
+        "thread-id": "s-2",
+        "x-client-request-id": "s-2",
+    }
+    assert codex_session_headers({}) == {}
+    assert codex_session_headers({"prompt_cache_key": "   "}) == {}
+    assert codex_session_headers({"prompt_cache_key": "a\r\nInjected: 1"}) == {}
+    assert codex_session_headers({"client_metadata": {"session_id": "s", "thread_id": "t\nx"}}) == {}
+
+
+def test_responses_requests_carry_codex_session_headers_only_with_a_key(monkeypatch):
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+            self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, _format, *args):  # noqa: ANN001
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        token = _test_token()
+        provider = ChatGPTOAuthProvider(base_url=f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setattr(provider_module, "token_for_request", lambda _path: token)
+        with pytest.raises(ChatGPTOAuthUpstreamError):
+            list(provider._post_sse("/responses", {"prompt_cache_key": "cache-key-7"}))  # noqa: SLF001
+        with pytest.raises(ChatGPTOAuthUpstreamError):
+            provider._request_json("/responses/compact", {"prompt_cache_key": "cache-key-7"})  # noqa: SLF001
+        with pytest.raises(ChatGPTOAuthUpstreamError):
+            list(provider._post_sse("/responses", {}))  # noqa: SLF001
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert [path for path, _ in seen] == ["/responses", "/responses/compact", "/responses"]
+    for _, headers in seen[:2]:
+        assert headers["session-id"] == "cache-key-7"
+        assert headers["thread-id"] == "cache-key-7"
+        assert headers["x-client-request-id"] == "cache-key-7"
+    assert "session-id" not in seen[2][1]
+    assert "thread-id" not in seen[2][1]

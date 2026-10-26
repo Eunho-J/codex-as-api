@@ -2588,6 +2588,7 @@ impl ChatGPTOAuthProvider {
                     ProviderError::Request(format!("ChatGPT OAuth credential worker failed: {error}"))
                 })??;
                 headers.insert("Accept".to_string(), "text/event-stream".to_string());
+                headers.extend(codex_session_headers(payload));
                 if let Some(eh) = extra_headers {
                     for (key, value) in eh {
                         headers.insert(key.clone(), value.clone());
@@ -2747,6 +2748,7 @@ impl ChatGPTOAuthProvider {
         for attempt in 0..2 {
             let (mut headers, token) =
                 self.headers_for_account(expected_account_id, client_version)?;
+            headers.extend(codex_session_headers(payload));
             if let Some(eh) = extra_headers {
                 for (k, v) in eh {
                     headers.insert(k.clone(), v.clone());
@@ -2836,6 +2838,41 @@ async fn wait_for_cancellation(cancellation: Option<Arc<AtomicBool>>) {
     while !cancellation.load(Ordering::Acquire) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Session headers the official Codex CLI sends on every Responses request
+/// (codex-rs codex-api requests/headers.rs + endpoint/responses.rs). The ChatGPT
+/// Codex backend does not reuse its prompt cache from `prompt_cache_key` alone:
+/// measured 2026-10-27, an identical 7k-token prefix read 0 cached tokens on every
+/// request without these headers and 7,296 with them.
+pub(crate) fn codex_session_headers(payload: &Value) -> HashMap<String, String> {
+    fn non_empty(value: Option<&Value>) -> Option<String> {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    }
+    let metadata = payload
+        .get("client_metadata")
+        .filter(|value| value.is_object());
+    let session_id = non_empty(metadata.and_then(|m| m.get("session_id")))
+        .or_else(|| non_empty(payload.get("prompt_cache_key")));
+    let Some(session_id) = session_id else {
+        return HashMap::new();
+    };
+    let thread_id =
+        non_empty(metadata.and_then(|m| m.get("thread_id"))).unwrap_or_else(|| session_id.clone());
+    if [&session_id, &thread_id]
+        .iter()
+        .any(|value| value.contains('\r') || value.contains('\n'))
+    {
+        return HashMap::new();
+    }
+    HashMap::from([
+        ("session-id".to_string(), session_id),
+        ("thread-id".to_string(), thread_id.clone()),
+        ("x-client-request-id".to_string(), thread_id),
+    ])
 }
 
 fn headers_for_token(
@@ -9091,5 +9128,148 @@ mod tests {
         assert!(req_text.contains(&format!(") codex-as-api/{}\r\n", env!("CARGO_PKG_VERSION"))));
 
         std::fs::remove_file(auth_path).unwrap();
+    }
+
+    #[test]
+    fn codex_session_headers_derive_from_cache_key_and_metadata() {
+        let expect = |s: &str, t: &str| {
+            HashMap::from([
+                ("session-id".to_string(), s.to_string()),
+                ("thread-id".to_string(), t.to_string()),
+                ("x-client-request-id".to_string(), t.to_string()),
+            ])
+        };
+        assert_eq!(
+            codex_session_headers(&json!({"prompt_cache_key": "key-1"})),
+            expect("key-1", "key-1")
+        );
+        assert_eq!(
+            codex_session_headers(&json!({
+                "prompt_cache_key": "key-1",
+                "client_metadata": {"session_id": "s-1", "thread_id": "t-1"}
+            })),
+            expect("s-1", "t-1")
+        );
+        assert_eq!(
+            codex_session_headers(&json!({"client_metadata": {"session_id": "s-2"}})),
+            expect("s-2", "s-2")
+        );
+        assert!(codex_session_headers(&json!({})).is_empty());
+        assert!(codex_session_headers(&json!({"prompt_cache_key": "   "})).is_empty());
+        assert!(codex_session_headers(&json!({"prompt_cache_key": "a\r\nInjected: 1"})).is_empty());
+        assert!(codex_session_headers(&json!({
+            "client_metadata": {"session_id": "s", "thread_id": "t\nx"}
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn responses_requests_carry_codex_session_headers_only_with_a_key() {
+        use std::io::{Read, Write};
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "codex-provider-session-headers-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "header.e30.signature",
+                    "refresh_token": "refresh-token",
+                    "id_token": "header.e30.signature",
+                    "account_id": TEST_ACCOUNT_ID
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 16384];
+                let read = stream.read(&mut request).unwrap();
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let headers: HashMap<String, String> = head
+                    .split("\r\n\r\n")
+                    .next()
+                    .unwrap_or_default()
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(": "))
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                    .collect();
+                seen.push((path, headers));
+                write!(
+                    stream,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrefused"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+            seen
+        });
+        let provider = ChatGPTOAuthProvider::new(
+            String::new(),
+            format!("http://{address}"),
+            Some(auth_path.to_string_lossy().to_string()),
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        let version = pinned_codex_compatibility_version().to_string();
+        assert!(provider
+            .post_sse(
+                "/responses",
+                &json!({"prompt_cache_key": "cache-key-7"}),
+                None,
+                TEST_ACCOUNT_ID,
+                &version
+            )
+            .is_err());
+        assert!(provider
+            .request_json(
+                "/responses/compact",
+                &json!({"prompt_cache_key": "cache-key-7"}),
+                None,
+                TEST_ACCOUNT_ID,
+                &version
+            )
+            .is_err());
+        assert!(provider
+            .post_sse("/responses", &json!({}), None, TEST_ACCOUNT_ID, &version)
+            .is_err());
+        let seen = server.join().unwrap();
+        std::fs::remove_file(auth_path).unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/responses", "/responses/compact", "/responses"]
+        );
+        for (_, headers) in &seen[..2] {
+            assert_eq!(
+                headers.get("session-id").map(String::as_str),
+                Some("cache-key-7")
+            );
+            assert_eq!(
+                headers.get("thread-id").map(String::as_str),
+                Some("cache-key-7")
+            );
+            assert_eq!(
+                headers.get("x-client-request-id").map(String::as_str),
+                Some("cache-key-7")
+            );
+        }
+        assert!(!seen[2].1.contains_key("session-id"));
+        assert!(!seen[2].1.contains_key("thread-id"));
     }
 }
