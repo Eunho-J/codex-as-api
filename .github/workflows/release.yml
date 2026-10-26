@@ -22,7 +22,7 @@ jobs:
 
   python:
     name: Test and package Python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # setup-python has no 3.12.11 build for the Ubuntu 26.04 ubuntu-latest image (2026-10-27)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
