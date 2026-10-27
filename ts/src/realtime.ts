@@ -53,6 +53,11 @@ export interface CreateRealtimeCallOptions {
   baseUrl?: string;
   sessionId?: string;
   threadId?: string;
+  /**
+   * Client-generated voice session id, forwarded as `voice-session-id` (codex-rs
+   * #53784, Codex 0.164.0). Distinct from the realtime session id (`x-session-id`).
+   */
+  voiceSessionId?: string;
   fetchImpl?: typeof fetch;
   versionResolver?: CodexVersionProvider;
 }
@@ -64,6 +69,7 @@ export interface RealtimeCallResult {
   location: string;
   sessionId: string;
   threadId: string;
+  voiceSessionId?: string;
 }
 
 interface RealtimeAuthContext {
@@ -101,6 +107,14 @@ export function resolveRealtimeSidebandUrl(callId: string, baseUrl = REALTIME_SI
   url.protocol = url.protocol === "http:" ? "ws:" : "wss:";
   const base = url.toString().replace(/\/+$/, "");
   return `${base}/live/${encodeURIComponent(callId)}`;
+}
+
+/** Header-safe client voice session id (same token rules as call ids). */
+export function validateVoiceSessionId(value: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.:-]{1,200}$/.test(value)) {
+    throw new ChatGPTOAuthInvalidRequestError("invalid voice session id");
+  }
+  return value;
 }
 
 export function validateCallId(callId: string): string {
@@ -220,6 +234,7 @@ export async function createRealtimeCall(
   const threadId = options.threadId ?? sessionId;
   validateCallId(sessionId);
   validateCallId(threadId);
+  const voiceSessionId = options.voiceSessionId == null ? undefined : validateVoiceSessionId(options.voiceSessionId);
 
   const url = `${baseUrl}/realtime/calls?${REALTIME_CALL_QUERY}`;
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -230,6 +245,7 @@ export async function createRealtimeCall(
       "x-session-id": sessionId,
       "session-id": sessionId,
       "thread-id": threadId,
+      ...(voiceSessionId == null ? {} : { "voice-session-id": voiceSessionId }),
     },
     body: JSON.stringify({ sdp, session }),
   });
@@ -249,6 +265,7 @@ export async function createRealtimeCall(
     location: `${REALTIME_CALL_ROUTE}/${callId}`,
     sessionId,
     threadId,
+    ...(voiceSessionId == null ? {} : { voiceSessionId }),
   };
 }
 
@@ -256,6 +273,8 @@ export interface SidebandRelayOptions {
   callId: string;
   authPath?: string | null;
   sidebandBaseUrl?: string;
+  /** Forwarded as `voice-session-id` on the sideband join (existing-call transport). */
+  voiceSessionId?: string;
   versionResolver?: CodexVersionProvider;
 }
 
@@ -285,6 +304,14 @@ export async function relayRealtimeSideband(
   const target = resolveRealtimeSidebandUrl(callId, options.sidebandBaseUrl);
   const headers: Record<string, string> = { ...auth.headers };
   delete headers["Content-Type"];
+  if (options.voiceSessionId != null) {
+    try {
+      headers["voice-session-id"] = validateVoiceSessionId(options.voiceSessionId);
+    } catch {
+      closeClient(client, 4400, "invalid voice session id");
+      return;
+    }
+  }
 
   let upstream: WebSocket | null = null;
   let lastStatus: number | null = null;

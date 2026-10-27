@@ -707,11 +707,16 @@ export function createApp(opts?: CreateAppOptions): express.Express {
       ) {
         throw new ChatGPTOAuthInvalidRequestError("`session` must be a JSON object");
       }
+      const voiceSessionHeader = req.headers["voice-session-id"];
+      if (Array.isArray(voiceSessionHeader)) {
+        throw new ChatGPTOAuthInvalidRequestError("voice-session-id must be provided at most once");
+      }
       const result = await createRealtimeCall({
         sdp: body.sdp as string,
         session: session as RealtimeCallSessionPayload | undefined,
         authPath,
         versionResolver: realtimeVersionResolver,
+        ...(voiceSessionHeader == null ? {} : { voiceSessionId: voiceSessionHeader }),
       });
       res
         .status(201)
@@ -721,6 +726,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           "x-session-id": result.sessionId,
           "session-id": result.sessionId,
           "thread-id": result.threadId,
+          ...(result.voiceSessionId == null ? {} : { "voice-session-id": result.voiceSessionId }),
           "x-realtime-call-id": result.callId,
         })
         .end(result.sdp);

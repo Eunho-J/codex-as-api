@@ -16,9 +16,11 @@ import {
   createRealtimeCall,
   resolveRealtimeBaseUrl,
   resolveRealtimeSidebandUrl,
+  relayRealtimeSideband,
   validateCallId,
 } from "../realtime.js";
 import type { CodexConfig } from "../codex-config.js";
+import WebSocket, { WebSocketServer } from "ws";
 
 const TEST_CONFIG: CodexConfig = {
   codexHome: "/test/codex-home",
@@ -170,6 +172,46 @@ describe("realtime call creation", () => {
       assert.equal(Object.hasOwn(session, "id"), false);
       assert.equal(Object.hasOwn(session, "voice_session_id"), false);
       assert.equal(request.body.sdp, OFFER);
+    } finally {
+      await upstream.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards a client voice session id as voice-session-id only when given", async () => {
+    const upstream = await startRealtimeUpstream();
+    const { authPath, directory } = writeAuthFile();
+    try {
+      const withId = await createRealtimeCall({
+        sdp: OFFER,
+        authPath,
+        baseUrl: upstream.baseUrl,
+        sessionId: "session-fixed",
+        voiceSessionId: "voice_789",
+        versionResolver: () => "0.164.0",
+      });
+      const withoutId = await createRealtimeCall({
+        sdp: OFFER,
+        authPath,
+        baseUrl: upstream.baseUrl,
+        versionResolver: () => "0.164.0",
+      });
+      assert.equal(withId.voiceSessionId, "voice_789");
+      assert.equal(withoutId.voiceSessionId, undefined);
+      assert.equal(upstream.requests[0].headers["voice-session-id"], "voice_789");
+      assert.equal(upstream.requests[0].headers["x-session-id"], "session-fixed");
+      assert.equal(Object.hasOwn(upstream.requests[1].headers, "voice-session-id"), false);
+      await assert.rejects(
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl: upstream.baseUrl,
+          voiceSessionId: "bad\r\nInjected: 1",
+          versionResolver: () => "0.164.0",
+        }),
+        ChatGPTOAuthInvalidRequestError,
+      );
+      assert.equal(upstream.requests.length, 2, "an invalid id never reaches upstream");
     } finally {
       await upstream.close();
       fs.rmSync(directory, { recursive: true, force: true });
@@ -344,6 +386,18 @@ describe("POST /v1/realtime/calls", () => {
     assert.equal((await response.text()).startsWith("v=0"), true);
   });
 
+  it("forwards a voice-session-id request header and echoes it", async () => {
+    const response = await fetch(`${baseUrl}/v1/realtime/calls`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "voice-session-id": "voice_server_1" },
+      body: JSON.stringify({ sdp: OFFER }),
+    });
+    assert.equal(response.status, 201);
+    assert.equal(response.headers.get("voice-session-id"), "voice_server_1");
+    assert.equal(upstream.requests.at(-1)?.headers["voice-session-id"], "voice_server_1");
+    await response.text();
+  });
+
   it("rejects unknown request fields", async () => {
     const response = await fetch(`${baseUrl}/v1/realtime/calls`, {
       method: "POST",
@@ -369,5 +423,58 @@ describe("POST /v1/realtime/calls", () => {
     } finally {
       upstream.setResponse(201, "v=0\r\n");
     }
+  });
+});
+
+describe("realtime sideband relay voice session id", () => {
+  async function joinHeaders(voiceSessionId?: string): Promise<{ headers: Record<string, string | string[] | undefined> | null; closeCode: number | null }> {
+    const { authPath, directory } = writeAuthFile();
+    const upstreamHttp = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamHttp });
+    let seen: Record<string, string | string[] | undefined> | null = null;
+    upstreamWss.on("connection", (socket, request) => {
+      seen = { ...request.headers };
+      socket.close(1000, "done");
+    });
+    await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+    const clientHttp = createServer();
+    const clientWss = new WebSocketServer({ server: clientHttp });
+    await new Promise<void>((resolve) => clientHttp.listen(0, "127.0.0.1", resolve));
+    const clientPort = (clientHttp.address() as { port: number }).port;
+    let closeCode: number | null = null;
+    const relayed = new Promise<void>((resolve) => {
+      clientWss.on("connection", (serverSide) => {
+        void relayRealtimeSideband(serverSide, {
+          callId: "rtc_1",
+          authPath,
+          sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+          versionResolver: () => "0.164.0",
+          ...(voiceSessionId === undefined ? {} : { voiceSessionId }),
+        }).finally(resolve);
+      });
+    });
+    const client = new WebSocket(`ws://127.0.0.1:${clientPort}`);
+    const closed = new Promise<void>((resolve) => client.on("close", (code) => { closeCode = code; resolve(); }));
+    await Promise.race([Promise.all([relayed, closed]), new Promise((r) => setTimeout(r, 3000))]);
+    client.terminate();
+    await new Promise<void>((resolve) => clientWss.close(() => clientHttp.close(() => resolve())));
+    await new Promise<void>((resolve) => upstreamWss.close(() => upstreamHttp.close(() => resolve())));
+    fs.rmSync(directory, { recursive: true, force: true });
+    return { headers: seen, closeCode };
+  }
+
+  it("sends voice-session-id on the sideband join only when given", async () => {
+    const withId = await joinHeaders("voice_789");
+    assert.equal(withId.headers?.["voice-session-id"], "voice_789");
+    const withoutId = await joinHeaders();
+    assert.notEqual(withoutId.headers, null);
+    assert.equal(Object.hasOwn(withoutId.headers ?? {}, "voice-session-id"), false);
+  });
+
+  it("closes the client and never joins upstream for an invalid id", async () => {
+    const bad = await joinHeaders("bad id");
+    assert.equal(bad.headers, null);
+    assert.equal(bad.closeCode, 4400);
   });
 });

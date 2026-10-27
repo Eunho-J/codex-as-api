@@ -1,5 +1,19 @@
 # Release Notes
 
+## v0.9.4
+
+### Realtime voice session id
+
+- Forward an optional client voice session id as the `voice-session-id` header
+  on ChatGPT Live call creation and on the sideband join, matching Codex 0.164.0
+  (openai/codex #53784). It stays distinct from the realtime session id sent as
+  `x-session-id` / `session-id`. `createRealtimeCall` and `relayRealtimeSideband`
+  take `voiceSessionId`; `POST /v1/realtime/calls` forwards a `voice-session-id`
+  request header and echoes it. Ids outside `[A-Za-z0-9_.:-]{1,200}` are refused
+  before any upstream request.
+- Realtime remains TypeScript-only; the Python and Rust runtimes are unchanged
+  apart from the aligned version.
+
 ## v0.9.3
 
 ### Prompt cache routing headers
