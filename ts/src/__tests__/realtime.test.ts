@@ -11,6 +11,8 @@ import {
 } from "../auth.js";
 import {
   DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_V2_MODEL,
+  DEFAULT_REALTIME_V2_VOICE,
   DEFAULT_REALTIME_VOICE,
   buildRealtimeSessionPayload,
   createRealtimeCall,
@@ -212,6 +214,54 @@ describe("realtime call creation", () => {
         ChatGPTOAuthInvalidRequestError,
       );
       assert.equal(upstream.requests.length, 2, "an invalid id never reaches upstream");
+    } finally {
+      await upstream.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a standard Realtime call on the bare route with tools and no alpha header", async () => {
+    const upstream = await startRealtimeUpstream();
+    const { authPath, directory } = writeAuthFile();
+    const tools = [{ type: "function", name: "end_call", description: "hang up", parameters: { type: "object", properties: {} } }];
+    try {
+      await createRealtimeCall({
+        sdp: OFFER,
+        session: { type: "realtime", instructions: "hi", tools, tool_choice: "auto", delegation: { type: "client" } as never },
+        authPath,
+        baseUrl: upstream.baseUrl,
+        sessionId: "session-fixed",
+        versionResolver: () => "0.205.0",
+      });
+      await createRealtimeCall({
+        sdp: OFFER,
+        session: { instructions: "explicit", voice: "cedar" },
+        mode: "realtime",
+        authPath,
+        baseUrl: upstream.baseUrl,
+        versionResolver: () => "0.205.0",
+      });
+      const [inferred, explicit] = upstream.requests;
+      assert.equal(inferred.url, "/backend-api/codex/realtime/calls");
+      assert.equal(Object.hasOwn(inferred.headers, "openai-alpha"), false);
+      assert.equal(inferred.headers["x-session-id"], "session-fixed");
+      const session = inferred.body.session as Record<string, unknown>;
+      assert.equal(session.type, "realtime");
+      assert.equal(session.model, DEFAULT_REALTIME_V2_MODEL);
+      assert.deepEqual(session.audio, { output: { voice: DEFAULT_REALTIME_V2_VOICE } });
+      assert.deepEqual(session.tools, tools);
+      assert.equal(session.tool_choice, "auto");
+      assert.deepEqual(session.delegation, { type: "client" }, "a caller-given field passes through untouched");
+      assert.equal(explicit.url, "/backend-api/codex/realtime/calls");
+      const explicitSession = explicit.body.session as Record<string, unknown>;
+      assert.equal(explicitSession.type, "realtime");
+      assert.equal(Object.hasOwn(explicitSession, "delegation"), false, "no delegation is injected in realtime mode");
+      assert.deepEqual(explicitSession.audio, { output: { voice: "cedar" } });
+      await assert.rejects(
+        createRealtimeCall({ sdp: OFFER, mode: "bogus" as never, authPath, baseUrl: upstream.baseUrl, versionResolver: () => "0.205.0" }),
+        ChatGPTOAuthInvalidRequestError,
+      );
+      assert.equal(upstream.requests.length, 2, "an unknown mode never reaches upstream");
     } finally {
       await upstream.close();
       fs.rmSync(directory, { recursive: true, force: true });

@@ -20,6 +20,8 @@ export {
 export { createApp, main, type CreateAppOptions } from "./server.js";
 export {
   DEFAULT_REALTIME_MODEL,
+  DEFAULT_REALTIME_V2_MODEL,
+  DEFAULT_REALTIME_V2_VOICE,
   DEFAULT_REALTIME_VOICE,
   REALTIME_CALL_ROUTE,
   REALTIME_SIDEBAND_BASE_URL,
@@ -28,8 +30,10 @@ export {
   createRealtimeCall,
   relayRealtimeSideband,
   resolveRealtimeBaseUrl,
+  resolveRealtimeCallMode,
   resolveRealtimeSidebandUrl,
   type CreateRealtimeCallOptions,
+  type RealtimeCallMode,
   type RealtimeCallResult,
   type RealtimeCallSessionPayload,
 } from "./realtime.js";

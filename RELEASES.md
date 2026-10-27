@@ -1,5 +1,24 @@
 # Release Notes
 
+## v0.9.5
+
+### Standard Realtime calls with function tools
+
+- `POST /v1/realtime/calls` and `createRealtimeCall` create a standard Realtime
+  call when the session says `"type": "realtime"` (or the library caller passes
+  `mode: "realtime"`): the model defaults to `gpt-realtime-1.5` and the voice to
+  `marin`, no `delegation` is injected, and the request goes to the bare
+  `/realtime/calls` route without `intent=quicksilver&architecture=avas` or the
+  `openai-alpha: quicksilver=v2` header. Measured against the ChatGPT backend
+  on 2026-10-27: the bare route accepts this session with function `tools`, while
+  each ChatGPT Live parameter on its own is refused with a 400
+  (`architecture="avas" is only supported for quicksilver Realtime WebRTC
+  sessions`, `Header OpenAI-Alpha requires intent=quicksilver&architecture=avas`,
+  `Invalid intent quicksilver`). The sideband relay is unchanged.
+- ChatGPT Live calls (`mode: "live"`, the default) are unchanged.
+- Realtime remains TypeScript-only; the Python and Rust runtimes are unchanged
+  apart from the aligned version.
+
 ## v0.9.4
 
 ### Realtime voice session id

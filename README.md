@@ -457,6 +457,15 @@ client-chosen voice-session id (`id`, `session_id`, `voice_session_id`), because
 the backend denies calls that set those itself. On success it returns `201` with
 the SDP answer as `text/plain` and a mirror `Location: /v1/realtime/calls/{call_id}`.
 
+A session with `"type": "realtime"` creates a standard Realtime call instead
+(`gpt-realtime-1.5` by default, voice `marin`): it carries function `tools` and
+`tool_choice` rather than `delegation`, and the proxy sends it to the backend's
+bare `/realtime/calls` route without the ChatGPT Live intent, architecture or
+`openai-alpha` header. Library callers can also pass `mode: "realtime"` to
+`createRealtimeCall`. Tool calls and their outputs then follow the standard
+Realtime events on the sideband (`response.output_item.done` with a
+`function_call` item, `conversation.item.create` with a `function_call_output`).
+
 ```bash
 curl -i http://localhost:18080/v1/realtime/calls \
   -H "Content-Type: application/json" \

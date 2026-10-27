@@ -23,6 +23,23 @@ export const DEFAULT_REALTIME_MODEL = "gpt-live-1-codex";
 /** Default voice for ChatGPT Live (realtime) voice calls. */
 export const DEFAULT_REALTIME_VOICE = "cove";
 /**
+ * Default model and voice for standard Realtime calls (`mode: "realtime"`): the
+ * function-calling voice model Codex defaults to on its v2 wire (openai/codex
+ * #17183), with a voice from that wire's list.
+ */
+export const DEFAULT_REALTIME_V2_MODEL = "gpt-realtime-1.5";
+export const DEFAULT_REALTIME_V2_VOICE = "marin";
+
+/**
+ * - `live`: a ChatGPT Live (GPT-Live, frameless bidi) call -- `?intent=quicksilver&
+ *   architecture=avas` with `openai-alpha: quicksilver=v2`, `delegation` instead of tools.
+ * - `realtime`: a standard Realtime session (`session.type: "realtime"`) with function
+ *   tools, e.g. gpt-realtime-1.5. The ChatGPT backend takes it on the bare
+ *   `/realtime/calls` route with no intent, architecture or alpha header (measured
+ *   2026-10-27: adding any of them is refused with a 400).
+ */
+export type RealtimeCallMode = "live" | "realtime";
+/**
  * Base URL used for the direct (sideband) realtime WebSocket. The call itself is
  * created on the ChatGPT backend, but the media/event sideband lives on the
  * OpenAI API host.
@@ -53,6 +70,8 @@ export interface CreateRealtimeCallOptions {
   baseUrl?: string;
   sessionId?: string;
   threadId?: string;
+  /** Defaults to `realtime` when `session.type` is `"realtime"`, otherwise `live`. */
+  mode?: RealtimeCallMode;
   /**
    * Client-generated voice session id, forwarded as `voice-session-id` (codex-rs
    * #53784, Codex 0.164.0). Distinct from the realtime session id (`x-session-id`).
@@ -142,8 +161,24 @@ function requireSdp(sdp: unknown): string {
   return sdp;
 }
 
+export function resolveRealtimeCallMode(
+  session: RealtimeCallSessionPayload | undefined,
+  mode?: RealtimeCallMode,
+): RealtimeCallMode {
+  if (mode != null) {
+    if (mode !== "live" && mode !== "realtime") {
+      throw new ChatGPTOAuthInvalidRequestError("`mode` must be \"live\" or \"realtime\"");
+    }
+    return mode;
+  }
+  return session != null && typeof session === "object" && !Array.isArray(session) && session.type === "realtime"
+    ? "realtime"
+    : "live";
+}
+
 export function buildRealtimeSessionPayload(
   session: RealtimeCallSessionPayload | undefined,
+  mode: RealtimeCallMode = "live",
 ): Record<string, unknown> {
   if (session != null && (typeof session !== "object" || Array.isArray(session))) {
     throw new ChatGPTOAuthInvalidRequestError("`session` must be an object");
@@ -167,12 +202,16 @@ export function buildRealtimeSessionPayload(
     ? incoming.voice
     : typeof output.voice === "string" && output.voice.trim().length > 0
       ? output.voice
-      : DEFAULT_REALTIME_VOICE;
+      : mode === "realtime" ? DEFAULT_REALTIME_V2_VOICE : DEFAULT_REALTIME_VOICE;
   delete incoming.voice;
 
   const model = typeof incoming.model === "string" && incoming.model.trim().length > 0
     ? incoming.model
-    : DEFAULT_REALTIME_MODEL;
+    : mode === "realtime" ? DEFAULT_REALTIME_V2_MODEL : DEFAULT_REALTIME_MODEL;
+  if (mode === "realtime") {
+    // Tools, not delegation: a standard Realtime session has no `delegation`.
+    return { ...incoming, type: "realtime", audio: { ...audio, output: { ...output, voice } }, model };
+  }
   const delegation =
     incoming.delegation != null
     && typeof incoming.delegation === "object"
@@ -191,6 +230,7 @@ export function buildRealtimeSessionPayload(
 async function realtimeAuthHeaders(
   authPath?: string | null,
   versionResolver: CodexVersionProvider = defaultCodexVersionResolver,
+  mode: RealtimeCallMode = "live",
 ): Promise<RealtimeAuthContext> {
   const token = await tokenForRequest(authPath);
   const version = await resolveLatestCodexVersion(versionResolver);
@@ -200,8 +240,8 @@ async function realtimeAuthHeaders(
     Authorization: `Bearer ${token.access_token}`,
     "ChatGPT-Account-Id": token.account_id,
     "Content-Type": "application/json",
-    "openai-alpha": "quicksilver=v2",
   };
+  if (mode === "live") headers["openai-alpha"] = "quicksilver=v2";
   if (token.fedramp) headers["X-OpenAI-Fedramp"] = "true";
   return { token, headers };
 }
@@ -227,8 +267,9 @@ export async function createRealtimeCall(
   options: CreateRealtimeCallOptions,
 ): Promise<RealtimeCallResult> {
   const sdp = requireSdp(options.sdp);
-  const session = buildRealtimeSessionPayload(options.session);
-  const auth = await realtimeAuthHeaders(options.authPath, options.versionResolver);
+  const mode = resolveRealtimeCallMode(options.session, options.mode);
+  const session = buildRealtimeSessionPayload(options.session, mode);
+  const auth = await realtimeAuthHeaders(options.authPath, options.versionResolver, mode);
   const baseUrl = resolveRealtimeBaseUrl(options.baseUrl);
   const sessionId = options.sessionId ?? randomUUID();
   const threadId = options.threadId ?? sessionId;
@@ -236,7 +277,7 @@ export async function createRealtimeCall(
   validateCallId(threadId);
   const voiceSessionId = options.voiceSessionId == null ? undefined : validateVoiceSessionId(options.voiceSessionId);
 
-  const url = `${baseUrl}/realtime/calls?${REALTIME_CALL_QUERY}`;
+  const url = mode === "live" ? `${baseUrl}/realtime/calls?${REALTIME_CALL_QUERY}` : `${baseUrl}/realtime/calls`;
   const fetchImpl = options.fetchImpl ?? fetch;
   const response = await fetchImpl(url, {
     method: "POST",
