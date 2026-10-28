@@ -356,6 +356,7 @@ export async function relayRealtimeSideband(
 
   let upstream: WebSocket | null = null;
   let lastStatus: number | null = null;
+  let lastCode: string | null = null;
   for (let attempt = 0; attempt < SIDEBAND_JOIN_ATTEMPTS; attempt++) {
     const joined = await openUpstream(target, headers);
     if (joined.socket != null) {
@@ -363,6 +364,7 @@ export async function relayRealtimeSideband(
       break;
     }
     lastStatus = joined.status;
+    lastCode = joined.code;
     if (joined.status !== 404) break;
     const delay =
       SIDEBAND_JOIN_BACKOFF_MS[Math.min(attempt, SIDEBAND_JOIN_BACKOFF_MS.length - 1)];
@@ -370,7 +372,9 @@ export async function relayRealtimeSideband(
   }
 
   if (upstream == null) {
-    closeClient(client, lastStatus === 403 ? 4403 : 4504, "realtime sideband unavailable");
+    // The close code stays 4403 / 4504; the reason carries what the upstream said, so a
+    // caller's log shows the cause (e.g. "HTTP 404 session_id_not_found").
+    closeClient(client, lastStatus === 403 ? 4403 : 4504, sidebandFailureReason(lastStatus, lastCode));
     return;
   }
 
@@ -403,39 +407,88 @@ export async function relayRealtimeSideband(
   });
 }
 
+/** Close reason for a failed sideband join: the status and upstream error code when known. */
+export function sidebandFailureReason(status: number | null, code: string | null): string {
+  const detail = [status == null ? null : `HTTP ${status}`, code].filter((x): x is string => !!x).join(" ");
+  return detail ? `realtime sideband unavailable (${detail})` : "realtime sideband unavailable";
+}
+
+// A WebSocket close reason is at most 123 bytes of UTF-8.
+function clampReason(reason: string): string {
+  let out = "";
+  for (const ch of reason) {
+    if (Buffer.byteLength(out + ch, "utf8") > 123) break;
+    out += ch;
+  }
+  return out;
+}
+
 function closeClient(client: WebSocket, code: number, reason: string): void {
   try {
     if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
-      client.close(code, reason.slice(0, 120));
+      client.close(code, clampReason(reason));
     }
   } catch {
     /* already closed */
   }
 }
 
-function openUpstream(
-  target: string,
-  headers: Record<string, string>,
-): Promise<{ socket: WebSocket | null; status: number | null }> {
+const UPSTREAM_ERROR_BODY_MAX_BYTES = 1024;
+const UPSTREAM_ERROR_BODY_WAIT_MS = 2000;
+const ERROR_CODE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/** The `error.code` (or `code`) of a refused join's JSON body, when it is a short token. */
+export function upstreamErrorCode(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown } | string; code?: unknown };
+    const code =
+      parsed && typeof parsed.error === "object" && parsed.error ? parsed.error.code : parsed?.code;
+    return typeof code === "string" && ERROR_CODE_RE.test(code) ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+type UpstreamJoin = { socket: WebSocket | null; status: number | null; code: string | null };
+
+function openUpstream(target: string, headers: Record<string, string>): Promise<UpstreamJoin> {
   return new Promise((resolve) => {
     const socket = new WebSocket(target, { headers });
     let settled = false;
-    const settle = (value: { socket: WebSocket | null; status: number | null }) => {
+    const settle = (value: UpstreamJoin) => {
       if (settled) return;
       settled = true;
       resolve(value);
     };
-    socket.once("open", () => settle({ socket, status: 101 }));
+    socket.once("open", () => settle({ socket, status: 101, code: null }));
     socket.once("unexpected-response", (_request, response) => {
-      settle({ socket: null, status: response.statusCode ?? null });
-      try {
-        socket.terminate();
-      } catch {
-        /* ignore */
-      }
+      // Read a little of the refusal body for its error code, then drop the connection.
+      const status = response.statusCode ?? null;
+      const chunks: Buffer[] = [];
+      let size = 0;
+      const finish = () => {
+        clearTimeout(timer);
+        const body = Buffer.concat(chunks).toString("utf8");
+        settle({ socket: null, status, code: upstreamErrorCode(body) });
+        try {
+          socket.terminate();
+        } catch {
+          /* ignore */
+        }
+      };
+      const timer = setTimeout(finish, UPSTREAM_ERROR_BODY_WAIT_MS);
+      response.on("data", (chunk: Buffer) => {
+        if (size >= UPSTREAM_ERROR_BODY_MAX_BYTES) return;
+        const piece = chunk.subarray(0, UPSTREAM_ERROR_BODY_MAX_BYTES - size);
+        chunks.push(piece);
+        size += piece.length;
+        if (size >= UPSTREAM_ERROR_BODY_MAX_BYTES) finish();
+      });
+      response.once("end", finish);
+      response.once("error", finish);
     });
-    socket.once("error", () => settle({ socket: null, status: null }));
-    socket.once("close", () => settle({ socket: null, status: null }));
+    socket.once("error", () => settle({ socket: null, status: null, code: null }));
+    socket.once("close", () => settle({ socket: null, status: null, code: null }));
   });
 }
 

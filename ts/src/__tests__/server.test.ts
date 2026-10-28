@@ -2231,6 +2231,9 @@ describe("live model catalog routes", () => {
           model: "gpt-5.6-sol",
           baseUrl: upstreamUrl,
           authJsonPath: auth.authPath,
+          // Pinned: the default resolver asks npm for the latest Codex CLI, so the expected
+          // client_version below broke the day Codex 0.165.0 was published.
+          versionResolver: () => upstreamContract.upstream.version,
         });
         await withServer(provider, async (baseUrl) => {
           const models = await fetch(`${baseUrl}/v1/models`);

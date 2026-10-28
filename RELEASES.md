@@ -1,5 +1,21 @@
 # Release Notes
 
+## v0.9.6
+
+### Sideband join failure says why
+
+- When the realtime sideband join fails, `relayRealtimeSideband` now closes the
+  client with the upstream HTTP status and, when the refusal body carries one, its
+  error code in the close reason, e.g. `realtime sideband unavailable (HTTP 404
+  session_id_not_found)`. The close codes are unchanged (4403 for 403, 4504 for
+  the rest), so callers that switch on the code keep working; the reason is
+  clamped to the 123-byte close-frame limit. The body read is capped at 1 KiB and
+  2 s. Found by a ChatGPT Live call whose voice the backend does not offer: call
+  creation answered 201 and every join answered 404 `session_id_not_found`, which
+  the old reason hid.
+- Realtime remains TypeScript-only; the Python and Rust runtimes are unchanged
+  apart from the aligned version.
+
 ## v0.9.5
 
 ### Standard Realtime calls with function tools

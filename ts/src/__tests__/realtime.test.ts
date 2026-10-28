@@ -19,6 +19,8 @@ import {
   resolveRealtimeBaseUrl,
   resolveRealtimeSidebandUrl,
   relayRealtimeSideband,
+  sidebandFailureReason,
+  upstreamErrorCode,
   validateCallId,
 } from "../realtime.js";
 import type { CodexConfig } from "../codex-config.js";
@@ -526,5 +528,66 @@ describe("realtime sideband relay voice session id", () => {
     const bad = await joinHeaders("bad id");
     assert.equal(bad.headers, null);
     assert.equal(bad.closeCode, 4400);
+  });
+});
+
+describe("realtime sideband join failure reason", () => {
+  // A fake upstream that refuses the WebSocket upgrade with `status` and `body`.
+  async function refusedJoin(status: number, body: string): Promise<{ code: number | null; reason: string; attempts: number }> {
+    const { authPath, directory } = writeAuthFile();
+    let attempts = 0;
+    const upstreamHttp = createServer();
+    upstreamHttp.on("upgrade", (_req, socket) => {
+      attempts++;
+      const payload = Buffer.from(body, "utf8");
+      socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n${body}`);
+    });
+    await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+    const clientHttp = createServer();
+    const clientWss = new WebSocketServer({ server: clientHttp });
+    await new Promise<void>((resolve) => clientHttp.listen(0, "127.0.0.1", resolve));
+    const clientPort = (clientHttp.address() as { port: number }).port;
+    clientWss.on("connection", (serverSide) => {
+      void relayRealtimeSideband(serverSide, {
+        callId: "rtc_1",
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        versionResolver: () => "0.164.0",
+      });
+    });
+    const client = new WebSocket(`ws://127.0.0.1:${clientPort}`);
+    const result = await new Promise<{ code: number | null; reason: string }>((resolve) => {
+      client.on("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+      setTimeout(() => resolve({ code: null, reason: "" }), 8000);
+    });
+    client.terminate();
+    await new Promise<void>((resolve) => clientWss.close(() => clientHttp.close(() => resolve())));
+    await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+    return { ...result, attempts };
+  }
+
+  it("404 session_id_not_found: retried, then 4504 with the status and the upstream code in the reason", async () => {
+    const r = await refusedJoin(404, JSON.stringify({ error: { code: "session_id_not_found", message: "no such session" } }));
+    assert.equal(r.code, 4504);
+    assert.equal(r.reason, "realtime sideband unavailable (HTTP 404 session_id_not_found)");
+    assert.equal(r.attempts, 4);
+  });
+
+  it("403: 4403 as before, reason names the status", async () => {
+    const r = await refusedJoin(403, "forbidden");
+    assert.equal(r.code, 4403);
+    assert.equal(r.reason, "realtime sideband unavailable (HTTP 403)");
+    assert.equal(r.attempts, 1);
+  });
+
+  it("reason helpers: no detail, code only when it is a short token, clamped to a close frame", () => {
+    assert.equal(sidebandFailureReason(null, null), "realtime sideband unavailable");
+    assert.equal(sidebandFailureReason(500, null), "realtime sideband unavailable (HTTP 500)");
+    assert.equal(upstreamErrorCode('{"error":{"code":"session_id_not_found"}}'), "session_id_not_found");
+    assert.equal(upstreamErrorCode('{"code":"rate_limited"}'), "rate_limited");
+    assert.equal(upstreamErrorCode('{"error":{"code":"has spaces and is long"}}'), null);
+    assert.equal(upstreamErrorCode("<html>"), null);
   });
 });
