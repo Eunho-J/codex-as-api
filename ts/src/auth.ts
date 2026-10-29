@@ -9,7 +9,7 @@ import {
 } from "./utf8-json.js";
 
 const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_AUTH_PATH = "~/.codex/auth.json";
+const DEFAULT_AUTH_PATH = "~/.codex-as-api/auth.json";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const REFRESH_URL_OVERRIDE_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 const REFRESH_WINDOW_MS = 5 * 60 * 1000;
@@ -138,12 +138,19 @@ export function resolveAuthPath(raw?: string | null): string {
     }
     return expandHome(raw);
   }
-  const codexHome = process.env["CODEX_HOME"];
-  if (codexHome !== undefined) {
-    if (codexHome.trim().length === 0) {
-      throw new ChatGPTOAuthError("CODEX_HOME must not be blank");
+  const configuredPath = process.env["CODEX_AS_API_AUTH_PATH"];
+  if (configuredPath !== undefined) {
+    if (configuredPath.trim().length === 0) {
+      throw new ChatGPTOAuthError("CODEX_AS_API_AUTH_PATH must not be blank");
     }
-    return path.join(expandHome(codexHome), "auth.json");
+    return expandHome(configuredPath);
+  }
+  const projectHome = process.env["CODEX_AS_API_HOME"];
+  if (projectHome !== undefined) {
+    if (projectHome.trim().length === 0) {
+      throw new ChatGPTOAuthError("CODEX_AS_API_HOME must not be blank");
+    }
+    return path.join(expandHome(projectHome), "auth.json");
   }
   return expandHome(DEFAULT_AUTH_PATH);
 }
@@ -369,7 +376,7 @@ function tokenDataFromDocument(data: unknown, authPath: string): ChatGPTTokenDat
     [...accountSources.values()].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
   );
   if (accountIds.size === 0) {
-    throw new ChatGPTOAuthError("ChatGPT OAuth account id not available; rerun codex login");
+    throw new ChatGPTOAuthError("ChatGPT OAuth account id not available; use the codex-as-api login API");
   }
   if (accountIds.size !== 1) {
     throw new ChatGPTOAuthError("ChatGPT OAuth token account ids do not match");
@@ -456,15 +463,15 @@ function matchingOptionalStringClaim(
 function unsupportedAuthSchemaMessage(data: Record<string, unknown>): string {
   const hasFileTokens = ["tokens", "access_token", "refresh_token", "id_token"].some((key) => key in data);
   if ("personal_access_token" in data && !hasFileTokens) {
-    return "ChatGPT OAuth personal_access_token-only auth is not supported; rerun codex login to create file-backed tokens";
+    return "ChatGPT OAuth personal_access_token-only auth is not supported; use the codex-as-api login API to create file-backed tokens";
   }
   if ("agent_identity" in data && !hasFileTokens) {
-    return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens";
+    return "ChatGPT OAuth agent_identity-only auth is not supported; use the codex-as-api login API to create file-backed tokens";
   }
   if ("bedrock_api_key" in data && !hasFileTokens) {
     return "ChatGPT OAuth bedrock_api_key-only auth is not supported by the ChatGPT OAuth backend";
   }
-  return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; rerun codex login";
+  return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; use the codex-as-api login API";
 }
 
 export function isAuthLocallyAvailable(authJsonPath?: string | null): boolean {
@@ -483,10 +490,10 @@ const NO_WRITE_FAILURE = Symbol("no auth write failure");
 
 function writeAuthJson(filePath: string, data: Record<string, unknown>): void {
   const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = path.join(dir, `.${path.basename(filePath)}.tmp-${process.pid}-${crypto.randomUUID()}`);
   const payload = JSON.stringify(data, null, 2) + "\n";
-  const fd = fs.openSync(tmp, "w", 0o600);
+  const fd = fs.openSync(tmp, "wx", 0o600);
   let failure: unknown = NO_WRITE_FAILURE;
   try {
     fs.writeFileSync(fd, payload, "utf-8");
@@ -664,7 +671,7 @@ async function performRefresh(
     );
     if (response.status === 400 || response.status === 401) {
       throw new ChatGPTOAuthRefreshError(
-        `ChatGPT OAuth refresh token is invalid; rerun codex login: ${redacted}`
+        `ChatGPT OAuth refresh token is invalid; use the codex-as-api login API: ${redacted}`
       );
     }
     throw new ChatGPTOAuthUpstreamError(

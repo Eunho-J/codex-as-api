@@ -58,7 +58,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 18080;
 export const REQUEST_BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 const PUBLIC_AUTH_ERROR_MESSAGE =
-  "ChatGPT OAuth credentials are unavailable; rerun codex login";
+  "ChatGPT OAuth credentials are unavailable; use the codex-as-api login API";
 
 const UNSUPPORTED_GENERATION_FIELDS = [
   "top_p",

@@ -10,6 +10,7 @@ import math
 import os
 import pathlib
 import re
+import tempfile
 import threading
 import time
 import unicodedata
@@ -21,7 +22,7 @@ from typing import Any, cast
 from .strict_json import JS_SAFE_INTEGER, strict_json_loads
 
 CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_AUTH_PATH = "~/.codex/auth.json"
+DEFAULT_AUTH_PATH = "~/.codex-as-api/auth.json"
 DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token"
 REFRESH_URL_OVERRIDE_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 REFRESH_WINDOW = _dt.timedelta(minutes=5)
@@ -160,15 +161,16 @@ class ChatGPTTokenData:
 
 
 def resolve_auth_path(raw: str | None = None) -> pathlib.Path:
-    if raw is not None:
-        if not raw.strip():
+    path = raw if raw is not None else os.getenv("CODEX_AS_API_AUTH_PATH")
+    if path is not None:
+        if not path.strip():
             raise ValueError("auth path must be a non-empty string")
-        return pathlib.Path(raw).expanduser()
-    codex_home = os.getenv("CODEX_HOME")
-    if codex_home is not None:
-        if not codex_home.strip():
-            raise ValueError("CODEX_HOME must be a non-empty string")
-        return pathlib.Path(codex_home).expanduser() / "auth.json"
+        return pathlib.Path(path).expanduser()
+    home = os.getenv("CODEX_AS_API_HOME")
+    if home is not None:
+        if not home.strip():
+            raise ValueError("CODEX_AS_API_HOME must be a non-empty string")
+        return pathlib.Path(home).expanduser() / "auth.json"
     return pathlib.Path(DEFAULT_AUTH_PATH).expanduser()
 
 
@@ -295,7 +297,9 @@ def _token_data_from_document(data: object, path: pathlib.Path) -> ChatGPTTokenD
             raise ChatGPTOAuthMissingError(f"ChatGPT OAuth {source} account id is invalid")
     account_ids = {value for value in account_sources.values() if isinstance(value, str) and value}
     if not account_ids:
-        raise ChatGPTOAuthMissingError("ChatGPT OAuth account id not available; rerun codex login")
+        raise ChatGPTOAuthMissingError(
+            "ChatGPT OAuth account id not available; sign in using the codex-as-api login API"
+        )
     if len(account_ids) != 1:
         raise ChatGPTOAuthMissingError("ChatGPT OAuth token account ids do not match")
     account_id = account_ids.pop()
@@ -361,13 +365,16 @@ def _unsupported_auth_schema_message(data: dict[str, Any]) -> str:
     if "personal_access_token" in data and "tokens" not in data:
         return (
             "ChatGPT OAuth personal_access_token-only auth is not supported; "
-            "rerun codex login to create file-backed tokens"
+            "sign in using the codex-as-api login API to create file-backed tokens"
         )
     if "agent_identity" in data and "tokens" not in data:
-        return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens"
+        return (
+            "ChatGPT OAuth agent_identity-only auth is not supported; "
+            "sign in using the codex-as-api login API to create file-backed tokens"
+        )
     if "bedrock_api_key" in data and "tokens" not in data:
         return "ChatGPT OAuth bedrock_api_key-only auth is not supported by the ChatGPT OAuth backend"
-    return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; rerun codex login"
+    return "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; sign in using the codex-as-api login API"
 
 
 def is_auth_locally_available(auth_json_path: str | pathlib.Path | None = None) -> bool:
@@ -389,11 +396,10 @@ def _refresh_lock(path: pathlib.Path) -> threading.Lock:
 
 
 def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(tmp, flags, 0o600)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    tmp = pathlib.Path(tmp_name)
     failure: BaseException | None = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -532,7 +538,7 @@ def _refresh_token(current: ChatGPTTokenData, *, refresh_if_expiring: bool) -> C
             )
             if exc.code in {400, 401}:
                 raise ChatGPTOAuthRefreshError(
-                    f"ChatGPT OAuth refresh token is invalid; rerun codex login: {redacted}"
+                    f"ChatGPT OAuth refresh token is invalid; sign in using the codex-as-api login API: {redacted}"
                 ) from exc
             raise ChatGPTOAuthUpstreamError(
                 exc.code,

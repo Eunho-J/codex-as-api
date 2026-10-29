@@ -70,9 +70,45 @@ function replaceBuiltinFsMethod(name: string, replacement: unknown): () => void 
 }
 
 describe("resolveAuthPath", () => {
-  it("returns default path when no arg", () => {
-    const result = resolveAuthPath();
-    assert.ok(result.endsWith(".codex/auth.json"));
+  it("uses only the standalone store and respects project overrides", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "standalone-auth-home-"));
+    const names = ["HOME", "CODEX_HOME", "CODEX_AS_API_HOME", "CODEX_AS_API_AUTH_PATH"] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.HOME = home;
+      process.env.CODEX_HOME = path.join(home, ".codex");
+      delete process.env.CODEX_AS_API_HOME;
+      delete process.env.CODEX_AS_API_AUTH_PATH;
+      const legacy = path.join(home, ".codex", "auth.json");
+      writeAuthJson(path.dirname(legacy), {
+        tokens: { access_token: makeJwt({}), id_token: makeJwt({}), refresh_token: "legacy-fake", account_id: "legacy-account" },
+      });
+      const legacyBytes = fs.readFileSync(legacy);
+      assert.equal(resolveAuthPath(), path.join(home, ".codex-as-api", "auth.json"));
+      assert.throws(() => loadTokenData(), ChatGPTOAuthMissingError);
+      writeAuthJson(path.join(home, ".codex-as-api"), {
+        tokens: { access_token: makeJwt({}), id_token: makeJwt({}), refresh_token: "project-fake", account_id: "project-account" },
+      });
+      assert.equal(loadTokenData().account_id, "project-account");
+      assert.deepEqual(fs.readFileSync(legacy), legacyBytes);
+      process.env.CODEX_AS_API_HOME = path.join(home, "project");
+      assert.equal(resolveAuthPath(), path.join(home, "project", "auth.json"));
+      process.env.CODEX_AS_API_AUTH_PATH = path.join(home, "chosen.json");
+      assert.equal(resolveAuthPath(), path.join(home, "chosen.json"));
+      assert.equal(resolveAuthPath(path.join(home, "explicit.json")), path.join(home, "explicit.json"));
+      process.env.CODEX_AS_API_AUTH_PATH = " ";
+      assert.throws(() => resolveAuthPath(), /CODEX_AS_API_AUTH_PATH/);
+      delete process.env.CODEX_AS_API_AUTH_PATH;
+      process.env.CODEX_AS_API_HOME = " ";
+      assert.throws(() => resolveAuthPath(), /CODEX_AS_API_HOME/);
+    } finally {
+      for (const name of names) {
+        const value = previous[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("uses explicit path", () => {
@@ -948,6 +984,9 @@ describe("OAuth refresh coordination", () => {
       assert.equal(second.access_token, newAccess);
       assert.equal(first.refresh_token, "refresh-preserved");
       assert.equal(first.id_token, idToken);
+      if (process.platform !== "win32") assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+      assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).tokens.access_token, newAccess);
+      assert.deepEqual(fs.readdirSync(dir), ["auth.json"]);
     } finally {
       globalThis.fetch = previousFetch;
       fs.rmSync(dir, { recursive: true });

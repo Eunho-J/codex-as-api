@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use thiserror::Error;
 use crate::strict_json;
 
 pub const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const DEFAULT_AUTH_PATH: &str = "~/.codex/auth.json";
+pub const DEFAULT_AUTH_PATH: &str = "~/.codex-as-api/auth.json";
 pub const DEFAULT_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 const REFRESH_WINDOW_MINUTES: i64 = 5;
@@ -81,16 +81,33 @@ pub fn resolve_auth_path(raw: Option<&str>) -> Result<PathBuf, AuthError> {
         return expand_tilde(path);
     }
 
-    match std::env::var("CODEX_HOME") {
-        Ok(path) if path.trim().is_empty() => Err(AuthError::Missing(
-            "CODEX_HOME must not be empty when provided".to_string(),
-        )),
-        Ok(path) => Ok(expand_tilde(&path)?.join("auth.json")),
-        Err(std::env::VarError::NotPresent) => expand_tilde(DEFAULT_AUTH_PATH),
-        Err(std::env::VarError::NotUnicode(_)) => Err(AuthError::Missing(
-            "CODEX_HOME must contain valid Unicode".to_string(),
-        )),
+    for (name, is_directory) in [
+        ("CODEX_AS_API_AUTH_PATH", false),
+        ("CODEX_AS_API_HOME", true),
+    ] {
+        match std::env::var(name) {
+            Ok(path) if path.trim().is_empty() => {
+                return Err(AuthError::Missing(format!(
+                    "{name} must not be empty when provided"
+                )));
+            }
+            Ok(path) => {
+                let path = expand_tilde(&path)?;
+                return Ok(if is_directory {
+                    path.join("auth.json")
+                } else {
+                    path
+                });
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(AuthError::Missing(format!(
+                    "{name} must contain valid Unicode"
+                )));
+            }
+        }
     }
+    expand_tilde(DEFAULT_AUTH_PATH)
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, AuthError> {
@@ -337,7 +354,7 @@ fn token_data_from_document(data: &Value, path: PathBuf) -> Result<ChatGPTTokenD
     let account_id = account_id
         .ok_or_else(|| {
             AuthError::OAuth(
-                "ChatGPT OAuth account id not available; rerun codex login".to_string(),
+                "ChatGPT OAuth account id not available; use the native login API".to_string(),
             )
         })?
         .to_string();
@@ -426,15 +443,16 @@ fn consistent_optional_string_claim(
 fn unsupported_auth_schema_message(data: &serde_json::Map<String, Value>) -> String {
     let has_file_tokens = data.contains_key("tokens");
     if data.contains_key("personal_access_token") && !has_file_tokens {
-        return "ChatGPT OAuth personal_access_token-only auth is not supported; rerun codex login to create file-backed tokens".to_string();
+        return "ChatGPT OAuth personal_access_token-only auth is not supported; use the native login API to create file-backed tokens".to_string();
     }
     if data.contains_key("agent_identity") && !has_file_tokens {
-        return "ChatGPT OAuth agent_identity-only auth is not supported; rerun codex login to create file-backed tokens".to_string();
+        return "ChatGPT OAuth agent_identity-only auth is not supported; use the native login API to create file-backed tokens".to_string();
     }
     if data.contains_key("bedrock_api_key") && !has_file_tokens {
         return "ChatGPT OAuth bedrock_api_key-only auth is not supported by the ChatGPT OAuth backend".to_string();
     }
-    "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; rerun codex login".to_string()
+    "ChatGPT OAuth file-backed ChatGPT OAuth tokens are required; use the native login API"
+        .to_string()
 }
 
 fn extract_required_string(
@@ -469,8 +487,13 @@ fn refresh_lock(path: &Path) -> Result<std::sync::Arc<Mutex<()>>, AuthError> {
 }
 
 fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
+            .create(parent)
             .map_err(|e| AuthError::OAuth(format!("failed to create auth directory: {}", e)))?;
     }
     let file_name = path
@@ -487,13 +510,15 @@ fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
         + "\n";
 
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
+    let mut created = false;
     let write_result = (|| {
         let mut file = options
             .open(&tmp)
             .map_err(|e| AuthError::OAuth(format!("failed to write temp auth file: {e}")))?;
+        created = true;
         file.write_all(payload.as_bytes())
             .map_err(|e| AuthError::OAuth(format!("failed to write auth data: {e}")))?;
         file.sync_all()
@@ -505,7 +530,12 @@ fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
         Ok(())
     })();
 
-    finish_auth_write(write_result, fs::remove_file(&tmp))
+    let cleanup = if created {
+        fs::remove_file(&tmp)
+    } else {
+        Ok(())
+    };
+    finish_auth_write(write_result, cleanup)
 }
 
 #[cfg(not(windows))]
@@ -774,7 +804,7 @@ fn refresh_from_observed(
         );
         if matches!(status.as_u16(), 400 | 401) {
             return Err(AuthError::Refresh(format!(
-                "ChatGPT OAuth refresh token is invalid; rerun codex login: {}",
+                "ChatGPT OAuth refresh token is invalid; use the native login API: {}",
                 redacted
             )));
         }
@@ -2009,13 +2039,91 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_auth_path_default() {
+    fn project_store_precedence_and_no_implicit_cli_discovery() {
         let _guard = AUTH_PATH_ENV_LOCK.lock().unwrap();
-        let previous = std::env::var_os("CODEX_HOME");
-        std::env::remove_var("CODEX_HOME");
-        let path = resolve_auth_path(None).unwrap();
-        assert!(path.to_str().unwrap().ends_with(".codex/auth.json"));
-        restore_env("CODEX_HOME", previous);
+        let names = [
+            "HOME",
+            "CODEX_HOME",
+            "CODEX_AS_API_HOME",
+            "CODEX_AS_API_AUTH_PATH",
+        ];
+        let previous: Vec<_> = names.iter().map(|name| std::env::var_os(name)).collect();
+        let home = std::env::temp_dir().join(format!("project-auth-home-{}", uuid::Uuid::new_v4()));
+        let cli = home.join(".codex");
+        let legacy = home.join("legacy-cli");
+        fs::create_dir_all(&cli).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        let jwt = format!(
+            "hdr.{}.sig",
+            URL_SAFE_NO_PAD.encode(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fake-account"}}"#
+            )
+        );
+        let data = serde_json::json!({"tokens": {"access_token": jwt, "refresh_token": "fake-refresh", "id_token": jwt}});
+        for dir in [&cli, &legacy] {
+            fs::write(dir.join("auth.json"), serde_json::to_vec(&data).unwrap()).unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CODEX_HOME", &legacy);
+        std::env::remove_var("CODEX_AS_API_HOME");
+        std::env::remove_var("CODEX_AS_API_AUTH_PATH");
+        assert_eq!(
+            resolve_auth_path(None).unwrap(),
+            home.join(".codex-as-api/auth.json")
+        );
+        assert!(matches!(load_token_data(None), Err(AuthError::Missing(_))));
+        assert_eq!(
+            load_token_data(cli.join("auth.json").to_str())
+                .unwrap()
+                .account_id,
+            "fake-account"
+        );
+        let project = home.join("project");
+        std::env::set_var("CODEX_AS_API_HOME", &project);
+        assert_eq!(resolve_auth_path(None).unwrap(), project.join("auth.json"));
+        assert!(matches!(load_token_data(None), Err(AuthError::Missing(_))));
+        let selected = home.join("selected.json");
+        std::env::set_var("CODEX_AS_API_AUTH_PATH", &selected);
+        assert_eq!(resolve_auth_path(None).unwrap(), selected);
+        assert_eq!(
+            resolve_auth_path(Some("/explicit/auth.json")).unwrap(),
+            PathBuf::from("/explicit/auth.json")
+        );
+        std::env::set_var("CODEX_AS_API_AUTH_PATH", " ");
+        assert!(resolve_auth_path(None).is_err());
+        std::env::remove_var("CODEX_AS_API_AUTH_PATH");
+        std::env::set_var("CODEX_AS_API_HOME", " ");
+        assert!(resolve_auth_path(None).is_err());
+        for (name, value) in names.iter().zip(previous) {
+            restore_env(name, value);
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_auth_directory_and_replacement_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("private-auth-{}", uuid::Uuid::new_v4()));
+        let path = base.join("nested/auth.json");
+        write_auth_json(&path, &serde_json::json!({"fake": 1})).unwrap();
+        assert_eq!(fs::metadata(&base).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            fs::metadata(base.join("nested"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        write_auth_json(&path, &serde_json::json!({"fake": 2})).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            strict_json::parse_slice(&fs::read(&path).unwrap()).unwrap()["fake"],
+            2
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -2025,7 +2133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_auth_path_expands_exact_tilde_for_explicit_and_codex_home() {
+    fn test_resolve_auth_path_expands_exact_tilde_for_explicit_and_project_home() {
         let _guard = AUTH_PATH_ENV_LOCK.lock().unwrap();
         #[cfg(not(windows))]
         let home = PathBuf::from(std::env::var_os("HOME").expect("test requires HOME"));
@@ -2037,31 +2145,37 @@ mod tests {
         );
         assert_eq!(resolve_auth_path(Some("~")).unwrap(), home);
 
-        let previous = std::env::var_os("CODEX_HOME");
-        std::env::set_var("CODEX_HOME", "~");
+        let previous = std::env::var_os("CODEX_AS_API_HOME");
+        let previous_path = std::env::var_os("CODEX_AS_API_AUTH_PATH");
+        std::env::remove_var("CODEX_AS_API_AUTH_PATH");
+        std::env::set_var("CODEX_AS_API_HOME", "~");
         assert_eq!(resolve_auth_path(None).unwrap(), home.join("auth.json"));
-        restore_env("CODEX_HOME", previous);
+        restore_env("CODEX_AS_API_HOME", previous);
+        restore_env("CODEX_AS_API_AUTH_PATH", previous_path);
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_default_auth_path_uses_userprofile_without_home() {
         let _guard = AUTH_PATH_ENV_LOCK.lock().unwrap();
-        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let previous_codex_home = std::env::var_os("CODEX_AS_API_HOME");
+        let previous_auth_path = std::env::var_os("CODEX_AS_API_AUTH_PATH");
         let previous_home = std::env::var_os("HOME");
         let previous_profile = std::env::var_os("USERPROFILE");
         let profile =
             std::env::temp_dir().join(format!("codex_windows_profile_{}", uuid::Uuid::new_v4()));
-        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("CODEX_AS_API_HOME");
+        std::env::remove_var("CODEX_AS_API_AUTH_PATH");
         std::env::remove_var("HOME");
         std::env::set_var("USERPROFILE", &profile);
 
         assert_eq!(
             resolve_auth_path(None).unwrap(),
-            profile.join(".codex").join("auth.json")
+            profile.join(".codex-as-api").join("auth.json")
         );
 
-        restore_env("CODEX_HOME", previous_codex_home);
+        restore_env("CODEX_AS_API_HOME", previous_codex_home);
+        restore_env("CODEX_AS_API_AUTH_PATH", previous_auth_path);
         restore_env("HOME", previous_home);
         restore_env("USERPROFILE", previous_profile);
     }

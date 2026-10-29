@@ -235,7 +235,7 @@ fn provider_error_response(error: &ProviderError) -> axum::response::Response {
 fn public_error_message(error: &ProviderError) -> String {
     match error {
         ProviderError::Auth(_) => {
-            "ChatGPT OAuth credentials are unavailable; rerun codex login".to_string()
+            "ChatGPT OAuth credentials are unavailable; use the native login API".to_string()
         }
         ProviderError::CatalogUnavailable(_) => {
             "authenticated model catalog is unavailable".to_string()
@@ -5467,7 +5467,7 @@ mod live_catalog_tests {
         assert_eq!(body["error"]["type"], "authentication_error");
         assert_eq!(
             body["error"]["message"],
-            "ChatGPT OAuth credentials are unavailable; rerun codex login"
+            "ChatGPT OAuth credentials are unavailable; use the native login API"
         );
         assert!(!body.to_string().contains(auth_path.to_str().unwrap()));
 

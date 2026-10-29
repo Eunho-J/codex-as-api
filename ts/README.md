@@ -2,19 +2,17 @@
 
 Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
-## Prerequisite
+## Authentication
 
-Install the official Codex CLI and sign in once so `~/.codex/auth.json` exists:
+Credentials are stored separately in `~/.codex-as-api/auth.json`, or in
+`auth.json` under `CODEX_AS_API_HOME`. `CODEX_AS_API_AUTH_PATH` explicitly
+selects a different project store. The proxy does not automatically read or
+import the Codex CLI credential file. A standalone login API is planned but is
+not yet available in this development version.
 
-```bash
-npm install -g @openai/codex
-codex login
-```
-
-The standalone proxy accepts only Codex-managed credentials: a nested `tokens`
-object with `auth_mode` equal to `chatgpt`, `null`, or absent. External
-`chatgptAuthTokens` files require a host refresh bridge and are rejected rather
-than being refreshed or rewritten as managed credentials.
+The store accepts a nested `tokens` object with `auth_mode` equal to `chatgpt`,
+`null`, or absent. External `chatgptAuthTokens` files require a host refresh
+bridge and are rejected rather than being refreshed or rewritten.
 
 ## Install and run
 

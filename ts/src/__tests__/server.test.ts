@@ -596,7 +596,7 @@ describe("server error handling", () => {
         assert.equal(response.status, 401);
         const text = await response.text();
         assert.equal(
-          text.includes("ChatGPT OAuth credentials are unavailable; rerun codex login"),
+          text.includes("ChatGPT OAuth credentials are unavailable; use the codex-as-api login API"),
           true,
         );
         assert.equal(text.includes(secret), false);
@@ -625,7 +625,7 @@ describe("server error handling", () => {
         assert.equal(response.status, 200);
         const text = await response.text();
         assert.equal(
-          text.includes("ChatGPT OAuth credentials are unavailable; rerun codex login"),
+          text.includes("ChatGPT OAuth credentials are unavailable; use the codex-as-api login API"),
           true,
         );
         assert.equal(text.includes(secret), false);
@@ -1555,7 +1555,7 @@ describe("server model defaults", () => {
           const response = await fetch(`${baseUrl}/v1/models`);
           assert.equal(response.status, 401);
           const text = await response.text();
-          assert.equal(text.includes("rerun codex login"), true);
+          assert.equal(text.includes("use the codex-as-api login API"), true);
           assert.equal(text.includes(directory), false);
           assert.equal(text.includes(authJsonPath), false);
         }, { authPath: authJsonPath });

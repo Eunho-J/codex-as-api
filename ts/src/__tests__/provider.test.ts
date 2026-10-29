@@ -1500,10 +1500,10 @@ describe("ChatGPTOAuthProvider payload", () => {
     assert.equal(child.prompt_cache_key, "session-root");
   });
 
-  it("derives installation identity from the CODEX_HOME auth path", () => {
-    const previousCodexHome = process.env.CODEX_HOME;
+  it("derives installation identity from the project auth path", () => {
+    const previousCodexHome = process.env.CODEX_AS_API_HOME;
     const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-metadata-home-"));
-    process.env.CODEX_HOME = codexHome;
+    process.env.CODEX_AS_API_HOME = codexHome;
     try {
       const options = {
         model: "gpt-5.5",
@@ -1525,8 +1525,8 @@ describe("ChatGPTOAuthProvider payload", () => {
         explicit["x-codex-installation-id"],
       );
     } finally {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_AS_API_HOME;
+      else process.env.CODEX_AS_API_HOME = previousCodexHome;
       fs.rmSync(codexHome, { recursive: true, force: true });
     }
   });

@@ -223,7 +223,7 @@ def _error_status(exc: BaseException) -> int:
 
 def _public_error_message(exc: BaseException) -> str:
     if isinstance(exc, (ChatGPTOAuthMissingError, ChatGPTOAuthRefreshError)):
-        return "ChatGPT OAuth credentials are unavailable; rerun codex login"
+        return "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
     if isinstance(exc, (ChatGPTOAuthInvalidRequestError, ChatGPTOAuthModelNotFoundError)):
         return str(exc)
     if isinstance(exc, ChatGPTOAuthCatalogUnavailableError):

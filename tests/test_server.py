@@ -4030,12 +4030,16 @@ def test_chat_completions_missing_auth_returns_auth_error(
     body = resp.json()
     assert "error" in body
     assert body["error"]["type"] == "authentication_error"
-    assert body["error"]["message"] == ("ChatGPT OAuth credentials are unavailable; rerun codex login")
+    assert body["error"]["message"] == (
+        "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
+    )
     assert missing_auth_path not in resp.text
 
     models = client.get("/v1/models")
     assert models.status_code == 401
-    assert models.json()["error"]["message"] == ("ChatGPT OAuth credentials are unavailable; rerun codex login")
+    assert models.json()["error"]["message"] == (
+        "ChatGPT OAuth credentials are unavailable; sign in using the codex-as-api login API"
+    )
     assert missing_auth_path not in models.text
 
 

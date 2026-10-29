@@ -37,17 +37,25 @@ from codex_as_api.auth import (
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_auth_path_default():
-    path = resolve_auth_path(None)
-    assert path == pathlib.Path("~/.codex/auth.json").expanduser()
+def test_resolve_auth_path_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_AS_API_HOME", raising=False)
+    monkeypatch.delenv("CODEX_AS_API_AUTH_PATH", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "legacy"))
+    assert resolve_auth_path(None) == tmp_path / ".codex-as-api" / "auth.json"
 
 
-def test_resolve_auth_path_codex_home_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    path = resolve_auth_path(None)
-    assert path == tmp_path / "auth.json"
+def test_resolve_auth_path_project_home_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("CODEX_AS_API_AUTH_PATH", raising=False)
+    monkeypatch.setenv("CODEX_AS_API_HOME", str(tmp_path))
+    assert resolve_auth_path(None) == tmp_path / "auth.json"
+
+
+def test_resolve_auth_path_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_AS_API_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_AS_API_AUTH_PATH", str(tmp_path / "override.json"))
+    assert resolve_auth_path() == tmp_path / "override.json"
+    assert resolve_auth_path(str(tmp_path / "explicit.json")) == tmp_path / "explicit.json"
 
 
 def test_resolve_auth_path_explicit(tmp_path):
@@ -71,12 +79,56 @@ def test_resolve_auth_path_rejects_empty_explicit_path(value):
 
 
 @pytest.mark.parametrize("value", ["", "   "])
-def test_resolve_auth_path_rejects_empty_codex_home(monkeypatch, value):
-    monkeypatch.setenv("CODEX_HOME", value)
+def test_resolve_auth_path_rejects_empty_project_home(monkeypatch, value):
+    monkeypatch.delenv("CODEX_AS_API_AUTH_PATH", raising=False)
+    monkeypatch.setenv("CODEX_AS_API_HOME", value)
 
     with pytest.raises(ValueError) as caught:
         resolve_auth_path(None)
-    assert "CODEX_HOME" in str(caught.value)
+    assert "CODEX_AS_API_HOME" in str(caught.value)
+
+
+def test_empty_home_never_reads_legacy_or_invokes_cli(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    monkeypatch.delenv("CODEX_AS_API_AUTH_PATH", raising=False)
+    monkeypatch.delenv("CODEX_AS_API_HOME", raising=False)
+    legacy = tmp_path / ".codex" / "auth.json"
+    legacy.parent.mkdir()
+    legacy.write_text('{"tokens": {"access_token": "fake-legacy"}}')
+    original_read = pathlib.Path.read_text
+    reads = []
+
+    def observed_read(path, *args, **kwargs):
+        reads.append(path)
+        assert path != legacy
+        return original_read(path, *args, **kwargs)
+
+    def forbidden_cli(*args, **kwargs):
+        pytest.fail("unexpected subprocess")
+
+    monkeypatch.setattr(pathlib.Path, "read_text", observed_read)
+    monkeypatch.setattr(subprocess, "Popen", forbidden_cli)
+    with pytest.raises(ChatGPTOAuthMissingError):
+        load_token_data()
+    assert reads == [tmp_path / ".codex-as-api" / "auth.json"]
+    assert legacy.read_bytes() == b'{"tokens": {"access_token": "fake-legacy"}}'
+
+
+def test_auth_store_atomic_private_write(tmp_path):
+    import os
+    import stat
+
+    target = tmp_path / "private" / "auth.json"
+    _write_auth_json(target, {"tokens": {"refresh_token": "fake-one"}})
+    _write_auth_json(target, {"tokens": {"refresh_token": "fake-two"}})
+    assert json.loads(target.read_text())["tokens"]["refresh_token"] == "fake-two"
+    assert list(target.parent.iterdir()) == [target]
+    if os.name != "nt":
+        assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
