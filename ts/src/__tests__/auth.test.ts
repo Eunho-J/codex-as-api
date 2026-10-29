@@ -1286,6 +1286,31 @@ describe("OAuth refresh coordination", () => {
     }
   });
 
+  it("preserves the existing store when refreshed credentials fail merged validation", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-refresh-validation-"));
+    const claims = { "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" } };
+    const filePath = writeAuthJson(dir, { tokens: {
+      access_token: makeJwt({ exp: 1, ...claims }),
+      refresh_token: "refresh-old",
+      id_token: makeJwt(claims),
+    } });
+    const original = fs.readFileSync(filePath);
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      access_token: makeJwt({ exp: "invalid", ...claims }),
+      refresh_token: "refresh-new",
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+      await assert.rejects(refreshToken(filePath), (error: unknown) =>
+        error instanceof ChatGPTOAuthProtocolError && error.message === "ChatGPT OAuth token refresh returned invalid credentials");
+      assert.deepEqual(fs.readFileSync(filePath), original);
+      assert.equal(loadTokenData(filePath).refresh_token, "refresh-old");
+    } finally {
+      globalThis.fetch = previousFetch;
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
+
   it("redacts account IDs from refresh failures", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auth-redaction-test-"));
     const claims = { "https://api.openai.com/auth": { chatgpt_account_id: "acct-secret" } };
@@ -1301,7 +1326,7 @@ describe("OAuth refresh coordination", () => {
         refreshToken(filePath),
         (error: unknown) => error instanceof ChatGPTOAuthRefreshError
           && !error.message.includes("acct-secret")
-          && error.message.includes("account=***"),
+          && !error.message.includes("account="),
       );
     } finally {
       globalThis.fetch = previousFetch;

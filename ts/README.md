@@ -7,9 +7,27 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 Credentials are stored separately in `~/.codex-as-api/auth.json`, or in
 `auth.json` under `CODEX_AS_API_HOME`. `CODEX_AS_API_AUTH_PATH` explicitly
 selects a different project store. The proxy does not automatically read or
-import the Codex CLI credential file. A standalone login API is planned but is
-not yet available in this development version.
+import the Codex CLI credential file. Run only one server process per store.
 
+Set a strong, independent `CODEX_AS_API_ADMIN_KEY` before starting the server;
+management routes are disabled if it is unset. Use that key as a Bearer token
+for `POST /auth/login` (empty body, `{}`, or `{"method":"browser"}`). Open the
+returned `auth_url` in your browser; the server does not open it for you. The
+browser returns to a local callback on 127.0.0.1:1455, or 1457 if needed. For
+headless or remote login explicitly send `{"method":"device"}`, then open its
+`verification_url` and enter its `user_code` yourself. Treat authorization URLs
+and device codes as private. Poll `GET /auth/login/{id}` for `pending`, `succeeded`, `failed`,
+`cancelled`, or `expired`; use `DELETE /auth/login/{id}` to cancel. A supplied
+browser Origin must match the server's own scheme and host. All management
+responses are `no-store`; do not send credentials or endpoint overrides to them.
+`GET /auth/status` reports only local credential availability and does not
+verify provider-side validity.
+
+`login_storage_error` indicates the new login could not be stored.
+`login_persistence_uncertain` means replacement occurred but durable storage
+could not be confirmed; the new credentials may already be visible. Check local
+status and retry login if needed rather than assuming the old store survived.
+A failed or cancelled attempt does not automatically log out an existing user.
 The store accepts a nested `tokens` object with `auth_mode` equal to `chatgpt`,
 `null`, or absent. External `chatgptAuthTokens` files require a host refresh
 bridge and are rejected rather than being refreshed or rewritten.

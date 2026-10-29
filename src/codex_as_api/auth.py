@@ -1,3 +1,9 @@
+"""Project credential storage and refresh, modified for standalone login.
+
+Login token handling follows OpenAI Codex rust-v0.164.0, including
+codex-rs/login/src/oauth/client.rs (Apache-2.0); see third-party notices.
+The private store and its generation/commit protections are project-specific.
+"""
 from __future__ import annotations
 
 import base64
@@ -17,6 +23,8 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Callable
 from typing import Any, cast
 
 from .strict_json import JS_SAFE_INTEGER, strict_json_loads
@@ -40,6 +48,8 @@ _SECRET_KEYS = (
 
 _REFRESH_LOCKS: dict[pathlib.Path, threading.Lock] = {}
 _REFRESH_LOCKS_GUARD = threading.Lock()
+_WRITE_LOCKS: dict[pathlib.Path, threading.Lock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -149,6 +159,7 @@ class ChatGPTTokenData:
     user_id: str | None
     fedramp: bool
     access_expires_at: _dt.datetime | None
+    login_generation: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -262,6 +273,9 @@ def load_token_data(auth_json_path: str | pathlib.Path | None = None) -> ChatGPT
 def _token_data_from_document(data: object, path: pathlib.Path) -> ChatGPTTokenData:
     if not isinstance(data, dict):
         raise ChatGPTOAuthMissingError("ChatGPT OAuth auth file root must be an object")
+    generation = data.get("_login_generation")
+    if generation is not None and (not isinstance(generation, str) or not generation):
+        raise ChatGPTOAuthMissingError("ChatGPT OAuth login generation is invalid")
     mode = data.get("auth_mode")
     if mode is not None and (not isinstance(mode, str) or mode != "chatgpt"):
         raise ChatGPTOAuthMissingError("ChatGPT OAuth auth_mode is unsupported")
@@ -341,6 +355,7 @@ def _token_data_from_document(data: object, path: pathlib.Path) -> ChatGPTTokenD
         user_id=user,
         fedramp=fedramp,
         access_expires_at=_expiration(access_token),
+        login_generation=generation,
     )
 
 
@@ -395,18 +410,56 @@ def _refresh_lock(path: pathlib.Path) -> threading.Lock:
         return lock
 
 
-def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+def _write_lock(path: pathlib.Path) -> threading.Lock:
+    resolved = path.expanduser().resolve()
+    with _WRITE_LOCKS_GUARD:
+        return _WRITE_LOCKS.setdefault(resolved, threading.Lock())
+
+
+def commit_login(
+    path: pathlib.Path, payload: dict[str, Any], guard: Callable[[], bool] | None = None
+) -> bool:
+    """Validate and atomically store fresh credentials, fenced from old refreshes."""
+    document = {
+        "auth_mode": "chatgpt",
+        "tokens": {key: payload.get(key) for key in ("access_token", "refresh_token", "id_token")},
+        "_login_generation": uuid.uuid4().hex,
+    }
+    _token_data_from_document(document, path)
+    with _write_lock(path):
+        try:
+            _write_auth_json(path, document, before_replace=guard)
+        except _LoginCommitCancelledError:
+            return False
+    return True
+
+
+class _LoginCommitCancelledError(Exception):
+    pass
+
+
+class AuthDurabilityUnknownError(OSError):
+    """Replacement occurred, but its directory durability could not be confirmed."""
+
+
+def _write_auth_json(
+    path: pathlib.Path, data: dict[str, Any], *, before_replace: Callable[[], bool] | None = None
+) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
     tmp = pathlib.Path(tmp_name)
     failure: BaseException | None = None
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
+        if before_replace is not None and not before_replace():
+            raise _LoginCommitCancelledError()
         tmp.replace(path)
+        replaced = True
         if os.name != "nt":
             dir_fd = os.open(path.parent, os.O_RDONLY)
             try:
@@ -414,7 +467,10 @@ def _write_auth_json(path: pathlib.Path, data: dict[str, Any]) -> None:
             finally:
                 os.close(dir_fd)
     except BaseException as exc:
-        failure = exc
+        failure = (
+            AuthDurabilityUnknownError("Credential replacement durability is unknown")
+            if replaced and isinstance(exc, Exception) else exc
+        )
     try:
         tmp.unlink(missing_ok=True)
     except FileNotFoundError:
@@ -443,6 +499,8 @@ def refresh_token(auth_json_path: str | pathlib.Path | None = None) -> ChatGPTTo
 def _fail_if_account_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> None:
     if current.account_id != latest.account_id:
         raise ChatGPTOAuthRefreshError("ChatGPT OAuth account changed while refreshing credentials")
+    if current.login_generation != latest.login_generation:
+        raise ChatGPTOAuthRefreshError("ChatGPT OAuth login changed while refreshing credentials")
 
 
 def _access_token_changed(current: ChatGPTTokenData, latest: ChatGPTTokenData) -> bool:
@@ -525,41 +583,22 @@ def _refresh_token(current: ChatGPTTokenData, *, refresh_if_expiring: bool) -> C
             with _urlopen_no_redirect(request, timeout=REFRESH_TIMEOUT_SECONDS) as response:
                 payload = strict_json_loads(_read_response_before_deadline(response, deadline))
         except urllib.error.HTTPError as exc:
-            try:
-                text = _read_response_before_deadline(exc, deadline).decode("utf-8", "replace")
-            except (OSError, ValueError, TimeoutError, http.client.HTTPException):
-                text = "could not read upstream refresh error body"
-            redacted = redact_text(
-                text,
-                current.access_token,
-                current.refresh_token,
-                current.id_token,
-                current.account_id,
-            )
-            if exc.code in {400, 401}:
+            status = exc.code
+            exc.close()
+            if status in {400, 401}:
                 raise ChatGPTOAuthRefreshError(
-                    f"ChatGPT OAuth refresh token is invalid; sign in using the codex-as-api login API: {redacted}"
-                ) from exc
-            raise ChatGPTOAuthUpstreamError(
-                exc.code,
-                f"ChatGPT OAuth token refresh failed: HTTP {exc.code}: {redacted}",
-            ) from exc
+                    "ChatGPT OAuth refresh token is invalid; sign in using the codex-as-api login API"
+                ) from None
+            raise ChatGPTOAuthUpstreamError(status, f"ChatGPT OAuth token refresh failed: HTTP {status}") from None
         except (
             urllib.error.URLError,
             TimeoutError,
             OSError,
             http.client.HTTPException,
-        ) as exc:
-            redacted = redact_text(
-                str(exc),
-                current.access_token,
-                current.refresh_token,
-                current.id_token,
-                current.account_id,
-            )
-            raise ChatGPTOAuthUpstreamError(502, f"ChatGPT OAuth token refresh failed: {redacted}") from exc
-        except (UnicodeError, ValueError) as exc:
-            raise ChatGPTOAuthProtocolError("ChatGPT OAuth token refresh returned invalid JSON") from exc
+        ):
+            raise ChatGPTOAuthUpstreamError(502, "ChatGPT OAuth token refresh failed") from None
+        except (UnicodeError, ValueError):
+            raise ChatGPTOAuthProtocolError("ChatGPT OAuth token refresh returned invalid JSON") from None
         if not isinstance(payload, dict):
             raise ChatGPTOAuthProtocolError("ChatGPT OAuth token refresh returned invalid JSON")
         access_token = payload.get("access_token")
@@ -575,27 +614,32 @@ def _refresh_token(current: ChatGPTTokenData, *, refresh_if_expiring: bool) -> C
                 raise ChatGPTOAuthProtocolError(f"ChatGPT OAuth token refresh response has invalid {name}")
         _validate_refreshed_token_accounts(payload, current.account_id)
 
-        try:
-            data = strict_json_loads(current.auth_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("failed to re-read ChatGPT OAuth auth file") from exc
-        try:
-            exact = _token_data_from_document(data, current.auth_path)
-        except ChatGPTOAuthError as exc:
-            raise RuntimeError("ChatGPT OAuth auth file changed to an invalid schema") from exc
-        _fail_if_account_changed(current, exact)
-        if _access_token_changed(current, exact):
-            return exact
-        if _other_credentials_changed(current, exact):
-            raise ChatGPTOAuthRefreshError("ChatGPT OAuth credentials changed while token refresh was in flight")
-        tokens = data.get("tokens")
-        if not isinstance(tokens, dict):
-            raise RuntimeError("ChatGPT OAuth auth file changed to an invalid schema")
-        if payload.get("id_token"):
-            tokens["id_token"] = payload["id_token"]
-        tokens["access_token"] = access_token
-        if payload.get("refresh_token"):
-            tokens["refresh_token"] = payload["refresh_token"]
-        data["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        _write_auth_json(current.auth_path, data)
-        return load_token_data(current.auth_path)
+        with _write_lock(current.auth_path):
+            try:
+                data = strict_json_loads(current.auth_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("failed to re-read ChatGPT OAuth auth file") from exc
+            try:
+                exact = _token_data_from_document(data, current.auth_path)
+            except ChatGPTOAuthError as exc:
+                raise RuntimeError("ChatGPT OAuth auth file changed to an invalid schema") from exc
+            _fail_if_account_changed(current, exact)
+            if _access_token_changed(current, exact):
+                return exact
+            if _other_credentials_changed(current, exact):
+                raise ChatGPTOAuthRefreshError("ChatGPT OAuth credentials changed while token refresh was in flight")
+            tokens = data.get("tokens")
+            if not isinstance(tokens, dict):
+                raise RuntimeError("ChatGPT OAuth auth file changed to an invalid schema")
+            if payload.get("id_token"):
+                tokens["id_token"] = payload["id_token"]
+            tokens["access_token"] = access_token
+            if payload.get("refresh_token"):
+                tokens["refresh_token"] = payload["refresh_token"]
+            data["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            try:
+                validated = _token_data_from_document(data, current.auth_path)
+            except ChatGPTOAuthError as exc:
+                raise ChatGPTOAuthProtocolError("ChatGPT OAuth token refresh returned invalid credentials") from exc
+            _write_auth_json(current.auth_path, data)
+            return validated

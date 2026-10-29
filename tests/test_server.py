@@ -6652,7 +6652,7 @@ def test_dynamic_npm_version_resolver_updates_models_query_user_agent_and_cold_f
     responses_req_1 = recording_backend.requests.get(timeout=1)
     assert catalog_req_1["path"] == "/models?client_version=0.175.2"
     assert catalog_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
-    assert catalog_req_1["headers"]["user-agent"].endswith(") codex-as-api/0.9.6")
+    assert catalog_req_1["headers"]["user-agent"].endswith(") codex-as-api/0.10.0")
     assert responses_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
 
     active_version = "0.176.0"

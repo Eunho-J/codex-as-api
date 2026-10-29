@@ -1,5 +1,30 @@
 # Release Notes
 
+## v0.10.0
+
+### Standalone browser login — no Codex installation required
+
+- Python, TypeScript and Rust now own their ChatGPT OAuth login and refresh
+  lifecycle. `POST /auth/login` starts ordinary browser OAuth with PKCE and a
+  loopback callback by default. The trusted application opens the returned
+  `auth_url`; progress and cancellation are available through the management API.
+- Use `CODEX_AS_API_ADMIN_KEY` as the independent management bearer credential.
+  Management is disabled without it; status responses never export OAuth tokens.
+- Credentials are privately and atomically stored in
+  `CODEX_AS_API_AUTH_PATH`, `CODEX_AS_API_HOME/auth.json`, or
+  `~/.codex-as-api/auth.json`. Existing Codex credentials are neither discovered
+  nor imported. **Upgrading requires signing in once for codex-as-api.**
+- Explicit `{"method":"device"}` remains available for remote/headless servers.
+  There is no silent fallback between login methods. Ordinary browser login
+  expects the browser and server to run on the same machine, using registered
+  callback port 1455 or 1457.
+- Cancellation, expiry and failures before replacement preserve the previous
+  login. A post-replacement durability failure is reported separately, and an
+  already committed login is not rolled back by cancellation. Local status is
+  not a provider-side validity or revocation check.
+- Preserve the pinned OpenAI Codex Apache-2.0 attribution in distributed artifacts.
+  Model configuration and existing inference/Realtime behavior are unchanged.
+
 ## v0.9.6
 
 ### Sideband join failure says why

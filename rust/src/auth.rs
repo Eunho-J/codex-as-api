@@ -1,3 +1,6 @@
+//! OAuth client identity and token handling informed by OpenAI Codex
+//! rust-v0.164.0 `codex-rs/login/src/oauth/client.rs`, Apache-2.0.
+//! Project credentials are stored separately; no Codex CLI credentials are imported.
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
@@ -40,6 +43,10 @@ pub enum AuthError {
     RefreshProtocol(String),
     #[error("{0}")]
     Internal(String),
+    #[error("device login deadline expired")]
+    LoginExpired,
+    #[error("credential persistence uncertain: {0}")]
+    PersistenceUncertain(String),
     #[error("{primary}; temporary auth file cleanup also failed: {cleanup}")]
     WriteCleanup {
         primary: Box<AuthError>,
@@ -56,6 +63,8 @@ pub struct ChatGPTTokenData {
     pub account_id: String,
     pub fedramp: bool,
     pub access_expires_at: Option<DateTime<Utc>>,
+    // A fresh login gets a new owner even when the provider returns identical tokens.
+    pub login_generation: Option<String>,
 }
 
 fn is_ascii_visible_token(value: &str) -> bool {
@@ -408,6 +417,10 @@ fn token_data_from_document(data: &Value, path: PathBuf) -> Result<ChatGPTTokenD
         account_id,
         fedramp,
         access_expires_at,
+        login_generation: obj
+            .get("login_generation")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -475,6 +488,102 @@ pub fn is_auth_locally_available(auth_json_path: Option<&str>) -> bool {
     }
 }
 
+/// Local state only; it does not establish issuer-side validity or revocation.
+pub fn local_auth_status(auth_json_path: Option<&str>) -> &'static str {
+    let path = match resolve_auth_path(auth_json_path) {
+        Ok(path) => path,
+        Err(_) => return "reauthentication_required",
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "unauthenticated",
+        Err(_) => return "reauthentication_required",
+    };
+    match strict_json::parse_str(&raw)
+        .and_then(|data| token_data_from_document(&data, path).map_err(|_| String::new()))
+    {
+        Ok(_) => "authenticated",
+        Err(_) => "reauthentication_required",
+    }
+}
+
+/// Handle valid only inside `with_login_store_lock`. Caller must hold its session
+/// state lock while checking cancellation/deadline and committing, so cancellation
+/// cannot race the durable write. Never perform network operations in the closure.
+pub struct LoginStore<'a> {
+    path: &'a Path,
+}
+
+impl LoginStore<'_> {
+    /// Validate a provider token response and atomically durably replace the store.
+    /// An error after atomic replacement (e.g. directory sync failure) means the
+    /// new credentials may already be visible, but durability is not established.
+    #[cfg(test)]
+    pub fn commit(&self, tokens: &Value) -> Result<(), AuthError> {
+        self.commit_guarded(tokens, || Ok(()))
+    }
+
+    /// Reject an expired login immediately before atomic replacement. The caller
+    /// must still hold the session lock to fence cancellation through commit.
+    pub fn commit_before(
+        &self,
+        tokens: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), AuthError> {
+        self.commit_guarded(tokens, || {
+            if tokio::time::Instant::now() >= deadline {
+                Err(AuthError::LoginExpired)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn commit_guarded(
+        &self,
+        tokens: &Value,
+        before_replace: impl FnOnce() -> Result<(), AuthError>,
+    ) -> Result<(), AuthError> {
+        let data = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "login_generation": uuid::Uuid::new_v4().to_string(),
+            "tokens": tokens,
+        });
+        token_data_from_document(&data, self.path.to_path_buf())?;
+        write_auth_json_guarded(self.path, &data, before_replace).map_err(login_write_error)
+    }
+}
+
+fn login_write_error(error: AuthError) -> AuthError {
+    fn uncertain(error: &AuthError) -> bool {
+        match error {
+            AuthError::PersistenceUncertain(_) => true,
+            AuthError::WriteCleanup { primary, .. } => uncertain(primary),
+            _ => false,
+        }
+    }
+    if uncertain(&error) {
+        AuthError::PersistenceUncertain("failed to durably write project credentials".to_string())
+    } else if matches!(error, AuthError::LoginExpired) {
+        AuthError::LoginExpired
+    } else {
+        AuthError::Internal("failed to durably write project credentials".to_string())
+    }
+}
+
+/// Serialize a new-login commit with refreshes for this store. Recheck the login
+/// deadline and cancellation in `f` after this lock is acquired.
+pub fn with_login_store_lock<T>(
+    path: &Path,
+    f: impl FnOnce(&LoginStore<'_>) -> Result<T, AuthError>,
+) -> Result<T, AuthError> {
+    let lock = refresh_lock(path)?;
+    let _guard = lock
+        .lock()
+        .map_err(|_| AuthError::Internal("OAuth store lock is poisoned".to_string()))?;
+    f(&LoginStore { path })
+}
+
 fn refresh_lock(path: &Path) -> Result<std::sync::Arc<Mutex<()>>, AuthError> {
     let resolved = path.to_path_buf();
     let mut locks = REFRESH_LOCKS
@@ -487,6 +596,30 @@ fn refresh_lock(path: &Path) -> Result<std::sync::Arc<Mutex<()>>, AuthError> {
 }
 
 fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
+    write_auth_json_guarded(path, data, || Ok(()))
+}
+
+fn write_auth_json_guarded(
+    path: &Path,
+    data: &Value,
+    before_replace: impl FnOnce() -> Result<(), AuthError>,
+) -> Result<(), AuthError> {
+    write_auth_json_with_sync(
+        path,
+        data,
+        before_replace,
+        |file| file.sync_all(),
+        sync_auth_directory,
+    )
+}
+
+fn write_auth_json_with_sync(
+    path: &Path,
+    data: &Value,
+    before_replace: impl FnOnce() -> Result<(), AuthError>,
+    sync_file: impl FnOnce(&fs::File) -> std::io::Result<()>,
+    sync_directory: impl FnOnce(&Path) -> Result<(), AuthError>,
+) -> Result<(), AuthError> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -521,12 +654,13 @@ fn write_auth_json(path: &Path, data: &Value) -> Result<(), AuthError> {
         created = true;
         file.write_all(payload.as_bytes())
             .map_err(|e| AuthError::OAuth(format!("failed to write auth data: {e}")))?;
-        file.sync_all()
-            .map_err(|e| AuthError::OAuth(format!("failed to sync auth data: {e}")))?;
+        sync_file(&file).map_err(|e| AuthError::OAuth(format!("failed to sync auth data: {e}")))?;
         drop(file);
 
+        before_replace()?;
         replace_auth_file(&tmp, path)?;
-        sync_auth_directory(path)?;
+        created = false;
+        sync_directory(path).map_err(|error| AuthError::PersistenceUncertain(error.to_string()))?;
         Ok(())
     })();
 
@@ -743,7 +877,9 @@ fn refresh_from_observed(
 
     let latest = load_token_data(current.auth_path.to_str())?;
     fail_if_account_changed(&current, &latest)?;
-    if access_token_changed(&current, &latest) {
+    if current.login_generation != latest.login_generation
+        || access_token_changed(&current, &latest)
+    {
         return Ok(latest);
     }
     if refresh_if_expiring && !latest.expires_within_refresh_window() {
@@ -790,30 +926,16 @@ fn refresh_from_observed(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response
-            .text()
-            .unwrap_or_else(|_| "could not read upstream error body".to_string());
-        let redacted = redact_text(
-            &body_text,
-            &[
-                &current.access_token,
-                &current.refresh_token,
-                &current.id_token,
-                &current.account_id,
-            ],
-        );
         if matches!(status.as_u16(), 400 | 401) {
-            return Err(AuthError::Refresh(format!(
-                "ChatGPT OAuth refresh token is invalid; use the native login API: {}",
-                redacted
-            )));
+            return Err(AuthError::Refresh(
+                "ChatGPT OAuth refresh token is invalid; use the native login API".to_string(),
+            ));
         }
         return Err(AuthError::RefreshUpstreamHttp {
             status: status.as_u16(),
             message: format!(
-                "ChatGPT OAuth token refresh failed: HTTP {}: {}",
-                status.as_u16(),
-                redacted
+                "ChatGPT OAuth token refresh failed: HTTP {}",
+                status.as_u16()
             ),
         });
     }
@@ -896,7 +1018,7 @@ fn persist_refresh_payload(
         AuthError::Internal("ChatGPT OAuth auth file changed to an invalid schema".to_string())
     })?;
     fail_if_account_changed(current, &exact)?;
-    if access_token_changed(current, &exact) {
+    if current.login_generation != exact.login_generation || access_token_changed(current, &exact) {
         return Ok(exact);
     }
     if other_credentials_changed(current, &exact) {
@@ -957,6 +1079,175 @@ mod tests {
     use std::io::Write;
 
     static AUTH_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn login_deadline_guard_runs_after_temp_sync_and_preserves_existing_store() {
+        let dir = std::env::temp_dir().join(format!("login-deadline-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(&path, b"previous").unwrap();
+        let jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}"#)
+        );
+        let tokens =
+            serde_json::json!({"access_token":jwt,"id_token":jwt,"refresh_token":"refresh"});
+        let result = with_login_store_lock(&path, |store| {
+            store.commit_guarded(&tokens, || {
+                assert_eq!(fs::read(&path).unwrap(), b"previous");
+                assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+                Err(AuthError::LoginExpired)
+            })
+        });
+        assert!(matches!(result, Err(AuthError::LoginExpired)));
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(matches!(
+            with_login_store_lock(&path, |store| store
+                .commit_before(&tokens, tokio::time::Instant::now())),
+            Err(AuthError::LoginExpired)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        with_login_store_lock(&path, |store| {
+            store.commit_before(
+                &tokens,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+        })
+        .unwrap();
+        assert_eq!(local_auth_status(path.to_str()), "authenticated");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn injected_file_sync_failure_preserves_valid_previous_credentials() {
+        let dir = std::env::temp_dir().join(format!("auth-sync-failure-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("auth.json");
+        let jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}"#)
+        );
+        let old = serde_json::json!({"access_token": jwt, "id_token": jwt, "refresh_token": "old-refresh"});
+        with_login_store_lock(&path, |store| store.commit(&old)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let new = serde_json::json!({"auth_mode": "chatgpt", "tokens": {
+            "access_token": jwt, "id_token": jwt, "refresh_token": "new-refresh"
+        }});
+        let result = write_auth_json_with_sync(
+            &path,
+            &new,
+            || Ok(()),
+            |_| Err(std::io::Error::other("injected file sync failure")),
+            |_| panic!("directory sync must not run before replacement"),
+        );
+        assert!(
+            matches!(result, Err(AuthError::OAuth(ref message)) if message.contains("injected file sync failure"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(local_auth_status(path.to_str()), "authenticated");
+        assert_eq!(
+            load_token_data(path.to_str()).unwrap().refresh_token,
+            "old-refresh"
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn login_write_error_preserves_nested_uncertainty() {
+        let error = AuthError::WriteCleanup {
+            primary: Box::new(AuthError::WriteCleanup {
+                primary: Box::new(AuthError::PersistenceUncertain("private detail".into())),
+                cleanup: std::io::Error::other("cleanup"),
+            }),
+            cleanup: std::io::Error::other("outer cleanup"),
+        };
+        let classified = login_write_error(error);
+        assert!(
+            matches!(classified, AuthError::PersistenceUncertain(ref message) if !message.contains("private detail"))
+        );
+    }
+
+    #[test]
+    fn injected_directory_sync_failure_reports_error_after_new_credentials_visible() {
+        let dir =
+            std::env::temp_dir().join(format!("auth-dir-sync-failure-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("auth.json");
+        let jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}"#)
+        );
+        let old = serde_json::json!({"access_token": jwt, "id_token": jwt, "refresh_token": "old-refresh"});
+        with_login_store_lock(&path, |store| store.commit(&old)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let new = serde_json::json!({"auth_mode": "chatgpt", "tokens": {
+            "access_token": jwt, "id_token": jwt, "refresh_token": "new-refresh"
+        }});
+        let result = write_auth_json_with_sync(
+            &path,
+            &new,
+            || Ok(()),
+            |file| file.sync_all(),
+            |_| {
+                Err(AuthError::OAuth(
+                    "injected directory sync failure".to_string(),
+                ))
+            },
+        );
+        assert!(
+            matches!(result, Err(AuthError::PersistenceUncertain(ref message)) if message.contains("injected directory sync failure"))
+        );
+        assert_ne!(fs::read(&path).unwrap(), before);
+        assert_eq!(local_auth_status(path.to_str()), "authenticated");
+        assert_eq!(
+            load_token_data(path.to_str()).unwrap().refresh_token,
+            "new-refresh"
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn login_commit_validates_and_fences_identical_old_credentials() {
+        let dir = std::env::temp_dir().join(format!("login-store-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("auth.json");
+        let jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}"#)
+        );
+        let tokens =
+            serde_json::json!({"access_token":jwt,"id_token":jwt,"refresh_token":"refresh"});
+        assert_eq!(local_auth_status(path.to_str()), "unauthenticated");
+        with_login_store_lock(&path, |store| store.commit(&tokens)).unwrap();
+        let observed = load_token_data(path.to_str()).unwrap();
+        assert_eq!(local_auth_status(path.to_str()), "authenticated");
+        let before = fs::read(&path).unwrap();
+        assert!(
+            with_login_store_lock(&path, |store| store.commit(&serde_json::json!({}))).is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        with_login_store_lock(&path, |store| store.commit(&tokens)).unwrap();
+        let fresh = load_token_data(path.to_str()).unwrap();
+        assert_ne!(observed.login_generation, fresh.login_generation);
+        let returned =
+            persist_refresh_payload(&observed, &serde_json::json!({"access_token": jwt}), &jwt)
+                .unwrap();
+        assert_eq!(returned.login_generation, fresh.login_generation);
+        assert_eq!(
+            load_token_data(path.to_str()).unwrap().login_generation,
+            fresh.login_generation
+        );
+        fs::write(&path, b"invalid").unwrap();
+        assert_eq!(
+            local_auth_status(path.to_str()),
+            "reauthentication_required"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
         match value {
@@ -1711,6 +2002,7 @@ mod tests {
             account_id: "acc".to_string(),
             fedramp: false,
             access_expires_at: None,
+            login_generation: None,
         };
         let error = persist_refresh_payload(
             &current,
@@ -1856,6 +2148,7 @@ mod tests {
             account_id: "acc-old".to_string(),
             fedramp: false,
             access_expires_at: None,
+            login_generation: None,
         };
         let mut latest = observed.clone();
         latest.refresh_token = "refresh-latest".to_string();
@@ -1865,6 +2158,74 @@ mod tests {
         assert!(fail_if_account_changed(&observed, &latest).is_ok());
         latest.account_id = "acc-new".to_string();
         assert!(fail_if_account_changed(&observed, &latest).is_err());
+    }
+
+    #[test]
+    fn refresh_http_errors_never_expose_upstream_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _guard = AUTH_PATH_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os(REFRESH_URL_OVERRIDE_ENV);
+        let dir = std::env::temp_dir().join(format!("refresh-body-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+        let jwt = format!(
+            "hdr.{}.sig",
+            URL_SAFE_NO_PAD.encode(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fake-account"}}"#
+            )
+        );
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {"access_token": jwt, "id_token": jwt, "refresh_token": "fake-refresh"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let observed = load_token_data(auth_path.to_str()).unwrap();
+        let sentinel = "unrelated-private-upstream-sentinel-98321";
+
+        for status in [400, 401, 503] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            std::env::set_var(
+                REFRESH_URL_OVERRIDE_ENV,
+                format!("http://{}/token", listener.local_addr().unwrap()),
+            );
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 4096];
+                assert!(stream.read(&mut buffer).unwrap() > 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 {} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    sentinel.len(),
+                    sentinel
+                )
+                .unwrap();
+            });
+            let error = refresh_after_unauthorized(&observed).unwrap_err();
+            server.join().unwrap();
+            let message = error.to_string();
+            assert!(
+                !message.contains(sentinel),
+                "upstream body leaked: {message}"
+            );
+            if status == 503 {
+                assert!(matches!(
+                    error,
+                    AuthError::RefreshUpstreamHttp { status: 503, .. }
+                ));
+                assert!(message.contains("HTTP 503"));
+            } else {
+                assert!(matches!(error, AuthError::Refresh(_)));
+                assert!(message.contains("use the native login API"));
+            }
+        }
+        restore_env(REFRESH_URL_OVERRIDE_ENV, previous);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1915,6 +2276,7 @@ mod tests {
             account_id: "acc-shared".to_string(),
             fedramp: false,
             access_expires_at: Some(Utc::now() + Duration::minutes(4)),
+            login_generation: None,
         };
         assert!(observed.expires_within_refresh_window());
         observed.access_expires_at = Some(Utc::now() + Duration::minutes(6));
@@ -2047,7 +2409,7 @@ mod tests {
             "CODEX_AS_API_HOME",
             "CODEX_AS_API_AUTH_PATH",
         ];
-        let previous: Vec<_> = names.iter().map(|name| std::env::var_os(name)).collect();
+        let previous: Vec<_> = names.iter().map(std::env::var_os).collect();
         let home = std::env::temp_dir().join(format!("project-auth-home-{}", uuid::Uuid::new_v4()));
         let cli = home.join(".codex");
         let legacy = home.join("legacy-cli");

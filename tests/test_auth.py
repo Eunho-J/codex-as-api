@@ -827,6 +827,29 @@ def test_refresh_rejects_header_unsafe_access_token_before_persist(
     assert auth_path.read_text(encoding="utf-8") == before
 
 
+def test_refresh_invalid_exp_does_not_replace_store(monkeypatch, auth_json_factory, make_jwt):
+    auth_path = auth_json_factory(account_id="acc-shared")
+    before = auth_path.read_bytes()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps({"access_token": make_jwt({
+                "exp": "invalid", "https://api.openai.com/auth": {"chatgpt_account_id": "acc-shared"}
+            })}).encode()
+
+    monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", lambda *_args, **_kwargs: Response())
+    with pytest.raises(ChatGPTOAuthProtocolError):
+        refresh_token(auth_path)
+    assert auth_path.read_bytes() == before
+    assert load_token_data(auth_path).account_id == "acc-shared"
+
+
 def test_unauthorized_reload_reuses_matching_account_file_update(monkeypatch, auth_json_factory, make_jwt):
 
     auth_path = auth_json_factory(account_id="acc-shared")
@@ -1114,7 +1137,7 @@ def test_refresh_error_redacts_account_id(monkeypatch, auth_json_factory):
             400,
             "bad request",
             {},
-            io.BytesIO(b"account=acc-secret"),
+            io.BytesIO(b"account=acc-secret&unknown=never-echo-this-secret"),
         )
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", fail)
@@ -1122,7 +1145,8 @@ def test_refresh_error_redacts_account_id(monkeypatch, auth_json_factory):
     with pytest.raises(ChatGPTOAuthRefreshError) as caught:
         refresh_token(auth_path)
     assert "acc-secret" not in str(caught.value)
-    assert "account=***" in str(caught.value)
+    assert "never-echo-this-secret" not in str(caught.value)
+    assert caught.value.__suppress_context__
 
 
 @pytest.mark.parametrize("status", [500, 429])
@@ -1137,7 +1161,7 @@ def test_refresh_preserves_non_auth_upstream_status(monkeypatch, auth_json_facto
             status,
             "upstream failure",
             {},
-            io.BytesIO(b'{"error":"temporary"}'),
+            io.BytesIO(b'{"error":"unknown-upstream-secret"}'),
         )
 
     monkeypatch.setattr("codex_as_api.auth._urlopen_no_redirect", fail)
@@ -1145,6 +1169,8 @@ def test_refresh_preserves_non_auth_upstream_status(monkeypatch, auth_json_facto
     with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
         refresh_token(auth_path)
     assert caught.value.status == status
+    assert "unknown-upstream-secret" not in str(caught.value)
+    assert caught.value.__suppress_context__
 
 
 def test_refresh_transport_failure_is_upstream_error(monkeypatch, auth_json_factory):
@@ -1153,12 +1179,14 @@ def test_refresh_transport_failure_is_upstream_error(monkeypatch, auth_json_fact
     auth_path = auth_json_factory()
     monkeypatch.setattr(
         "codex_as_api.auth._urlopen_no_redirect",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("connection reset")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(urllib.error.URLError("unknown-secret-in-exception")),
     )
 
     with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
         refresh_token(auth_path)
     assert caught.value.status == 502
+    assert "unknown-secret-in-exception" not in str(caught.value)
+    assert caught.value.__suppress_context__
 
 
 def test_refresh_malformed_success_is_protocol_error(monkeypatch, auth_json_factory):
@@ -1238,7 +1266,7 @@ def test_refresh_http_error_body_read_failure_preserves_upstream_status(
     with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
         refresh_token(auth_path)
     assert caught.value.status == 429
-    assert "could not read upstream refresh error body" in str(caught.value)
+    assert str(caught.value) == "ChatGPT OAuth token refresh failed: HTTP 429"
     assert "secret local detail" not in str(caught.value)
 
 
@@ -1277,7 +1305,7 @@ def test_refresh_response_body_has_a_total_deadline(monkeypatch, auth_json_facto
     with pytest.raises(ChatGPTOAuthUpstreamError) as caught:
         refresh_token(auth_path)
     assert caught.value.status == 502
-    assert "total deadline" in str(caught.value)
+    assert str(caught.value) == "ChatGPT OAuth token refresh failed"
 
 
 def test_refresh_does_not_hide_programming_errors(monkeypatch, auth_json_factory):

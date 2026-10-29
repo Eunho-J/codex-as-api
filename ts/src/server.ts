@@ -53,6 +53,10 @@ import {
 } from "./realtime.js";
 import { decodeUtf8Strict, parseJsonStrict } from "./utf8-json.js";
 import { isReasoningModelCompatible } from "./reasoning-signature.js";
+import { localAuthStatus } from "./auth.js";
+import { DeviceLoginManager } from "./device-login.js";
+import { BrowserLoginManager } from "./browser-login.js";
+import { CombinedLoginManager, createAuthManagementRouter, type LoginManager } from "./auth-management.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 18080;
@@ -485,6 +489,7 @@ export interface CreateAppOptions {
   model?: string;
   authPath?: string;
   versionResolver?: CodexVersionProvider;
+  loginManager?: LoginManager;
 }
 
 export function resolveServerHost(raw = process.env.CODEX_AS_API_HOST): string {
@@ -575,6 +580,31 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   };
 
   const app = express();
+  const loginManager = opts?.loginManager ?? new CombinedLoginManager(
+    new BrowserLoginManager(authPath), new DeviceLoginManager(authPath),
+  );
+  // Embedded hosts using http.createServer(app) can invoke this hook themselves.
+  let loginManagerClosed = false;
+  app.locals.closeAuthManagement = () => {
+    if (!loginManagerClosed) {
+      loginManagerClosed = true;
+      loginManager.close();
+    }
+  };
+  const listen = app.listen;
+  app.listen = ((...args: unknown[]) => {
+    const server = Reflect.apply(listen, app, args) as import("node:http").Server;
+    const close = server.close;
+    server.close = function (...closeArgs: unknown[]) {
+      // Cancel before waiting for open requests to finish, not on the eventual
+      // close event: a pending login request can itself hold a connection open.
+      app.locals.closeAuthManagement();
+      return Reflect.apply(close, server, closeArgs);
+    } as typeof server.close;
+    server.once("close", () => app.locals.closeAuthManagement());
+    return server;
+  }) as typeof app.listen;
+  app.use("/auth", createAuthManagementRouter(loginManager, () => localAuthStatus(authPath)));
   app.disable("etag");
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (

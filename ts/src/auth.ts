@@ -1,3 +1,9 @@
+/*
+ * Credential handling modified for codex-as-api's standalone login, based on
+ * OpenAI Codex rust-v0.164.0 (commit 6aaac694803004a63c6f393d153c96d22521a6b9),
+ * codex-rs/login/src/oauth/client.rs and device_code_auth.rs.
+ * Copyright 2025 OpenAI; Apache-2.0. SPDX-License-Identifier: Apache-2.0
+ */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -110,6 +116,8 @@ export interface ChatGPTTokenData {
   user_id: string | null;
   fedramp: boolean;
   access_expires_at: Date | null;
+  /** Store ownership marker, never sent upstream or exposed by management APIs. */
+  login_generation?: string;
 }
 
 export function isTokenExpired(token: ChatGPTTokenData): boolean {
@@ -423,6 +431,7 @@ function tokenDataFromDocument(data: unknown, authPath: string): ChatGPTTokenDat
     user_id: user ?? null,
     fedramp,
     access_expires_at: expiration(access_token as string),
+    login_generation: typeof d["login_generation"] === "string" ? d["login_generation"] : undefined,
   };
 }
 
@@ -486,9 +495,66 @@ export function isAuthLocallyAvailable(authJsonPath?: string | null): boolean {
   }
 }
 
+/** A local inspection only; it does not establish provider-side validity. */
+export function localAuthStatus(authJsonPath?: string | null): "authenticated" | "unauthenticated" | "reauthentication_required" {
+  const authPath = resolveAuthPath(authJsonPath);
+  try {
+    fs.statSync(authPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "unauthenticated";
+    return "reauthentication_required";
+  }
+  try {
+    loadTokenData(authPath);
+    return "authenticated";
+  } catch {
+    return "reauthentication_required";
+  }
+}
+
+/** Replacement occurred but its durability could not be established. */
+export class LoginPersistenceUncertainError extends Error {
+  constructor() {
+    super("Login persistence could not be confirmed");
+    this.name = "LoginPersistenceUncertainError";
+  }
+}
+
+export class LoginCommitExpiredError extends Error {
+  constructor() { super("Login expired before persistence"); this.name = "LoginCommitExpiredError"; }
+}
+
+/** Validate a new grant before atomically replacing the existing project store. */
+export function commitLoginCredentials(
+  authJsonPath: string | null | undefined,
+  payload: Record<string, unknown>,
+  beforeReplace?: () => void,
+): ChatGPTTokenData {
+  const authPath = resolveAuthPath(authJsonPath);
+  const data: Record<string, unknown> = {
+    auth_mode: "chatgpt",
+    tokens: {
+      access_token: payload["access_token"],
+      refresh_token: payload["refresh_token"],
+      id_token: payload["id_token"],
+    },
+    login_generation: crypto.randomUUID(),
+    last_refresh: new Date().toISOString(),
+  };
+  const validated = tokenDataFromDocument(data, authPath);
+  let renamed = false;
+  try {
+    writeAuthJson(authPath, data, () => { renamed = true; }, beforeReplace);
+  } catch (error) {
+    if (renamed) throw new LoginPersistenceUncertainError();
+    throw error;
+  }
+  return validated;
+}
+
 const NO_WRITE_FAILURE = Symbol("no auth write failure");
 
-function writeAuthJson(filePath: string, data: Record<string, unknown>): void {
+function writeAuthJson(filePath: string, data: Record<string, unknown>, onRename?: () => void, beforeReplace?: () => void): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = path.join(dir, `.${path.basename(filePath)}.tmp-${process.pid}-${crypto.randomUUID()}`);
@@ -508,7 +574,9 @@ function writeAuthJson(filePath: string, data: Record<string, unknown>): void {
   }
   if (failure === NO_WRITE_FAILURE) {
     try {
+      beforeReplace?.();
       fs.renameSync(tmp, filePath);
+      onRename?.();
     } catch (err) {
       failure = err;
     }
@@ -578,7 +646,8 @@ function failIfAccountChanged(current: ChatGPTTokenData, latest: ChatGPTTokenDat
 }
 
 function accessTokenChanged(current: ChatGPTTokenData, latest: ChatGPTTokenData): boolean {
-  return current.access_token !== latest.access_token;
+  return current.access_token !== latest.access_token
+    || current.login_generation !== latest.login_generation;
 }
 
 function otherCredentialsChanged(current: ChatGPTTokenData, latest: ChatGPTTokenData): boolean {
@@ -645,38 +714,20 @@ async function performRefresh(
       body,
       signal: AbortSignal.timeout(30000),
     });
-  } catch (err) {
-    const redacted = redactText(
-      String(err),
-      current.access_token,
-      current.refresh_token,
-      current.id_token,
-      current.account_id,
-    );
-    throw new ChatGPTOAuthUnavailableError(`ChatGPT OAuth token refresh failed: ${redacted}`);
+  } catch {
+    throw new ChatGPTOAuthUnavailableError("ChatGPT OAuth token refresh failed");
   }
   if (!response.ok) {
-    let responseText = "could not read upstream error body";
-    try {
-      responseText = await response.text();
-    } catch {
-      // Preserve the upstream HTTP status even when its error body cannot be read.
-    }
-    const redacted = redactText(
-      responseText,
-      current.access_token,
-      current.refresh_token,
-      current.id_token,
-      current.account_id,
-    );
+    // Upstream bodies and transport errors are untrusted and may contain secrets
+    // beyond the credentials currently known to us. Never copy them into errors.
     if (response.status === 400 || response.status === 401) {
       throw new ChatGPTOAuthRefreshError(
-        `ChatGPT OAuth refresh token is invalid; use the codex-as-api login API: ${redacted}`
+        "ChatGPT OAuth refresh token is invalid; use the codex-as-api login API"
       );
     }
     throw new ChatGPTOAuthUpstreamError(
       response.status,
-      `ChatGPT OAuth token refresh failed: HTTP ${response.status}: ${redacted}`,
+      `ChatGPT OAuth token refresh failed: HTTP ${response.status}`,
     );
   }
   let responsePayload: unknown;
@@ -762,6 +813,13 @@ async function performRefresh(
     tokenObject["refresh_token"] = p["refresh_token"];
   }
   data["last_refresh"] = new Date().toISOString().replace("+00:00", "Z");
+  // Validate the complete merged document before replacing the working store.
+  // Partial response checks alone miss malformed expiry and conflicting claims.
+  try {
+    tokenDataFromDocument(data, current.auth_path);
+  } catch {
+    throw new ChatGPTOAuthProtocolError("ChatGPT OAuth token refresh returned invalid credentials");
+  }
   writeAuthJson(current.auth_path, data);
   try {
     return loadTokenData(current.auth_path);

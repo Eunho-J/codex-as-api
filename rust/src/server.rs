@@ -1,7 +1,10 @@
 use axum::extract::rejection::JsonRejection;
+use axum::extract::Request;
 use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
+use axum::response::Response;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
@@ -947,7 +950,249 @@ fn map_error_status(e: &ProviderError) -> StatusCode {
     }
 }
 
+fn management_error(status: StatusCode, code: &'static str) -> Response {
+    (
+        status,
+        Json(
+            json!({"error": {"code": code, "message": "Authentication management request failed"}}),
+        ),
+    )
+        .into_response()
+}
+
+async fn management_guard(
+    State(key): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let error = if key.as_deref().is_none_or(|k| k.is_empty()) {
+        Some((StatusCode::SERVICE_UNAVAILABLE, "management_disabled"))
+    } else {
+        let supplied = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let expected_hash = Sha256::digest(key.as_deref().unwrap_or_default().as_bytes());
+        let supplied_hash = Sha256::digest(supplied.unwrap_or_default().as_bytes());
+        let equal = expected_hash
+            .iter()
+            .zip(supplied_hash.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+        if headers
+            .get_all(axum::http::header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+            || supplied.is_none()
+            || !equal
+        {
+            Some((StatusCode::UNAUTHORIZED, "invalid_admin_key"))
+        } else if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok());
+            let scheme = request.uri().scheme_str().unwrap_or("http");
+            let expected = host.map(|host| format!("{scheme}://{host}"));
+            if headers.get_all(axum::http::header::ORIGIN).iter().count() != 1
+                || origin
+                    .to_str()
+                    .ok()
+                    .zip(expected.as_deref())
+                    .is_none_or(|(actual, expected)| !actual.eq_ignore_ascii_case(expected))
+            {
+                Some((StatusCode::FORBIDDEN, "origin_not_allowed"))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let mut response = match error {
+        Some((status, code)) => management_error(status, code),
+        None => next.run(request).await,
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+struct ManagementShutdown(crate::device_login::DeviceLogin);
+impl Drop for ManagementShutdown {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+#[derive(Clone)]
+struct ManagementState {
+    login: crate::device_login::DeviceLogin,
+    auth_path: Option<String>,
+    _shutdown: Arc<ManagementShutdown>,
+}
+
+#[derive(Deserialize, Default, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum LoginMethod {
+    #[default]
+    Browser,
+    Device,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    #[serde(default)]
+    method: LoginMethod,
+}
+
+fn parse_login_request(body: &[u8]) -> Result<LoginMethod, ()> {
+    if body.is_empty() {
+        return Ok(LoginMethod::Browser);
+    }
+    // Serde accepts sequences for structs, including [] when all fields default.
+    // The management contract permits JSON objects only.
+    if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err(());
+    }
+    serde_json::from_slice::<LoginRequest>(body)
+        .map(|request| request.method)
+        .map_err(|_| ())
+}
+
+async fn login_start(
+    State(state): State<ManagementState>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return management_error(rejection.status(), "invalid_request"),
+    };
+    let method = match parse_login_request(&body) {
+        Ok(method) => method,
+        Err(()) => return management_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let result = match method {
+        LoginMethod::Browser => state
+            .login
+            .start_browser()
+            .await
+            .map(|started| (StatusCode::ACCEPTED, Json(started)).into_response()),
+        LoginMethod::Device => state
+            .login
+            .start()
+            .await
+            .map(|started| (StatusCode::ACCEPTED, Json(started)).into_response()),
+    };
+    match result {
+        Ok(response) => response,
+        Err(error) => management_error(
+            if matches!(
+                error,
+                crate::device_login::StartError::InProgress
+                    | crate::device_login::StartError::CallbackPortUnavailable
+            ) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            error.code(),
+        ),
+    }
+}
+
+async fn login_get(
+    State(state): State<ManagementState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let login = state.login.clone();
+    match tokio::task::spawn_blocking(move || login.get(&id)).await {
+        Ok(Some(session)) => Json(session).into_response(),
+        Ok(None) => management_error(StatusCode::NOT_FOUND, "login_not_found"),
+        Err(_) => management_error(StatusCode::INTERNAL_SERVER_ERROR, "login_internal_error"),
+    }
+}
+
+async fn login_cancel(
+    State(state): State<ManagementState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let login = state.login.clone();
+    match tokio::task::spawn_blocking(move || login.cancel(&id)).await {
+        Ok(Some(session)) => Json(session).into_response(),
+        Ok(None) => management_error(StatusCode::NOT_FOUND, "login_not_found"),
+        Err(_) => management_error(StatusCode::INTERNAL_SERVER_ERROR, "login_internal_error"),
+    }
+}
+
+async fn login_status(State(state): State<ManagementState>) -> Json<Value> {
+    Json(json!({"status": auth::local_auth_status(state.auth_path.as_deref())}))
+}
+
+fn login_commit_error(error: &auth::AuthError) -> crate::device_login::CommitError {
+    match error {
+        auth::AuthError::PersistenceUncertain(_) => {
+            crate::device_login::CommitError::PersistenceUncertain
+        }
+        auth::AuthError::WriteCleanup { primary, .. } => login_commit_error(primary),
+        _ => crate::device_login::CommitError::Storage,
+    }
+}
+
+fn login_commit(auth_path: Option<&str>) -> crate::device_login::Commit {
+    let path = auth::resolve_auth_path(auth_path);
+    Arc::new(move |tokens, deadline, fence| {
+        use crate::device_login::CommitError;
+        let path = path.as_ref().map_err(|_| CommitError::Storage)?;
+        auth::with_login_store_lock(path, |store| {
+            Ok(fence(&mut || {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CommitError::Storage);
+                }
+                store
+                    .commit_before(&tokens, deadline)
+                    .map_err(|error| login_commit_error(&error))
+            }))
+        })
+        .map_err(|_| CommitError::Storage)?
+    })
+}
+
+fn management_router(
+    login: crate::device_login::DeviceLogin,
+    auth_path: Option<String>,
+    key: Option<String>,
+) -> Router {
+    Router::new()
+        .route("/auth/login", post(login_start))
+        .route("/auth/login/{id}", get(login_get).delete(login_cancel))
+        .route("/auth/status", get(login_status))
+        .layer(DefaultBodyLimit::max(1024))
+        .with_state(ManagementState {
+            _shutdown: Arc::new(ManagementShutdown(login.clone())),
+            login,
+            auth_path,
+        })
+        .layer(middleware::from_fn_with_state(key, management_guard))
+}
+
 pub fn create_router(state: AppState) -> Router {
+    let login = crate::device_login::DeviceLogin::new(login_commit(state.auth_path.as_deref()))
+        .expect("failed to construct device login HTTP client");
+    let management = management_router(
+        login,
+        state.auth_path.clone(),
+        std::env::var("CODEX_AS_API_ADMIN_KEY").ok(),
+    );
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -960,6 +1205,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/messages", post(anthropic_messages))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
+        .merge(management)
 }
 
 fn request_messages_to_internal(messages: &[ChatMessage]) -> Result<Vec<Message>, ProviderError> {
@@ -5534,6 +5780,237 @@ mod live_catalog_tests {
 mod tests {
     use super::*;
     use crate::auth::AuthError;
+
+    #[test]
+    fn login_request_defaults_to_browser_and_rejects_extra_or_duplicate_fields() {
+        for body in ["", "{}", r#"{"method":"browser"}"#] {
+            assert_eq!(
+                parse_login_request(body.as_bytes()),
+                Ok(LoginMethod::Browser)
+            );
+        }
+        assert_eq!(
+            parse_login_request(br#"{"method":"device"}"#),
+            Ok(LoginMethod::Device)
+        );
+        for body in [
+            r#"{"method":null}"#,
+            r#"{"method":"other"}"#,
+            r#"{"method":"device","x":1}"#,
+            r#"{"method":"browser","method":"device"}"#,
+            "[]",
+            "null",
+            "{",
+        ] {
+            assert!(parse_login_request(body.as_bytes()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn login_commit_classifies_uncertainty_even_with_cleanup_error() {
+        let error = auth::AuthError::WriteCleanup {
+            primary: Box::new(auth::AuthError::PersistenceUncertain("safe".to_owned())),
+            cleanup: std::io::Error::other("safe"),
+        };
+        assert_eq!(
+            login_commit_error(&error),
+            crate::device_login::CommitError::PersistenceUncertain
+        );
+        assert_eq!(
+            login_commit_error(&auth::AuthError::LoginExpired),
+            crate::device_login::CommitError::Storage
+        );
+    }
+
+    #[tokio::test]
+    async fn management_endpoints_reject_input_and_unknown_ids() {
+        let path = std::env::temp_dir().join(format!("missing-auth-{}", uuid::Uuid::new_v4()));
+        let login = crate::device_login::DeviceLogin::new(Arc::new(|_, _, _| {
+            Err(crate::device_login::CommitError::Storage)
+        }))
+        .unwrap();
+        let app = management_router(
+            login,
+            Some(path.to_string_lossy().to_string()),
+            Some("admin".to_owned()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{base}/auth/status"))
+            .bearer_auth("admin")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"status":"unauthenticated"})
+        );
+        for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+            let response = client
+                .request(method, format!("{base}/auth/login/unknown"))
+                .bearer_auth("admin")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "login_not_found"
+            );
+        }
+        let response = client
+            .post(format!("{base}/auth/login"))
+            .bearer_auth("admin")
+            .body(r#"{"issuer":"https://evil"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        for (body, expected) in [
+            ("{".to_owned(), StatusCode::BAD_REQUEST),
+            ("x".repeat(1025), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let response = client
+                .post(format!("{base}/auth/login"))
+                .bearer_auth("admin")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"error":{"code":"invalid_request","message":"Authentication management request failed"}})
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn real_management_router_persists_before_success_with_fake_issuer() {
+        use base64::Engine;
+        let claims = json!({"exp": 9999999999i64, "https://api.openai.com/auth": {"chatgpt_account_id": "fake-account"}});
+        let access = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let access_clone = access.clone();
+        let issuer = Router::new()
+            .route("/api/accounts/deviceauth/usercode", post(|| async { Json(json!({"device_auth_id":"fake-id", "user_code":"fake-code", "interval":1})) }))
+            .route("/api/accounts/deviceauth/token", post(|| async { Json(json!({"authorization_code":"fake-code", "code_challenge":"fake-challenge", "code_verifier":"fake-verifier"})) }))
+            .route("/oauth/token", post(move || { let access = access_clone.clone(); async move { Json(json!({"access_token":access, "refresh_token":"fake-refresh", "id_token":"header.e30.signature"})) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer_url = format!("http://{}", listener.local_addr().unwrap());
+        let issuer_task = tokio::spawn(async move { axum::serve(listener, issuer).await.unwrap() });
+        let auth_path = std::env::temp_dir()
+            .join(format!("codex-login-integration-{}", uuid::Uuid::new_v4()))
+            .join("auth.json");
+        let path = auth_path.to_string_lossy().to_string();
+        let login = crate::device_login::DeviceLogin::test_with_issuer(
+            login_commit(Some(&path)),
+            issuer_url,
+        )
+        .unwrap();
+        let app = management_router(login, Some(path.clone()), Some("test-admin".to_owned()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let start = client
+            .post(format!("{base}/auth/login"))
+            .bearer_auth("test-admin")
+            .json(&json!({"method":"device"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::ACCEPTED);
+        let id = start.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let response = client
+                    .get(format!("{base}/auth/login/{id}"))
+                    .bearer_auth("test-admin")
+                    .send()
+                    .await
+                    .unwrap();
+                let value = response.json::<Value>().await.unwrap();
+                if value["status"] == "succeeded" {
+                    let saved = auth::load_token_data(Some(&path)).unwrap();
+                    assert_eq!(saved.access_token, access);
+                    assert_eq!(saved.account_id, "fake-account");
+                    assert_eq!(auth::local_auth_status(Some(&path)), "authenticated");
+                    break;
+                }
+                assert_eq!(value["status"], "pending", "{value}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        issuer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn management_guard_enforces_auth_origin_and_no_store() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        async fn start(key: Option<String>) -> (String, tokio::task::JoinHandle<()>) {
+            let app = Router::new()
+                .route("/auth/status", get(ok))
+                .layer(middleware::from_fn_with_state(key, management_guard));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://{address}"), task)
+        }
+        let client = reqwest::Client::new();
+        let (base, task) = start(None).await;
+        let response = client
+            .get(format!("{base}/auth/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        task.abort();
+        let (base, task) = start(Some("admin-secret".to_owned())).await;
+        for (bearer, origin, expected) in [
+            (None, None, StatusCode::UNAUTHORIZED),
+            (Some("wrong"), None, StatusCode::UNAUTHORIZED),
+            (
+                Some("admin-secret"),
+                Some("https://evil.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            (Some("admin-secret"), Some(base.as_str()), StatusCode::OK),
+            (Some("admin-secret"), None, StatusCode::OK),
+        ] {
+            let mut req = client.get(format!("{base}/auth/status"));
+            if let Some(value) = bearer {
+                req = req.bearer_auth(value);
+            }
+            if let Some(value) = origin {
+                req = req.header("origin", value);
+            }
+            let response = req.send().await.unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        task.abort();
+    }
     use crate::messages::{Message, MessageRole};
     use axum::body::{Body, Bytes};
     use axum::http::{header::CONTENT_TYPE, Method, Uri};

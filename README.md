@@ -18,35 +18,31 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 - **Codex features** — live authenticated model discovery, session-aware `prompt_cache_key`, account-scoped Chat continuation, subagent headers, and remote compaction
 - **Codex config aware** — reads `CODEX_HOME` / `~/.codex/config.toml` for model, reasoning-effort, and context-window settings
 - **Token estimate & compaction helpers** — Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`
-- **Managed ChatGPT auth** — reads official `~/.codex/auth.json` token data and refreshes managed OAuth tokens
+- **Standalone ChatGPT login** — ordinary browser OAuth by default, optional device-code login for remote servers, a private application-owned credential store, and managed refresh; no installed Codex CLI or existing Codex login required
 - **3 implementations** — Python, TypeScript (npm), and Rust — identical behavior
 
 ## What it does
 
-Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend using your existing `~/.codex/auth.json` OAuth credentials.
+Runs a lightweight HTTP server on `localhost` that translates standard OpenAI API calls into authenticated requests against the ChatGPT / Codex backend. Sign in explicitly through this server's browser OAuth API; it stores and refreshes its own OAuth credentials without reading or changing your Codex login.
 
 Python, Rust, and TypeScript (npm) implementations are provided — identical functionality, same endpoints, same behavior.
 
 ## Prerequisites
 
-Install the official Codex CLI and log in so that `~/.codex/auth.json` exists:
+A ChatGPT account eligible for the Codex backend and a runtime for your chosen
+implementation are required. The official Codex CLI is **not** required.
 
-```bash
-npm install -g @openai/codex
-codex login
-```
+After starting the server, use [Standalone login](#standalone-login) to open
+OpenAI's ordinary sign-in page in your browser and authorize this server. Credentials are saved privately to
+`~/.codex-as-api/auth.json` by default, and the server handles refresh itself.
+It does not discover, import or fall back to `~/.codex/auth.json`, `CODEX_HOME`
+credentials or a Codex keychain entry. Upgrading from older versions therefore
+requires a fresh login for codex-as-api; your existing Codex login is left alone.
 
-The server reads the official nested `tokens` object from that file and refreshes
-managed ChatGPT OAuth tokens automatically. `auth_mode` may be omitted, `null`,
-or `"chatgpt"`.
-
-Unofficial root-level `access_token` / `refresh_token` / `id_token` fields and
-noncanonical auth-mode aliases are rejected. The official
-`"chatgptAuthTokens"` mode is also unsupported: those credentials are owned and
-refreshed by an external host application, while this standalone proxy has no
-host refresh callback. `personal_access_token`-, `agent_identity`-, and
-Bedrock-only auth files are not ChatGPT OAuth credentials; run `codex login` to
-create the supported managed-token file.
+Use one server process per credential store. To run independent instances,
+assign each its own `CODEX_AS_API_HOME` or `CODEX_AS_API_AUTH_PATH`.
+Model settings may still be read from `~/.codex/config.toml`; that separate
+configuration behavior is unchanged and does not require installing Codex.
 
 ## Install & Run
 
@@ -129,6 +125,87 @@ app.listen(18080);
 
 All versions bind to `127.0.0.1:18080` (localhost only) by default.
 
+## Standalone login
+
+Login is an API operation; the `codex-as-api` command starts the server, not the
+Codex CLI. Before starting, set `CODEX_AS_API_ADMIN_KEY` to a private random
+administrator key. Supply that same key as a bearer credential on `/auth/*`.
+This key is independent of both the OpenAI OAuth credentials and any inference
+client authentication; never use your access or refresh token as the admin key.
+
+1. Start the server with the key configured, then initiate login from a trusted
+   local terminal or authenticated management client:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:18080/auth/login \
+     -H "Authorization: Bearer $CODEX_AS_API_ADMIN_KEY" \
+     -H 'Content-Type: application/json' -d '{}'
+   ```
+
+2. The `202` response contains `id`, `method: "browser"`, `status: "pending"`,
+   `auth_url` and `expires_at`. Your app opens `auth_url` in the system browser;
+   sign in normally on OpenAI's page. No one-time device code or Codex CLI is
+   needed. On approval, the browser returns to a separate loopback callback
+   listener on the **same machine as the server**, and credentials are saved
+   privately. The server tries registered callback port 1455, then 1457; if both
+   are occupied it reports `409 callback_port_unavailable` instead of interfering
+   with another app. The API itself never launches a browser on a remote server.
+   The authorization URL contains temporary sensitive state; do not log or share
+   it. Only start login on a server you control.
+
+3. Poll the login ID returned by step 1 (the placeholder below is not a real ID):
+
+   ```bash
+   curl -sS http://127.0.0.1:18080/auth/login/LOGIN_ID \
+     -H "Authorization: Bearer $CODEX_AS_API_ADMIN_KEY"
+   ```
+
+   Status becomes `succeeded` only after valid credentials are durably saved.
+   Other terminal states are `failed`, `cancelled` and `expired`. Routine status
+   responses include the method but never repeat the authorization URL or user
+   code, or return OAuth tokens, authorization codes, verifiers, device IDs or
+   storage paths.
+
+4. To stop an outstanding attempt, send `DELETE /auth/login/LOGIN_ID` with the same
+   administrator bearer. Repeating cancellation is safe. A login already saved
+   remains `succeeded`; cancellation is not logout or provider-side revocation.
+
+`GET /auth/status` with the administrator bearer returns only
+`{"status":"authenticated"}`, `unauthenticated` or `reauthentication_required`.
+This checks the local application-owned credential state, not provider-side
+revocation or remote account validity; refresh is handled privately when needed.
+Validation, cancellation and failures before credential replacement preserve a
+prior valid login. If replacement succeeds but the final directory sync fails,
+`login_persistence_uncertain` reports that durability could not be confirmed; a
+new local credential may already exist. Cancellation is not a rollback.
+
+### Explicit device login for remote/headless use
+
+When the browser and API server are on different machines, a loopback browser
+callback would reach the wrong machine. Explicitly send `{"method":"device"}`
+to `POST /auth/login` instead. It returns `method: "device"`, `verification_url`,
+`user_code`, `interval` and the common session fields. Open
+`https://auth.openai.com/codex/device` in your own browser and enter the code.
+Only approve a code from a login you initiated on a trusted server; never post
+it in public channels or logs. Device-code login may need enabling in your
+OpenAI account. No method silently falls back to another.
+
+All management responses use `Cache-Control: no-store`. An unset admin key returns
+`503 management_disabled`; a missing/wrong bearer returns `401 invalid_admin_key`.
+An empty request body, `{}` or `{"method":"browser"}` selects browser login;
+`{"method":"device"}` selects device login. No other body fields are accepted.
+The API does not accept credentials to import, token export switches,
+authentication endpoints or credential paths from a request. One active attempt per store is allowed; another
+start returns `409 login_in_progress`. Unknown/retired IDs return `404`.
+
+Keep the default loopback binding unless you deliberately deploy authenticated
+HTTPS administration behind a trusted reverse proxy. A browser `Origin` must
+match the request's own scheme and Host; the API does not blindly trust forwarded
+headers. Configure proxy origins consistently. Origin checking supplements the
+admin bearer and is not a replacement for authentication or network controls.
+Each credential store must be owned by one server process, not shared between
+independent workers. Choose separate store paths for separate instances.
+
 ## Configuration
 
 Environment variables (Python, Rust, and TypeScript):
@@ -138,10 +215,12 @@ Environment variables (Python, Rust, and TypeScript):
 | `CODEX_AS_API_HOST` | `127.0.0.1` | Bind address |
 | `CODEX_AS_API_PORT` | `18080` | Listen port |
 | `CODEX_AS_API_MODEL` | `~/.codex/config.toml` `model`, else live default | Model identifier passed to Codex backend |
-| `CODEX_AS_API_AUTH_PATH` | `~/.codex/auth.json` | Path to OAuth credentials file |
+| `CODEX_AS_API_AUTH_PATH` | `CODEX_AS_API_HOME/auth.json`, else `~/.codex-as-api/auth.json` | Explicit application-owned OAuth store path; not an import command |
+| `CODEX_AS_API_HOME` | `~/.codex-as-api` | Application-owned credential directory |
+| `CODEX_AS_API_ADMIN_KEY` | unset (management disabled) | Independent bearer key for `/auth/*`; never use an OAuth token as this key |
 | `CODEX_AS_API_RESPONSES_LITE` | `auto` | Responses Lite mode: `auto`, `on`, or `off` |
 | `CODEX_AS_API_CODEX_METADATA` | `off` | Add Codex-style per-turn `client_metadata` and related backend headers |
-| `CODEX_HOME` | `~/.codex` | Codex home directory used for `auth.json` and `config.toml` discovery |
+| `CODEX_HOME` | `~/.codex` | Optional Codex model/config discovery only; never used to find credentials |
 
 The server also reads root-level Codex CLI settings from `~/.codex/config.toml`:
 
@@ -831,7 +910,7 @@ HTTP Server (FastAPI / Axum / Express)
     |
     +---> ChatGPTOAuthProvider
             |
-            +---> ~/.codex/auth.json (managed ChatGPT OAuth tokens, auto-refresh)
+            +---> ~/.codex-as-api/auth.json (own OAuth credentials, auto-refresh)
             +---> https://chatgpt.com/backend-api/codex/models
             +---> https://chatgpt.com/backend-api/codex/responses
 ```
@@ -878,9 +957,9 @@ registry setup is still required:
 After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-python scripts/check_package_versions.py --tag v0.8.0
-git tag v0.8.0
-git push origin v0.8.0
+python scripts/check_package_versions.py --tag v0.10.0
+git tag v0.10.0
+git push origin v0.10.0
 ```
 
 ## Tests
@@ -910,6 +989,15 @@ npm test
 
 
 ## Release Notes
+
+### v0.10.0
+
+- Sign in directly with ordinary browser OAuth; no Codex installation or existing
+  Codex credentials are required. Device-code login is an explicit remote option.
+- Add independent admin-key-protected login start/status/cancel endpoints and a
+  private application-owned credential store across Python, TypeScript and Rust.
+- Upgrading requires a new codex-as-api login; existing Codex credentials remain
+  untouched. See [Standalone login](#standalone-login) and [full release notes](RELEASES.md).
 
 ### v0.8.0
 

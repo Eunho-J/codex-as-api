@@ -1,7 +1,9 @@
 mod anthropic_adapter;
 mod auth;
+mod browser_login;
 mod codex_config;
 mod codex_version;
+mod device_login;
 mod messages;
 mod model_capabilities;
 mod model_catalog;

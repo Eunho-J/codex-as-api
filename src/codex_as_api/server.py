@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -33,9 +35,13 @@ from .auth import (
     ChatGPTOAuthProtocolError,
     ChatGPTOAuthRefreshError,
     ChatGPTOAuthUpstreamError,
+    commit_login,
+    load_token_data,
+    resolve_auth_path,
     validate_auth_environment,
 )
 from .codex_config import load_codex_config
+from .device_login import DeviceLoginManager, LoginError
 from .messages import Message, MessageRole, ToolSchema
 from .model_capabilities import (
     ModelCapability,
@@ -465,18 +471,59 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="0.9.6",
+    version="0.10.0",
 )
+
+
+def _management_error(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status, content={"error": {"code": code, "message": message}}, headers={"Cache-Control": "no-store"}
+    )
 
 
 @app.middleware("http")
 async def _strict_json_request_middleware(request: Request, call_next: Any) -> Any:
+    if request.url.path == "/auth" or request.url.path.startswith("/auth/"):
+        key = os.getenv("CODEX_AS_API_ADMIN_KEY")
+        if not key or not key.strip():
+            return _management_error(503, "management_disabled", "Management API is disabled")
+        authorizations = request.headers.getlist("authorization")
+        expected = f"Bearer {key}".encode()
+        supplied = authorizations[0].encode("utf-8") if len(authorizations) == 1 else b""
+        if not hmac.compare_digest(supplied, expected):
+            return _management_error(401, "invalid_admin_key", "Invalid admin key")
+        origins = request.headers.getlist("origin")
+        hosts = request.headers.getlist("host")
+        if origins and (len(origins) != 1 or len(hosts) != 1 or origins[0] != f"{request.url.scheme}://{hosts[0]}"):
+            return _management_error(403, "origin_not_allowed", "Origin is not allowed")
+        if request.method == "POST" and request.url.path == "/auth/login":
+            buffer = bytearray()
+            async for chunk in request.stream():
+                if len(buffer) + len(chunk) > 4096:
+                    return _management_error(400, "invalid_request", "Request body must be empty or an empty object")
+                buffer.extend(chunk)
+            raw = bytes(buffer)
+            request._body = raw
+            if raw:
+                try:
+                    body = strict_json_loads(raw)
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    return _management_error(400, "invalid_request", "Request body must be empty or an empty object")
+                if not isinstance(body, dict) or (
+                    body and (set(body) != {"method"} or body["method"] not in ("browser", "device"))
+                ):
+                    return _management_error(400, "invalid_request", "Invalid login request")
+        try:
+            response = await call_next(request)
+        except Exception:
+            return _management_error(500, "server_error", "Management request failed")
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if request.method in {"POST", "PUT", "PATCH"}:
         content_type = request.headers.get("content-type")
         media_type = content_type.split(";", 1)[0].strip().lower() if content_type is not None else ""
         if not (
-            media_type == "application/json"
-            or (media_type.startswith("application/") and media_type.endswith("+json"))
+            media_type == "application/json" or (media_type.startswith("application/") and media_type.endswith("+json"))
         ):
             return _request_transport_error_response(
                 request,
@@ -529,6 +576,136 @@ def _request_transport_error_response(request: Request, status: int, message: st
         status_code=status,
         content={"error": {"message": message, "type": error_type, "code": error_type}},
     )
+
+
+_login_manager: DeviceLoginManager | None = None
+_browser_login_manager: Any = None
+_login_starting = False
+
+
+def _get_browser_login_manager() -> Any:
+    global _browser_login_manager
+    if _browser_login_manager is None:
+        from .browser_login import BrowserLoginManager
+        _browser_login_manager = BrowserLoginManager(_commit_device_login)
+    return _browser_login_manager
+
+
+async def _commit_device_login(tokens: dict[str, str], guard: Any) -> bool:
+    return await asyncio.to_thread(commit_login, resolve_auth_path(AUTH_PATH), tokens, guard)
+
+
+def _get_login_manager() -> DeviceLoginManager:
+    global _login_manager
+    if _login_manager is None:
+        _login_manager = DeviceLoginManager(_commit_device_login)
+    return _login_manager
+
+
+@app.on_event("shutdown")
+async def _close_login_manager() -> None:
+    global _login_manager, _browser_login_manager, _login_starting
+    if _login_manager is not None:
+        await _login_manager.close()
+        _login_manager = None
+    if _browser_login_manager is not None:
+        await _browser_login_manager.close()
+        _browser_login_manager = None
+    _login_starting = False
+
+
+def _login_error(exc: LoginError) -> JSONResponse:
+    codes = {
+        "login_in_progress": (409, "A login is already in progress"),
+        "callback_port_unavailable": (409, "Login callback port is unavailable"),
+        "login_not_found": (404, "Login not found"),
+        "device_login_unsupported": (502, "Device login is unavailable"),
+        "invalid_login_response": (502, "Invalid login response"),
+        "login_upstream_error": (502, "Login provider request failed"),
+        "login_expired": (502, "Login expired"),
+        "login_unavailable": (503, "Login is unavailable"),
+    }
+    code = exc.code if exc.code in codes else "login_upstream_error"
+    status, message = codes[code]
+    return _management_error(status, code, message)
+
+
+def _login_public(record: dict[str, object], *, initiating: bool = False) -> dict[str, object]:
+    allowed = {"id", "method", "status", "expires_at", "error_code"}
+    if initiating:
+        allowed |= {"auth_url", "verification_url", "user_code", "interval"}
+    return {key: value for key, value in record.items() if key in allowed}
+
+
+@app.post("/auth/login")
+async def _start_login(request: Request) -> JSONResponse:
+    raw = await request.body()
+    body = strict_json_loads(raw) if raw else {}
+    method = body.get("method", "browser")
+    global _login_starting
+    try:
+        device = _get_login_manager()
+        browser = _get_browser_login_manager()
+        if _login_starting or device._active is not None or browser._active is not None:
+            raise LoginError("login_in_progress")
+        _login_starting = True
+        try:
+            record = await (browser if method == "browser" else device).start()
+        finally:
+            _login_starting = False
+    except LoginError as exc:
+        return _login_error(exc)
+    return JSONResponse(status_code=202, content=_login_public({**record, "method": method}, initiating=True))
+
+
+def _manager_for_login(login_id: str) -> tuple[Any, str]:
+    for manager, method in ((_get_login_manager(), "device"), (_get_browser_login_manager(), "browser")):
+        try:
+            manager.get(login_id)
+            return manager, method
+        except LoginError as exc:
+            if exc.code != "login_not_found":
+                raise
+    raise LoginError("login_not_found")
+
+
+@app.get("/auth/login/{login_id}")
+async def _get_login(login_id: str) -> JSONResponse:
+    try:
+        manager, method = _manager_for_login(login_id)
+        record = manager.get(login_id)
+    except LoginError as exc:
+        return _login_error(exc)
+    return JSONResponse(content=_login_public({**record, "method": method}))
+
+
+@app.delete("/auth/login/{login_id}")
+async def _cancel_login(login_id: str) -> JSONResponse:
+    try:
+        manager, method = _manager_for_login(login_id)
+        record = await manager.cancel(login_id)
+    except LoginError as exc:
+        return _login_error(exc)
+    return JSONResponse(content=_login_public({**record, "method": method}))
+
+
+@app.get("/auth/status")
+async def _management_status() -> JSONResponse:
+    # This only checks the local project store, not provider-side revocation.
+    path = resolve_auth_path(AUTH_PATH)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        status = "unauthenticated"
+    except OSError:
+        status = "reauthentication_required"
+    else:
+        try:
+            load_token_data(path)
+            status = "authenticated"
+        except (ChatGPTOAuthError, OSError, ValueError):
+            status = "reauthentication_required"
+    return JSONResponse(content={"status": status}, headers={"Cache-Control": "no-store"})
 
 
 @app.exception_handler(ChatGPTOAuthError)
@@ -821,9 +998,7 @@ def _request_messages_to_internal(messages: list[ChatMessage]) -> list[Message]:
             )
         if role is MessageRole.TOOL:
             if not isinstance(msg.tool_call_id, str):
-                raise ChatGPTOAuthInvalidRequestError(
-                    f"messages[{index}] tool message requires a string tool_call_id"
-                )
+                raise ChatGPTOAuthInvalidRequestError(f"messages[{index}] tool message requires a string tool_call_id")
             if msg.tool_calls:
                 raise ChatGPTOAuthInvalidRequestError(f"messages[{index}] tool message cannot contain tool_calls")
         elif msg.tool_call_id is not None:
@@ -874,9 +1049,7 @@ def _map_role(role: str) -> MessageRole:
         "tool": MessageRole.TOOL,
     }
     if not isinstance(role, str) or role not in mapping:
-        raise ChatGPTOAuthInvalidRequestError(
-            "message role must be one of: system, developer, user, assistant, tool"
-        )
+        raise ChatGPTOAuthInvalidRequestError("message role must be one of: system, developer, user, assistant, tool")
     return mapping[role]
 
 
@@ -1214,13 +1387,13 @@ def _reject_unsupported_generation_features(body: dict[str, Any], *, anthropic: 
             for fields in (item, function_fields):
                 if key not in fields:
                     continue
-                if anthropic and key == "eager_input_streaming" and (
-                    fields[key] is None or isinstance(fields[key], bool)
+                if (
+                    anthropic
+                    and key == "eager_input_streaming"
+                    and (fields[key] is None or isinstance(fields[key], bool))
                 ):
                     continue
-                if anthropic and key == "defer_loading" and (
-                    fields[key] is None or fields[key] is False
-                ):
+                if anthropic and key == "defer_loading" and (fields[key] is None or fields[key] is False):
                     continue
                 raise ChatGPTOAuthInvalidRequestError(f"{key} is not supported by the Chat facade")
 
@@ -1569,9 +1742,7 @@ async def health() -> JSONResponse:
         requested_effort = configured_effort or capability.default_reasoning_level
         try:
             reasoning_effort = (
-                resolve_model_reasoning_effort(capability, requested_effort)
-                if requested_effort is not None
-                else None
+                resolve_model_reasoning_effort(capability, requested_effort) if requested_effort is not None else None
             )
         except ChatGPTOAuthInvalidRequestError as exc:
             if configured_effort is not None:
@@ -1640,9 +1811,7 @@ async def list_models() -> JSONResponse:
                     ],
                     "default_reasoning_level": model.default_reasoning_level,
                     "multi_agent_reasoning_effort": (model.multi_agent_reasoning_effort),
-                    "supports_reasoning_summary_parameter": (
-                        model.supports_reasoning_summary_parameter
-                    ),
+                    "supports_reasoning_summary_parameter": (model.supports_reasoning_summary_parameter),
                     "default_reasoning_summary": model.default_reasoning_summary,
                     "comp_hash": model.comp_hash,
                     "context_window": model.context_window,
@@ -2319,9 +2488,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         )
     request_model = resolved_model[1].slug
     nested_request_effort = body.get("reasoning", {}).get("effort") if isinstance(body.get("reasoning"), dict) else None
-    allow_disabled_fallback = (
-        thinking_disabled and explicit_effort is None and nested_request_effort is None
-    )
+    allow_disabled_fallback = thinking_disabled and explicit_effort is None and nested_request_effort is None
     _validate_configured_reasoning_effort(
         resolved_model[1],
         effective_reasoning_effort,
@@ -2605,10 +2772,7 @@ async def compact(request: Request) -> JSONResponse:
         )
     selected_effort = _request_reasoning_effort(explicit_effort)
     allow_disabled_fallback = (
-        is_anthropic_compact
-        and thinking_disabled
-        and body.get("reasoning_effort") is None
-        and nested_effort is None
+        is_anthropic_compact and thinking_disabled and body.get("reasoning_effort") is None and nested_effort is None
     )
     _validate_configured_reasoning_effort(
         resolved_model[1],
