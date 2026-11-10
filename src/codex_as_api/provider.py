@@ -16,7 +16,7 @@ import urllib.request
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn, cast
 
 from . import __version__
@@ -1426,13 +1426,14 @@ class ChatGPTOAuthProvider:
         if max_tokens is not None:
             raise ChatGPTOAuthInvalidRequestError("max_tokens is not supported by the ChatGPT Codex OAuth transport")
         _reject_unsupported_stop(stop)
-        instructions, input_items = _split_instructions_and_input(messages)
+        instructions, input_items = _split_instructions_and_input(messages, preserve_system_positions=True)
         snapshot, capability = _resolved_model or self.resolve_model(model)
         request_model = capability.slug
         if any(msg.reasoning_items for msg in messages):
             instructions, input_items = _split_instructions_and_input(
                 messages,
                 backend_model=request_model,
+                preserve_system_positions=True,
             )
         if previous_response_id is not None:
             validated_previous_response_id = _validate_previous_response_id(previous_response_id)
@@ -2223,6 +2224,7 @@ def _split_instructions_and_input(
     messages: Sequence[Message],
     *,
     backend_model: str | None = None,
+    preserve_system_positions: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_messages: list[Message] = []
@@ -2232,7 +2234,11 @@ def _split_instructions_and_input(
                 part.get("prompt_cache_breakpoint") is not None for part in msg.content_parts
             ):
                 _reject_prompt_cache_breakpoint(None)
-            instructions.append(msg.content)
+            if preserve_system_positions and input_messages:
+                # Hoisting late system notes changes the entire cached history prefix.
+                input_messages.append(replace(msg, role=MessageRole.DEVELOPER))
+            else:
+                instructions.append(msg.content)
         else:
             input_messages.append(msg)
     return "\n\n".join(instructions), _messages_to_response_items(

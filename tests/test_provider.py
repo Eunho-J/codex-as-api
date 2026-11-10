@@ -3549,6 +3549,41 @@ def test_split_instructions_multiple_system_joined():
     assert instructions == "Part one.\n\nPart two."
 
 
+@pytest.mark.parametrize("with_reasoning", [False, True])
+def test_responses_payload_keeps_late_system_notes_after_tool_results(with_reasoning):
+    provider = ChatGPTOAuthProvider()
+    messages = [
+        Message(role=MessageRole.SYSTEM, content="Stable instructions."),
+        Message(role=MessageRole.USER, content="Read the fixture."),
+        Message(role=MessageRole.SYSTEM, content="Initial environment."),
+    ]
+    tools = [ToolSchema(name="Read", description="Read a file.", parameters={"type": "object"})]
+    previous = None
+    for turn in range(3):
+        payload = provider._responses_payload(  # noqa: SLF001
+            messages, model="gpt-5.5", tools=tools, responses_lite=False,
+            prompt_cache_key="same-session",
+        )
+        assert payload["instructions"] == "Stable instructions."
+        assert payload["input"][-1]["role"] == "developer"
+        if previous is not None:
+            assert payload["input"][:len(previous["input"])] == previous["input"]
+            assert payload["tools"] == previous["tools"]
+            assert payload["prompt_cache_key"] == previous["prompt_cache_key"]
+        if with_reasoning:
+            assert sum(item.get("type") == "reasoning" for item in payload["input"]) == turn
+        previous = payload
+        messages.extend([
+            Message(role=MessageRole.ASSISTANT, content="", tool_calls=(
+                ToolCall(id=f"call_{turn}", name="Read", arguments='{"path":"fixture"}'),
+            ), reasoning_items=(
+                {"type": "reasoning", "encrypted_content": f"opaque_{turn}", "summary": []},
+            ) if with_reasoning else ()),
+            Message(role=MessageRole.TOOL, content=f"Fixture result {turn}.", tool_call_id=f"call_{turn}"),
+            Message(role=MessageRole.SYSTEM, content=f"Budget remaining: {1000 - turn}."),
+        ])
+
+
 @pytest.mark.parametrize("responses_lite", [False, True])
 def test_responses_payload_accepts_user_input_without_system_instructions(responses_lite):
     provider = ChatGPTOAuthProvider()
