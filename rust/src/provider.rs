@@ -2334,7 +2334,7 @@ impl ChatGPTOAuthProvider {
         validate_normalized_tool_choice(tool_choice)?;
         validate_client_metadata_reserved_keys(client_metadata)?;
         let (instructions, mut input_items) =
-            split_instructions_and_input_for_model(messages, Some(&resolved.model.slug))?;
+            split_instructions_and_input_with_options(messages, Some(&resolved.model.slug), true)?;
 
         let tools_array: Vec<Value> = match tools {
             Some(ts) => ts
@@ -3775,8 +3775,16 @@ pub fn split_instructions_and_input_for_model(
     messages: &[Message],
     target_model: Option<&str>,
 ) -> Result<(String, Vec<Value>), ProviderError> {
+    split_instructions_and_input_with_options(messages, target_model, false)
+}
+
+pub fn split_instructions_and_input_with_options(
+    messages: &[Message],
+    target_model: Option<&str>,
+    preserve_system_positions: bool,
+) -> Result<(String, Vec<Value>), ProviderError> {
     let mut instructions: Vec<String> = Vec::new();
-    let mut input_messages: Vec<&Message> = Vec::new();
+    let mut input_messages: Vec<std::borrow::Cow<'_, Message>> = Vec::new();
 
     for msg in messages {
         if msg.role == MessageRole::System && !msg.content.starts_with(REMOTE_COMPACTION_MARKER) {
@@ -3790,15 +3798,23 @@ pub fn split_instructions_and_input_for_model(
                     "system message content cannot use prompt_cache_breakpoint".to_string(),
                 ));
             }
-            instructions.push(msg.content.clone());
+            if preserve_system_positions && !input_messages.is_empty() {
+                // Hoisting late system notes changes the entire cached history prefix.
+                let mut dev_msg = msg.clone();
+                dev_msg.role = MessageRole::Developer;
+                input_messages.push(std::borrow::Cow::Owned(dev_msg));
+            } else {
+                instructions.push(msg.content.clone());
+            }
         } else {
-            input_messages.push(msg);
+            input_messages.push(std::borrow::Cow::Borrowed(msg));
         }
     }
 
+    let input_refs: Vec<&Message> = input_messages.iter().map(|m| m.as_ref()).collect();
     Ok((
         instructions.join("\n\n"),
-        messages_to_response_items_refs_for_model(&input_messages, target_model)?,
+        messages_to_response_items_refs_for_model(&input_refs, target_model)?,
     ))
 }
 
@@ -7027,6 +7043,133 @@ mod tests {
         let (instructions, input) = split_instructions_and_input(&messages).unwrap();
         assert_eq!(instructions, "You are helpful.");
         assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn test_responses_payload_keeps_late_system_notes_after_tool_results() {
+        for with_reasoning in [false, true] {
+            let provider = ChatGPTOAuthProvider::new(
+                CHATGPT_OAUTH_DEFAULT_MODEL.to_string(),
+                CHATGPT_OAUTH_DEFAULT_BASE_URL.to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+            let mut messages = vec![
+                Message::new(
+                    MessageRole::System,
+                    "Stable instructions.".to_string(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap(),
+                Message::new(
+                    MessageRole::User,
+                    "Read the fixture.".to_string(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap(),
+                Message::new(
+                    MessageRole::System,
+                    "Initial environment.".to_string(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ];
+            let tools = vec![ToolSchema {
+                name: "Read".to_string(),
+                description: Some("Read a file.".to_string()),
+                parameters: json!({"type": "object"}),
+                strict: false,
+            }];
+            let mut previous: Option<Value> = None;
+
+            for turn in 0..3 {
+                let request = provider
+                    .responses_payload(
+                        &messages,
+                        Some(&tools),
+                        None,
+                        None,
+                        Some("same-session"),
+                        None,
+                        None,
+                        Some("gpt-5.5"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&json!(false)),
+                        None,
+                    )
+                    .unwrap();
+                let payload = request.payload;
+                let input = payload["input"].as_array().unwrap();
+                assert_eq!(payload["instructions"], "Stable instructions.");
+                assert_eq!(input.last().unwrap()["role"], "developer");
+                if let Some(prev) = &previous {
+                    let prev_input = prev["input"].as_array().unwrap();
+                    assert_eq!(&input[..prev_input.len()], prev_input.as_slice());
+                    assert_eq!(payload["tools"], prev["tools"]);
+                    assert_eq!(payload["prompt_cache_key"], prev["prompt_cache_key"]);
+                }
+                if with_reasoning {
+                    let reasoning_count = input
+                        .iter()
+                        .filter(|item| item["type"] == "reasoning")
+                        .count();
+                    assert_eq!(reasoning_count, turn);
+                }
+                previous = Some(payload);
+
+                let mut assistant_msg = Message::new(
+                    MessageRole::Assistant,
+                    String::new(),
+                    vec![crate::messages::ToolCall {
+                        id: format!("call_{turn}"),
+                        name: "Read".to_string(),
+                        arguments: "{\"path\":\"fixture\"}".to_string(),
+                    }],
+                    None,
+                    None,
+                )
+                .unwrap();
+                if with_reasoning {
+                    assistant_msg.reasoning_items = Some(vec![json!({
+                        "type": "reasoning",
+                        "encrypted_content": format!("opaque_{turn}"),
+                        "summary": [],
+                    })]);
+                }
+                messages.push(assistant_msg);
+                messages.push(
+                    Message::new(
+                        MessageRole::Tool,
+                        format!("Fixture result {turn}."),
+                        vec![],
+                        Some(format!("call_{turn}")),
+                        None,
+                    )
+                    .unwrap(),
+                );
+                messages.push(
+                    Message::new(
+                        MessageRole::System,
+                        format!("Budget remaining: {}.", 1000 - turn),
+                        vec![],
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
     }
 
     #[test]

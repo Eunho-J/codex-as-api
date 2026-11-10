@@ -3410,6 +3410,82 @@ describe("splitInstructionsAndInput", () => {
     assert.equal(instructions, "");
     assert.equal(items.length, 1);
   });
+
+  it("keeps late system notes after tool results as developer items", () => {
+    for (const withReasoning of [false, true]) {
+      const provider = testProvider({});
+      const messages: Message[] = [
+        { role: MessageRole.SYSTEM, content: "Stable instructions." },
+        { role: MessageRole.USER, content: "Read the fixture." },
+        { role: MessageRole.SYSTEM, content: "Initial environment." },
+      ];
+      const tools: ToolSchema[] = [
+        { name: "Read", description: "Read a file.", parameters: { type: "object" } },
+      ];
+      const responsesPayload = (provider as unknown as {
+        responsesPayload(
+          messages: Message[],
+          opts: {
+            model: string;
+            tools: ToolSchema[];
+            responsesLite: boolean;
+            promptCacheKey: string;
+          },
+        ): Record<string, unknown>;
+      }).responsesPayload.bind(provider);
+
+      let previous: Record<string, unknown> | undefined;
+      for (let turn = 0; turn < 3; turn += 1) {
+        const payload = responsesPayload(messages, {
+          model: "gpt-5.5",
+          tools,
+          responsesLite: false,
+          promptCacheKey: "same-session",
+        });
+        const input = payload.input as Record<string, unknown>[];
+        assert.equal(payload.instructions, "Stable instructions.");
+        assert.equal(input[input.length - 1].role, "developer");
+        if (previous !== undefined) {
+          const prevInput = previous.input as Record<string, unknown>[];
+          assert.deepEqual(input.slice(0, prevInput.length), prevInput);
+          assert.deepEqual(payload.tools, previous.tools);
+          assert.equal(payload.prompt_cache_key, previous.prompt_cache_key);
+        }
+        if (withReasoning) {
+          assert.equal(
+            input.filter((item) => item.type === "reasoning").length,
+            turn,
+          );
+        }
+        previous = payload;
+        messages.push(
+          {
+            role: MessageRole.ASSISTANT,
+            content: "",
+            tool_calls: [
+              { id: `call_${turn}`, name: "Read", arguments: '{"path":"fixture"}' },
+            ],
+            ...(withReasoning
+              ? {
+                reasoning_items: [
+                  { type: "reasoning", encrypted_content: `opaque_${turn}`, summary: [] },
+                ],
+              }
+              : {}),
+          },
+          {
+            role: MessageRole.TOOL,
+            content: `Fixture result ${turn}.`,
+            tool_call_id: `call_${turn}`,
+          },
+          {
+            role: MessageRole.SYSTEM,
+            content: `Budget remaining: ${1000 - turn}.`,
+          },
+        );
+      }
+    }
+  });
 });
 
 describe("messagesToResponseItems", () => {

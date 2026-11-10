@@ -1297,7 +1297,7 @@ export class ChatGPTOAuthProvider {
     rejectUnsupportedStop(opts.stop);
     const requestModel = prepared.slug;
     const [instructions, inputItems] =
-      splitInstructionsAndInput(messages, requestModel);
+      splitInstructionsAndInput(messages, requestModel, true);
     const semanticInput = this.resolveSemanticInput(
       inputItems,
       opts.previousResponseId,
@@ -2249,6 +2249,7 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 export function splitInstructionsAndInput(
   messages: Message[],
   targetModel?: string,
+  preserveSystemPositions = false,
 ): [string, Record<string, unknown>[]] {
   const instructions: string[] = [];
   const inputMessages: Message[] = [];
@@ -2262,7 +2263,12 @@ export function splitInstructionsAndInput(
           "prompt_cache_breakpoint is not supported by the private Codex OAuth HTTP transport",
         );
       }
-      instructions.push(msg.content);
+      if (preserveSystemPositions && inputMessages.length > 0) {
+        // Hoisting late system notes changes the entire cached history prefix.
+        inputMessages.push({ ...msg, role: MessageRole.DEVELOPER });
+      } else {
+        instructions.push(msg.content);
+      }
     } else {
       inputMessages.push(msg);
     }

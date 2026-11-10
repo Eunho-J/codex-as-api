@@ -416,7 +416,7 @@ null, or server-tool caller variants still fail before transport.
 
 ### Identifier and cache behavior
 
-For Python chat requests, initial system messages form `instructions`. System
+For chat requests, initial system messages form `instructions`. System
 messages added after conversation history starts stay at their original positions
 as developer messages, so appending runtime notes preserves the earlier history prefix.
 
