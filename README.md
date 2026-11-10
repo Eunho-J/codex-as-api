@@ -206,6 +206,16 @@ admin bearer and is not a replacement for authentication or network controls.
 Each credential store must be owned by one server process, not shared between
 independent workers. Choose separate store paths for separate instances.
 
+### Note on OpenAI "Sign in with ChatGPT" (SIWC) preview
+
+OpenAI's public [Sign in with ChatGPT (`chatgpt.tokens.use.direct`)](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt)
+preview route (`https://api.openai.com/v1/responses` with dynamic client registration)
+is intentionally kept on hold and not used as the default transport:
+
+- Function tools on the SIWC preview route must be wrapped inside a `namespace` tool object rather than sent as top-level function definitions.
+- Remote compaction (`/responses/compact`), `Responses Lite`, hosted `image_generation`, device-code login, and ChatGPT Live / Realtime WebRTC voice calls are not supported on the SIWC preview route.
+- Reliable prompt cache hits on SIWC currently require reusing a persistent WebSocket (`wss://api.openai.com/v1/responses`) rather than stateless HTTP `POST /v1/responses` requests.
+
 ## Configuration
 
 Environment variables (Python, Rust, and TypeScript):
@@ -961,9 +971,9 @@ registry setup is still required:
 After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-python scripts/check_package_versions.py --tag v0.10.0
-git tag v0.10.0
-git push origin v0.10.0
+python scripts/check_package_versions.py --tag v0.10.1
+git tag v0.10.1
+git push origin v0.10.1
 ```
 
 ## Tests
@@ -993,6 +1003,11 @@ npm test
 
 
 ## Release Notes
+
+### v0.10.1
+
+- Preserve mid-history `system` messages added after conversation history starts as in-place `developer` input items across Python, TypeScript, and Rust chat requests, keeping the earlier conversation history prefix stable for prompt caching while leaving remote compaction (`compact_messages`) unchanged.
+- Document current preview limitations of OpenAI's public "Sign in with ChatGPT" (`chatgpt.tokens.use.direct`) route and why the Codex OAuth transport remains the default.
 
 ### v0.10.0
 

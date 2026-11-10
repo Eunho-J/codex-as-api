@@ -1,5 +1,19 @@
 # Release Notes
 
+## v0.10.1
+
+### Preserve late system notes across Python, TypeScript and Rust chat histories
+
+- Keep initial `system` messages in top-level `instructions`, and preserve `system`
+  messages appended after conversation history starts at their original positions as
+  `developer` input items across Python, TypeScript and Rust chat requests.
+  Appending per-turn runtime notes after tool results no longer mutates
+  `instructions` or invalidates the cached prefix of the prior conversation history.
+- Remote compaction (`/v1/compact` and `/v1/messages/compact`) remains unchanged so
+  system directives continue to form `instructions` during compaction.
+- Document current preview constraints of OpenAI's public "Sign in with ChatGPT"
+  (`chatgpt.tokens.use.direct`) route in `README.md`.
+
 ## v0.10.0
 
 ### Standalone browser login — no Codex installation required
