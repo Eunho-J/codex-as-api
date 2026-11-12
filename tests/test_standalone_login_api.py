@@ -45,7 +45,10 @@ ROUTES = [
 
 
 @pytest.mark.parametrize(("method", "path"), ROUTES)
-def test_management_disabled_without_admin_key(management_client, method, path):
+@pytest.mark.parametrize("admin_key", [None, "", "   "])
+def test_management_disabled_without_admin_key(monkeypatch, management_client, method, path, admin_key):
+    if admin_key is not None:
+        monkeypatch.setenv("CODEX_AS_API_ADMIN_KEY", admin_key)
     response = management_client.request(method, path, headers={"Authorization": "Bearer anything"})
     assert_error(response, 503, "management_disabled")
 

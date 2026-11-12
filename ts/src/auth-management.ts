@@ -92,7 +92,7 @@ export function createAuthManagementRouter(manager: LoginManager, status: () => 
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store");
     const key = process.env.CODEX_AS_API_ADMIN_KEY;
-    if (!key) return error(res, 503, "management_disabled");
+    if (!key || !key.trim()) return error(res, 503, "management_disabled");
     const header = req.headers.authorization;
     const match = typeof header === "string" ? /^Bearer ([^\s]+)$/i.exec(header) : null;
     if (!match || !sameKey(match[1], key)) return error(res, 401, "invalid_admin_key");

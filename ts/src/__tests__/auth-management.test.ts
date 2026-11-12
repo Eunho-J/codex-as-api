@@ -30,6 +30,11 @@ test("management routes authenticate, reject foreign origins, and expose only sa
   try {
     delete process.env.CODEX_AS_API_ADMIN_KEY;
     assert.equal((await check(await request("/auth/status"), 503)).error && starts, 0);
+    process.env.CODEX_AS_API_ADMIN_KEY = "   ";
+    assert.deepEqual(
+      await check(await request("/auth/status", { headers: { Authorization: "Bearer    " } }), 503),
+      { error: { code: "management_disabled", message: "Management API is disabled." } },
+    );
     process.env.CODEX_AS_API_ADMIN_KEY = "admin-test";
     await check(await request("/auth/status"), 401);
     const auth = { Authorization: "Bearer admin-test" };

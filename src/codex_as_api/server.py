@@ -2707,8 +2707,7 @@ async def compact(request: Request) -> JSONResponse:
     body = await _request_json_object(request)
     _reject_explicit_null_responses_lite(body)
     is_anthropic_compact = request.url.path == "/v1/messages/compact"
-    if is_anthropic_compact:
-        _claude_code_session_id(request.headers)
+    claude_session_id = _claude_code_session_id(request.headers) if is_anthropic_compact else None
     _reject_unknown_fields(
         body,
         _ANTHROPIC_COMPACT_FIELDS if is_anthropic_compact else _OPENAI_COMPACT_FIELDS,
@@ -2789,6 +2788,9 @@ async def compact(request: Request) -> JSONResponse:
         "_resolved_model": resolved_model,
     }
     if is_anthropic_compact:
+        prompt_cache_key = _anthropic_prompt_cache_key(body, claude_session_id)
+        if prompt_cache_key is not None:
+            compact_options["prompt_cache_key"] = prompt_cache_key
         service_tier = _anthropic_service_tier(body)
         if service_tier is not None:
             compact_options["service_tier"] = service_tier

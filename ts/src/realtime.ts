@@ -414,7 +414,7 @@ export function sidebandFailureReason(status: number | null, code: string | null
 }
 
 // A WebSocket close reason is at most 123 bytes of UTF-8.
-function clampReason(reason: string): string {
+export function clampReason(reason: string): string {
   let out = "";
   for (const ch of reason) {
     if (Buffer.byteLength(out + ch, "utf8") > 123) break;
@@ -505,12 +505,17 @@ export function attachRealtimeSideband(
     const path = (request.url ?? "").split("?")[0];
     if (!path.startsWith(REALTIME_SIDEBAND_ROUTE_PREFIX)) return;
     const callId = path.slice(REALTIME_SIDEBAND_ROUTE_PREFIX.length);
+    const voiceSessionHeader = request.headers["voice-session-id"];
+    const voiceSessionId = Array.isArray(voiceSessionHeader)
+      ? voiceSessionHeader.join(",")
+      : voiceSessionHeader;
     wss.handleUpgrade(request, socket, head, (client) => {
       void relayRealtimeSideband(client, {
         callId,
         authPath: options.authPath,
         sidebandBaseUrl: options.sidebandBaseUrl,
         versionResolver: options.versionResolver,
+        ...(voiceSessionId == null ? {} : { voiceSessionId }),
       });
     });
   });

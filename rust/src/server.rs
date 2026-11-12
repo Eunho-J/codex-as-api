@@ -966,7 +966,7 @@ async fn management_guard(
     next: Next,
 ) -> Response {
     let headers = request.headers();
-    let error = if key.as_deref().is_none_or(|k| k.is_empty()) {
+    let error = if key.as_deref().is_none_or(|k| k.trim().is_empty()) {
         Some((StatusCode::SERVICE_UNAVAILABLE, "management_disabled"))
     } else {
         let supplied = headers
@@ -1075,7 +1075,7 @@ async fn login_start(
 ) -> Response {
     let body = match body {
         Ok(body) => body,
-        Err(rejection) => return management_error(rejection.status(), "invalid_request"),
+        Err(_rejection) => return management_error(StatusCode::BAD_REQUEST, "invalid_request"),
     };
     let method = match parse_login_request(&body) {
         Ok(method) => method,
@@ -1176,7 +1176,7 @@ fn management_router(
         .route("/auth/login", post(login_start))
         .route("/auth/login/{id}", get(login_get).delete(login_cancel))
         .route("/auth/status", get(login_status))
-        .layer(DefaultBodyLimit::max(1024))
+        .layer(DefaultBodyLimit::max(4096))
         .with_state(ManagementState {
             _shutdown: Arc::new(ManagementShutdown(login.clone())),
             login,
@@ -5874,7 +5874,7 @@ mod tests {
         assert_eq!(response.headers()["cache-control"], "no-store");
         for (body, expected) in [
             ("{".to_owned(), StatusCode::BAD_REQUEST),
-            ("x".repeat(1025), StatusCode::PAYLOAD_TOO_LARGE),
+            ("x".repeat(4097), StatusCode::BAD_REQUEST),
         ] {
             let response = client
                 .post(format!("{base}/auth/login"))
@@ -5977,15 +5977,18 @@ mod tests {
             (format!("http://{address}"), task)
         }
         let client = reqwest::Client::new();
-        let (base, task) = start(None).await;
-        let response = client
-            .get(format!("{base}/auth/status"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        task.abort();
+        for disabled_key in [None, Some(String::new()), Some("   ".to_owned())] {
+            let (base, task) = start(disabled_key).await;
+            let response = client
+                .get(format!("{base}/auth/status"))
+                .bearer_auth("   ")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            task.abort();
+        }
         let (base, task) = start(Some("admin-secret".to_owned())).await;
         for (bearer, origin, expected) in [
             (None, None, StatusCode::UNAUTHORIZED),

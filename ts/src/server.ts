@@ -1258,7 +1258,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   async function compact(req: Request, res: Response): Promise<void> {
     const isAnthropicCompact = req.path === "/v1/messages/compact";
     try {
-      resolveClaudeCodeSessionId(req);
+      const claudeCodeSessionId = isAnthropicCompact
+        ? resolveClaudeCodeSessionId(req)
+        : undefined;
       const rawBody = requireRequestBody(req.body);
       if (isAnthropicCompact) {
         rejectExplicitNullAnthropicFields(rawBody);
@@ -1325,7 +1327,13 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         reasoningSummary,
         responsesLite,
         tools: tools ?? undefined,
-        promptCacheKey: resolvePromptCacheKey(body.prompt_cache_key),
+        promptCacheKey:
+          resolvePromptCacheKey(body.prompt_cache_key)
+          ?? (
+            claudeCodeSessionId == null
+              ? undefined
+              : claudeSessionPromptCacheKey(claudeCodeSessionId)
+          ),
         previousResponseId: resolvePreviousResponseId(body.previous_response_id),
         serviceTier: isAnthropicCompact
           ? resolveAnthropicServiceTier(body)

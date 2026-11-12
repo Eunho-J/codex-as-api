@@ -7043,6 +7043,54 @@ mod tests {
         let (instructions, input) = split_instructions_and_input(&messages).unwrap();
         assert_eq!(instructions, "You are helpful.");
         assert_eq!(input.len(), 1);
+
+        let sequence = vec![
+            Message::new(MessageRole::System, "S0".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::System, "S1".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::User, "U0".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::Assistant, "A0".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::System, "S2".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::System, "S3".to_string(), vec![], None, None).unwrap(),
+            Message::new(MessageRole::User, "U1".to_string(), vec![], None, None).unwrap(),
+        ];
+        let (chat_instructions, chat_items) =
+            split_instructions_and_input_with_options(&sequence, None, true).unwrap();
+        let (compact_instructions, compact_items) =
+            split_instructions_and_input(&sequence).unwrap();
+        assert_eq!(chat_instructions, "S0\n\nS1");
+        let chat_roles_texts: Vec<(&str, &str)> = chat_items
+            .iter()
+            .map(|item| {
+                (
+                    item["role"].as_str().unwrap(),
+                    item["content"][0]["text"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chat_roles_texts,
+            vec![
+                ("user", "U0"),
+                ("assistant", "A0"),
+                ("developer", "S2"),
+                ("developer", "S3"),
+                ("user", "U1"),
+            ]
+        );
+        assert_eq!(compact_instructions, "S0\n\nS1\n\nS2\n\nS3");
+        let compact_roles_texts: Vec<(&str, &str)> = compact_items
+            .iter()
+            .map(|item| {
+                (
+                    item["role"].as_str().unwrap(),
+                    item["content"][0]["text"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            compact_roles_texts,
+            vec![("user", "U0"), ("assistant", "A0"), ("user", "U1")]
+        );
     }
 
     #[test]
