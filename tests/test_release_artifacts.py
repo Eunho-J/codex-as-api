@@ -113,17 +113,17 @@ def test_accepts_exact_python_and_npm_release_identities(tmp_path: Path) -> None
     wheel = tmp_path / "codex_as_api-0.7.0-py3-none-any.whl"
     sdist = tmp_path / "codex_as_api-0.7.0.tar.gz"
     npm = tmp_path / "codex-as-api-0.7.0.tgz"
-    github_npm = tmp_path / "eunho-j-codex-as-api-0.7.0.tgz"
+    github_npm = tmp_path / "choam-co-codex-as-api-0.7.0.tgz"
     make_wheel(wheel)
     make_sdist(sdist)
     make_npm_tarball(npm, "codex-as-api")
-    make_npm_tarball(github_npm, "@eunho-j/codex-as-api")
+    make_npm_tarball(github_npm, "@choam-co/codex-as-api")
 
     check_release_artifacts.validate_python_distributions([wheel, sdist], "0.7.0")
     check_release_artifacts.validate_npm_tarball(npm, "codex-as-api", "0.7.0")
     check_release_artifacts.validate_npm_tarball(
         github_npm,
-        "@eunho-j/codex-as-api",
+        "@choam-co/codex-as-api",
         "0.7.0",
     )
 

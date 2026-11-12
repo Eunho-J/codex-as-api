@@ -1,9 +1,9 @@
 # codex-as-api
 
-[![GitHub Release](https://img.shields.io/github/v/release/Eunho-J/codex-as-api)](https://github.com/Eunho-J/codex-as-api/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/CHOAM-CO/codex-as-api)](https://github.com/CHOAM-CO/codex-as-api/releases)
 [![PyPI](https://img.shields.io/pypi/v/codex-as-api)](https://pypi.org/project/codex-as-api/)
 [![npm](https://img.shields.io/npm/v/codex-as-api)](https://www.npmjs.com/package/codex-as-api)
-[![License](https://img.shields.io/github/license/Eunho-J/codex-as-api)](LICENSE)
+[![License](https://img.shields.io/github/license/CHOAM-CO/codex-as-api)](LICENSE)
 
 Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
@@ -65,7 +65,7 @@ codex-as-api
 Or from source:
 
 ```bash
-git clone https://github.com/Eunho-J/codex-as-api.git
+git clone https://github.com/CHOAM-CO/codex-as-api.git
 cd codex-as-api
 pip install -e .
 codex-as-api
@@ -263,7 +263,7 @@ These three upstream-hidden models returned real responses on October 24, 2026, 
 
 A small authenticated smoke test also verified function-tool calling plus tool-result continuation for all three models, and executed a simple generated JavaScript function against four inputs per model. This is a basic functionality check, not a coding-quality benchmark.
 
-**These are hidden models. Upstream support can stop at any time, and availability may differ by account. If a model stops responding, [open an issue](https://github.com/Eunho-J/codex-as-api/issues) with its model ID and a sanitized error; we will remove the discontinued model from this catalog.** Do not include access tokens or other credentials in the issue.
+**These are hidden models. Upstream support can stop at any time, and availability may differ by account. If a model stops responding, [open an issue](https://github.com/CHOAM-CO/codex-as-api/issues) with its model ID and a sanitized error; we will remove the discontinued model from this catalog.** Do not include access tokens or other credentials in the issue.
 
 The proxy exposes these verified exceptions as selectable models and prefers their current live capability metadata. Bundled capability records keep only these three IDs available when a successful live catalog omits them; they do not bypass OAuth, upstream rejection, or a failed/malformed catalog fetch. A successful empty upstream catalog can therefore list these experimental entries, while health/default selection still fails until an ordinary upstream default is available. The proxy never selects a hidden experimental model as its automatic default.
 
@@ -946,10 +946,12 @@ The provider handles:
 ## Release & package publishing
 
 The `Release` GitHub Actions workflow runs on a pushed `v*` tag. It rejects a
-tag that does not exactly match every Python, npm, and Rust version surface,
+tag that does not exactly match every Python, npm, and Rust version surface or
+lacks a matching `## v<version>` section in [RELEASES.md](RELEASES.md),
 runs the complete cross-runtime gate, and then publishes PyPI, npmjs, the
 scoped GitHub npm package, deterministic platform Rust ZIP archives, and one
-GitHub Release. Each Rust archive contains the platform binary, `LICENSE`, and
+GitHub Release whose body is populated from that `RELEASES.md` section. Each
+Rust archive contains the platform binary, `LICENSE`, and
 the generated `THIRD_PARTY_NOTICES.md` covering both bundled tokenizer data and
 the locked normal dependency graph across supported release targets.
 
@@ -959,10 +961,10 @@ registry setup is still required:
 
 - Create GitHub environments named `pypi` and `npm`; add deployment protection
   rules if desired.
-- On PyPI, add a trusted publisher for project `codex-as-api`, owner `Eunho-J`,
+- On PyPI, add a trusted publisher for project `codex-as-api`, owner `CHOAM-CO`,
   repository `codex-as-api`, workflow `release.yml`, environment `pypi`.
 - On npmjs, add a GitHub Actions trusted publisher for package `codex-as-api`,
-  owner `Eunho-J`, repository `codex-as-api`, workflow `release.yml`,
+  owner `CHOAM-CO`, repository `codex-as-api`, workflow `release.yml`,
   environment `npm`, with `npm publish` allowed.
 - GitHub Packages and GitHub Releases use the job-scoped automatic
   `GITHUB_TOKEN`; repository policy must allow the workflow's declared
@@ -1000,173 +1002,6 @@ cd ts
 npm install
 npm test
 ```
-
-
-## Release Notes
-
-### v0.10.1
-
-- Preserve mid-history `system` messages added after conversation history starts as in-place `developer` input items across Python, TypeScript, and Rust chat requests, keeping the earlier conversation history prefix stable for prompt caching while leaving remote compaction (`compact_messages`) unchanged.
-- Document current preview limitations of OpenAI's public "Sign in with ChatGPT" (`chatgpt.tokens.use.direct`) route and why the Codex OAuth transport remains the default.
-
-### v0.10.0
-
-- Sign in directly with ordinary browser OAuth; no Codex installation or existing
-  Codex credentials are required. Device-code login is an explicit remote option.
-- Add independent admin-key-protected login start/status/cancel endpoints and a
-  private application-owned credential store across Python, TypeScript and Rust.
-- Upgrading requires a new codex-as-api login; existing Codex credentials remain
-  untouched. See [Standalone login](#standalone-login) and [full release notes](RELEASES.md).
-
-### v0.8.0
-
-- Add ChatGPT Live realtime voice to the TypeScript runtime: `POST
-  /v1/realtime/calls` creates an OAuth-authorized call from a client-owned WebRTC
-  SDP offer and returns the SDP answer, and `WS /v1/realtime/sideband/{call_id}`
-  relays the OpenAI realtime event sideband for headless clients. Audio stays on
-  the client's media plane.
-- Mirror the pinned Codex call contract exactly: one identity in
-  `x-session-id`/`session-id`/`thread-id`, the `openai-alpha: quicksilver=v2`
-  handshake, `intent=quicksilver&architecture=avas`, and a session payload that
-  never chooses its own voice-session id.
-- Document realtime as a TypeScript-only capability; Python and Rust remain
-  HTTP-only in this release instead of claiming cross-runtime parity.
-
-### v0.7.0
-
-- Replace bundled model capability tables with a fresh authenticated Codex
-  catalog and add `GET /v1/models` across all three runtimes.
-- Remove stale/unknown-model fallbacks, fabricated Anthropic signatures, silent
-  request downgrades, and malformed upstream recovery; return typed failures.
-- Reject hosted Anthropic WebSearch instead of translating incomplete OpenAI
-  search lifecycle data, and require authoritative completion and final usage.
-- Keep immediate Claude Code `message_start` delivery without inventing token
-  counts; final Anthropic fields are emitted only from authoritative provider data.
-- Scope continuation history and catalog state to the authenticated account,
-  validate before streaming, and make `/health` report actual readiness.
-- Require the official nested `tokens` auth layout, remove root-level and
-  noncanonical auth aliases, and reject external-host `chatgptAuthTokens`.
-- Pin the validated private contract to Codex `0.153.3` and publish the exact
-  tested artifacts to PyPI, npmjs, GitHub Packages, and GitHub Releases.
-- Install Python server dependencies with the base package so the default
-  `pip install codex-as-api` command produces a runnable server.
-
-### v0.6.5
-
-- Align GPT-5.6 alias, Sol, Terra, and Luna context limits with Codex `0.147.0`
-  at 272,000 tokens and derive the 244,800-token automatic compact threshold.
-- Pin the verified upstream request, Responses Lite, header, and model contract
-  to `openai/codex` commit
-  `be6e8eac029b183056b7e4402879f15d2c85f61b`; track its new fractional SSE
-  rollout-budget field without claiming an unapproved facade mapping.
-- Refresh OAuth credentials five minutes before expiry, coalesce concurrent
-  refreshes, reload changed credentials after 401, and preserve upstream HTTP
-  status codes across all three servers.
-- Replace startup npm version discovery with deterministic compatibility and
-  package-version identity in the Codex-style `User-Agent`.
-- Add full cross-runtime CI plus tag-gated OIDC publishing to PyPI and npmjs,
-  `GITHUB_TOKEN` publishing to GitHub Packages, and GitHub Release assets.
-
-### v0.6.4
-
-- Remove process-global generated Codex session/thread identities and require
-  explicit session identity when Codex metadata mode is enabled.
-- Resolve Chat cache affinity as explicit `prompt_cache_key`, then
-  `client_metadata.session_id`, then omission.
-- Derive Claude Code cache affinity from `x-claude-code-session-id` without
-  fabricating Codex metadata; keep normal Anthropic Messages stateless.
-- Validate and strip Anthropic `cache_control` compatibility hints without
-  claiming unavailable breakpoint or TTL semantics.
-- Update current compatibility evidence to Codex `0.145.0`, Codex `main` at
-  `bd2de422aa287b97b06ca6425a10935bcf1b3731`, and Claude Code `2.1.220`.
-
-### v0.6.3
-
-- Accept Claude Code auxiliary requests that combine ambient `output_config.effort` with call-level `thinking.disabled`.
-- Give explicit disabled thinking precedence and send Codex reasoning effort `none` instead of returning HTTP 400.
-- Document and test `CODEX_AS_API_RESPONSES_LITE=off` for Claude Code hosted WebSearch on GPT-5.6; WebFetch needs no Responses Lite override.
-- Preserve fail-loudly validation for invalid effort values and unsupported `output_config` fields.
-- Add Python, TypeScript, and Rust adapter regressions, streamed `/v1/messages` coverage, and a `/count_tokens` regression for the WebSearch/WebFetch request shape.
-
-### v0.6.2
-
-- Fix `/v1/messages/count_tokens` overcounting that could trigger Claude Code autocompaction on every turn.
-- Count normalized model-visible messages, tool calls, reasoning, tool-result metadata, and tool schemas once; remove the second full raw-request-body addition.
-- Port official `tiktoken` `o200k_base` ordinary encoding into Python, TypeScript, and Rust without adding a `tiktoken` package dependency or runtime rank download.
-- Match the upstream Unicode text split and BPE merge ranks last checked on 2026-07-14 against `tiktoken` 0.13.0 at `08a5f3b`.
-- Keep image input cost separate and count inline base64 images once rather than adding both a fixed image estimate and the base64 request bytes.
-- Add matching Python, TypeScript, and Rust endpoint regressions: a 4,000-byte ASCII message now returns `1,012` instead of roughly `8,000`, and non-model control fields do not change the count.
-- Validate the release with Claude Code `2.1.209` and real Codex OAuth chat.
-
-### v0.6.1
-
-- Re-audit official Codex `0.144.4` and `main` at `393f64565ab46f09d99ca4d9bd973537e72a114b`, plus Claude Code `2.1.208`, before publishing.
-- Validate Claude Code `2.1.208` with real Codex OAuth chat and tool loops, and document the official custom GPT picker entry alongside Fable, Opus, Sonnet, and Haiku.
-- Route bundled GPT model IDs from Anthropic requests to the selected Codex backend model while retaining configured fallback behavior for built-in Claude model names.
-- Map `output_config.effort` and Fast Mode to Codex effort and priority service tier, preserve URL images and tool-error state, and handle current context/tool beta fields without silent loss.
-- Keep Messages, token counting, and remote compaction aligned on effective model limits and fail-loudly validation for output formats and image sources.
-- Keep Python streaming work off the ASGI event loop and make Rust Anthropic SSE truly incremental so concurrent Claude Code requests are not stalled or buffered.
-- Preserve Rust streaming authentication, rate-limit, and overload errors after OAuth refresh instead of collapsing them to generic HTTP 500 failures.
-- Restrict the Python source distribution to release inputs so local agent state and unrelated runtime sources cannot enter PyPI artifacts.
-
-### v0.6.0
-
-- Add GPT-5.6 public alias plus Sol, Terra, and Luna capability metadata, model defaults, and Codex context-window behavior.
-- Refresh bundled context and default-effort metadata for current GPT-5.5, GPT-5.4, GPT-5.4 Mini, and GPT-5.2 catalog entries.
-- Update Responses Lite request bodies and headers across chat, compact, and inspection paths; Lite image generation is rejected explicitly because this proxy has no standalone image-tool executor.
-- Add `max`, Codex-compatible `ultra` to `max` wire conversion, future model-defined efforts, and `model_reasoning_effort` config support.
-- Add GPT-5.6 reasoning effort/context, `standard` mode compatibility, capability-gated image `original` detail, standard verbosity, cache accounting, and real backend `response_id` support across Python, TypeScript, and Rust.
-- Translate known `previous_response_id` values into bounded local full-history replay; reject Pro and non-null public cache policy/breakpoints or `safety_identifier` because the private Codex request contract has no equivalent field.
-- Reject hosted Multi-agent and Programmatic Tool Calling on the Chat facade until their native agent/program item lifecycle can be preserved.
-
-### v0.5.2
-
-- Support latest Codex root-level OAuth token files while keeping PAT-only, agent-identity-only, and Bedrock-only auth files explicitly unsupported.
-- Add shared model capability gating for Responses Lite, parallel tool calls, verbosity, and service-tier behavior across Python, TypeScript, and Rust.
-- Preserve encrypted reasoning state via top-level `reasoning.encrypted_content` include and add Codex metadata forwarding controls.
-
-### v0.5.1
-
-- Add official Codex CLI `originator` and versioned `User-Agent` headers for ChatGPT/Codex OAuth requests.
-- Resolve the latest `@openai/codex` version from npm at server startup, with `CODEX_AS_API_CODEX_CLI_VERSION` as an explicit override.
-
-### v0.5.0
-
-- Preserve Claude Code server-tool history (`server_tool_use`, `web_search_tool_result`, MCP/advisor-like result blocks) as backend context instead of dropping it on the next turn.
-- Support Anthropic `output_format` structured outputs by mapping JSON schema/object formats to OpenAI Responses `text.format`.
-- Preserve `document` and `search_result` content blocks inside tool results, keep Python streaming defaults aligned, and accept unsuffixed `web_search` server-tool types across Python, TypeScript, and Rust.
-
-### v0.4.0
-
-- Add Claude Code-compatible Anthropic hosted web search support by mapping `web_search_*` server tools to OpenAI Responses `web_search`.
-- Return `server_tool_use` and `web_search_tool_result` blocks so Claude Code can parse web search results reliably.
-- Prepare TypeScript package publishing to npmjs and GitHub Packages via GitHub Actions.
-
-### v0.3.3
-
-- Stop forwarding client `max_tokens` as Codex `max_output_tokens`, restoring Claude Code compatibility with the Codex OAuth backend.
-- Add Python, TypeScript, and Rust regression tests for the provider payload.
-
-### v0.3.2
-
-- Restore immediate Anthropic streaming so Claude Code receives events without waiting for the backend response to finish.
-- Use conservative local token estimates for `/v1/messages/count_tokens`; Codex OAuth has no count-only backend endpoint.
-- Keep real final streaming usage metadata in `message_delta`.
-
-### v0.3.1
-
-- Attempted real backend token counting for `/v1/messages/count_tokens` with `max_output_tokens: 0`; this is superseded by v0.3.2 because Codex OAuth rejects count-only requests.
-- Forward converted Anthropic tools, tool choice, stop sequences, and thinking/reasoning settings during token-count requests.
-- Propagate cumulative Anthropic streaming usage, including cache accounting, server tool use, and service tier metadata when available.
-- Pass `max_output_tokens` through provider requests across Python, TypeScript, and Rust.
-
-### v0.3.0
-
-- Read Codex CLI config from `CODEX_HOME` / `~/.codex/config.toml` across Python, TypeScript, and Rust.
-- Use the configured Codex backend model while preserving Anthropic client model names in `/v1/messages` responses.
-- Expose `context_window` and `auto_compact_token_limit` through `/health` and `/v1/messages/count_tokens`.
-- Add Anthropic-compatible `/v1/messages/count_tokens` and `/v1/messages/compact`.
-- Map context-window failures to Anthropic-style `400 invalid_request_error` responses and stream error events.
 
 ## License
 

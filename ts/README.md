@@ -52,7 +52,7 @@ BPE merge logic, and rank data. No `tiktoken` package or runtime download is
 required. The last upstream synchronization check was 2026-07-14 against
 `tiktoken` 0.13.0 commit `08a5f3b2c987ada4fc5aa1f16c643c203fa8acaa`.
 
-For configuration, supported endpoints, model behavior, and examples, see the [canonical GitHub documentation](https://github.com/Eunho-J/codex-as-api#readme).
+For configuration, supported endpoints, model behavior, and examples, see the [canonical GitHub documentation](https://github.com/CHOAM-CO/codex-as-api#readme).
 
 `/v1/messages`, `/v1/messages/count_tokens`, and `/v1/messages/compact` accept Anthropic-shaped requests from any client. No Claude Code header is required. `max_tokens` and validated ephemeral `cache_control` are compatibility hints; Codex OAuth does not expose the matching output cap or cache TTL/breakpoints. The optional Claude Code session header supplies cache affinity only.
 
@@ -83,7 +83,7 @@ queries and request headers use the same resolved version.
 
 The effective model catalog also explicitly includes the verified hidden models
 `gpt-6-chat-thinking`, `gpt-reserve`, and `codex-auto-review`. **Their upstream
-support can stop at any time. If one stops responding, [open an issue](https://github.com/Eunho-J/codex-as-api/issues)
+support can stop at any time. If one stops responding, [open an issue](https://github.com/CHOAM-CO/codex-as-api/issues)
 with its ID and a sanitized error; we will remove the discontinued entry.** Never
 post credentials. These experimental entries are not automatic defaults; current
 live capability metadata takes precedence. See the repository README for observed
@@ -132,7 +132,7 @@ replayed. Malformed, null, or server-tool caller variants fail before transport.
 
 If managed settings define an `availableModels` allowlist, include the exact custom option ID, such as `gpt-5.6-sol`, or Claude Code will hide or reject the GPT row.
 
-The base URL applies to the entire Claude Code process. Built-in `claude-*` rows use the configured `CODEX_AS_API_MODEL` or the fresh catalog default; they do not contact Anthropic while the gateway variables are active. Unknown non-facade names are not routed to a default. Keep these variables out of global settings when a second, direct-Anthropic Claude Code process is required. See the [full Claude Code guide](https://github.com/Eunho-J/codex-as-api#using-with-claude-code) for routing details and current compatibility limits.
+The base URL applies to the entire Claude Code process. Built-in `claude-*` rows use the configured `CODEX_AS_API_MODEL` or the fresh catalog default; they do not contact Anthropic while the gateway variables are active. Unknown non-facade names are not routed to a default. Keep these variables out of global settings when a second, direct-Anthropic Claude Code process is required. See the [full Claude Code guide](https://github.com/CHOAM-CO/codex-as-api#using-with-claude-code) for routing details and current compatibility limits.
 
 Summarized thinking exposes actual Codex summaries as unsigned `thinking`
 blocks / `thinking_delta` content and the existing `codex_reasoning` extensions.

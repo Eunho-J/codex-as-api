@@ -17,7 +17,7 @@ from typing import TypeVar
 
 PYTHON_PACKAGE_NAME = "codex-as-api"
 NPM_PACKAGE_NAME = "codex-as-api"
-GITHUB_NPM_PACKAGE_NAME = "@eunho-j/codex-as-api"
+GITHUB_NPM_PACKAGE_NAME = "@choam-co/codex-as-api"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 NPM_REQUIRED_TEXT_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
 SDIST_REQUIRED_SCRIPT_FILES = (

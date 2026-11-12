@@ -4,7 +4,7 @@ version = "0.10.1"
 edition = "2021"
 description = "Use ChatGPT/Codex OAuth as a local OpenAI-compatible API server."
 license = "Apache-2.0"
-repository = "https://github.com/Eunho-J/codex-as-api"
+repository = "https://github.com/CHOAM-CO/codex-as-api"
 
 [[bin]]
 name = "codex-as-api"

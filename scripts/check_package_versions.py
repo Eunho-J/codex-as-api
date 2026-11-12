@@ -212,17 +212,63 @@ def validate_versions(versions: Mapping[str, str], tag: str | None = None) -> st
     return version
 
 
-def main() -> int:
+def extract_release_notes(path: Path, version: str) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise VersionCheckError(f"{path}: could not read release notes ({type(error).__name__})") from None
+
+    target_heading = f"## v{version}"
+    sections: list[list[str]] = []
+    current_lines: list[str] | None = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if line.startswith("## "):
+            if stripped == target_heading:
+                current_lines = []
+                sections.append(current_lines)
+            else:
+                current_lines = None
+            continue
+        if current_lines is not None:
+            current_lines.append(line)
+
+    if not sections:
+        raise VersionCheckError(f"{path}: missing release notes section {target_heading!r}")
+    if len(sections) > 1:
+        raise VersionCheckError(f"{path}: duplicate release notes section {target_heading!r}")
+
+    body = "\n".join(sections[0]).strip()
+    if not body:
+        raise VersionCheckError(f"{path}: release notes section {target_heading!r} must not be empty")
+    return body
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--tag",
         help="Release tag to validate. It must be v followed by the shared package version.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--notes-output",
+        type=Path,
+        help="Optional file path to write the extracted RELEASES.md section for this version.",
+    )
+    args = parser.parse_args(argv)
 
     try:
         validate_package_names(collect_package_names(ROOT))
         version = validate_versions(collect_versions(ROOT), args.tag)
+        notes = extract_release_notes(ROOT / "RELEASES.md", version)
+        if args.notes_output is not None:
+            try:
+                args.notes_output.write_text(f"{notes}\n", encoding="utf-8")
+            except OSError as error:
+                raise VersionCheckError(
+                    f"{args.notes_output}: could not write extracted release notes ({type(error).__name__})"
+                ) from None
     except VersionCheckError as error:
         print(error, file=sys.stderr)
         return 1

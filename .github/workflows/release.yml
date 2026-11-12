@@ -95,24 +95,24 @@ jobs:
         run: |
           mkdir -p ../dist/npm ../dist/github
           npm pack --ignore-scripts --pack-destination ../dist/npm
-          npm pkg set name="@eunho-j/codex-as-api"
+          npm pkg set name="@choam-co/codex-as-api"
           npm pack --ignore-scripts --pack-destination ../dist/github
           python ../scripts/check_no_static_model_catalog.py ../dist/npm/*.tgz ../dist/github/*.tgz
           python ../scripts/check_release_artifacts.py \
             --version "${GITHUB_REF_NAME#v}" \
             --npm-tarball ../dist/npm/codex-as-api-*.tgz \
-            --github-npm-tarball ../dist/github/eunho-j-codex-as-api-*.tgz
+            --github-npm-tarball ../dist/github/choam-co-codex-as-api-*.tgz
       - name: Install and smoke-test the exact npm archives
         run: |
           unscoped_dir="$(mktemp -d)"
           scoped_dir="$(mktemp -d)"
           npm install --ignore-scripts --prefix "$unscoped_dir" ../dist/npm/codex-as-api-*.tgz
-          npm install --ignore-scripts --prefix "$scoped_dir" ../dist/github/eunho-j-codex-as-api-*.tgz
+          npm install --ignore-scripts --prefix "$scoped_dir" ../dist/github/choam-co-codex-as-api-*.tgz
           pushd "$unscoped_dir"
           node --input-type=module -e "await import('codex-as-api')"
           popd
           pushd "$scoped_dir"
-          node --input-type=module -e "await import('@eunho-j/codex-as-api')"
+          node --input-type=module -e "await import('@choam-co/codex-as-api')"
           popd
           set +e
           CODEX_AS_API_PORT=0 "$unscoped_dir/node_modules/.bin/codex-as-api"
@@ -130,7 +130,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: github-packages-tarball
-          path: dist/github/eunho-j-codex-as-api-*.tgz
+          path: dist/github/choam-co-codex-as-api-*.tgz
           if-no-files-found: error
 
   rust:
@@ -303,14 +303,14 @@ jobs:
         with:
           node-version: "22.14.0"
           registry-url: https://npm.pkg.github.com
-          scope: "@eunho-j"
+          scope: "@choam-co"
       - run: npm install --global npm@11.19.1
       - name: Verify downloaded GitHub Packages artifact
         run: |
-          python scripts/check_no_static_model_catalog.py dist/github/eunho-j-codex-as-api-*.tgz
+          python scripts/check_no_static_model_catalog.py dist/github/choam-co-codex-as-api-*.tgz
           python scripts/check_release_artifacts.py \
             --version "${GITHUB_REF_NAME#v}" \
-            --github-npm-tarball dist/github/eunho-j-codex-as-api-*.tgz
+            --github-npm-tarball dist/github/choam-co-codex-as-api-*.tgz
       - name: Check whether the exact GitHub Packages artifact is already published
         id: github_packages_state
         env:
@@ -318,14 +318,14 @@ jobs:
         run: |
           python scripts/check_registry_release.py npm \
             --registry https://npm.pkg.github.com \
-            --package @eunho-j/codex-as-api \
+            --package @choam-co/codex-as-api \
             --version "${GITHUB_REF_NAME#v}" \
-            --artifact dist/github/eunho-j-codex-as-api-*.tgz \
+            --artifact dist/github/choam-co-codex-as-api-*.tgz \
             --token-env NODE_AUTH_TOKEN \
             --packument
       - name: Publish GitHub Packages artifact
         if: steps.github_packages_state.outputs.published != 'true'
-        run: npm publish --registry=https://npm.pkg.github.com ./dist/github/eunho-j-codex-as-api-*.tgz
+        run: npm publish --registry=https://npm.pkg.github.com ./dist/github/choam-co-codex-as-api-*.tgz
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
 
@@ -349,7 +349,7 @@ jobs:
             release-artifacts/python-dist/*.whl \
             release-artifacts/python-dist/*.tar.gz \
             release-artifacts/npm-tarball/codex-as-api-*.tgz \
-            release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz \
+            release-artifacts/github-packages-tarball/choam-co-codex-as-api-*.tgz \
             release-artifacts/rust-linux-archive/*.zip \
             release-artifacts/rust-macos-archive/*.zip \
             release-artifacts/rust-windows-archive/*.zip
@@ -359,7 +359,7 @@ jobs:
               release-artifacts/python-dist/*.whl \
               release-artifacts/python-dist/*.tar.gz \
             --npm-tarball release-artifacts/npm-tarball/codex-as-api-*.tgz \
-            --github-npm-tarball release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz \
+            --github-npm-tarball release-artifacts/github-packages-tarball/choam-co-codex-as-api-*.tgz \
             --rust-archive linux release-artifacts/rust-linux-archive/*.zip \
             --rust-archive macos release-artifacts/rust-macos-archive/*.zip \
             --rust-archive windows release-artifacts/rust-windows-archive/*.zip
@@ -369,7 +369,7 @@ jobs:
           cp release-artifacts/python-dist/codex_as_api-*.whl release-assets/
           cp release-artifacts/python-dist/codex_as_api-*.tar.gz release-assets/
           cp release-artifacts/npm-tarball/codex-as-api-*.tgz release-assets/
-          cp release-artifacts/github-packages-tarball/eunho-j-codex-as-api-*.tgz release-assets/
+          cp release-artifacts/github-packages-tarball/choam-co-codex-as-api-*.tgz release-assets/
           cp release-artifacts/rust-linux-archive/*.zip release-assets/
           cp release-artifacts/rust-macos-archive/*.zip release-assets/
           cp release-artifacts/rust-windows-archive/*.zip release-assets/
@@ -382,18 +382,23 @@ jobs:
           python scripts/check_registry_release.py github-release \
             --repository "${{ github.repository }}" \
             --tag "$GITHUB_REF_NAME"
+      - name: Extract release notes for tag
+        run: |
+          python scripts/check_package_versions.py \
+            --tag "$GITHUB_REF_NAME" \
+            --notes-output release-notes.md
       - name: Create GitHub Release metadata
         if: steps.github_release_state.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
-      - name: Align existing GitHub Release title
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+      - name: Align existing GitHub Release metadata
         if: steps.github_release_state.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --draft=false --prerelease=false
+        run: gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --draft=false --prerelease=false
       - name: Remove release assets outside the exact local set
         env:
           GH_TOKEN: ${{ github.token }}

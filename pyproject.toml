@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "Eunho-J", email = "" },
+    { name = "CHOAM", email = "" },
 ]
 keywords = ["openai", "codex", "chatgpt", "oauth", "api", "llm"]
 classifiers = [
@@ -40,8 +40,8 @@ dev = ["pytest", "ruff", "mypy", "httpx", "types-regex", "tomli>=2.0.1"]
 codex-as-api = "codex_as_api.server:main"
 
 [project.urls]
-Homepage = "https://github.com/Eunho-J/codex-as-api"
-Repository = "https://github.com/Eunho-J/codex-as-api"
+Homepage = "https://github.com/CHOAM-CO/codex-as-api"
+Repository = "https://github.com/CHOAM-CO/codex-as-api"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_as_api"]

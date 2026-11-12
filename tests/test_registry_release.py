@@ -179,9 +179,9 @@ def test_npm_rejects_mismatched_or_malformed_registry_state(tmp_path: Path, muta
 
 
 def test_github_packages_packument_supports_new_and_identical_versions(tmp_path: Path) -> None:
-    artifact = tmp_path / "eunho-j-codex-as-api-0.7.0.tgz"
+    artifact = tmp_path / "choam-co-codex-as-api-0.7.0.tgz"
     artifact.write_bytes(b"github package")
-    package = "@eunho-j/codex-as-api"
+    package = "@choam-co/codex-as-api"
     unpublished = {"name": package, "versions": {"0.6.5": {}}}
     published = {
         "name": package,
@@ -215,9 +215,9 @@ def test_github_packages_packument_supports_new_and_identical_versions(tmp_path:
 
 
 def test_github_packages_rejects_a_malformed_target_version(tmp_path: Path) -> None:
-    artifact = tmp_path / "eunho-j-codex-as-api-0.7.0.tgz"
+    artifact = tmp_path / "choam-co-codex-as-api-0.7.0.tgz"
     artifact.write_bytes(b"github package")
-    package = "@eunho-j/codex-as-api"
+    package = "@choam-co/codex-as-api"
 
     with pytest.raises(check_registry_release.RegistryPreflightError):
         check_registry_release.check_npm_release(
@@ -232,19 +232,19 @@ def test_github_packages_rejects_a_malformed_target_version(tmp_path: Path) -> N
 
 
 def test_github_packages_uses_bearer_without_exposing_it(tmp_path: Path) -> None:
-    artifact = tmp_path / "eunho-j-codex-as-api-0.7.0.tgz"
+    artifact = tmp_path / "choam-co-codex-as-api-0.7.0.tgz"
     artifact.write_bytes(b"github package")
     token = "never-print-this-token"
 
     def fetch(url: str, headers: Mapping[str, str]) -> object | None:
-        assert url == "https://npm.pkg.github.com/@eunho-j%2Fcodex-as-api"
+        assert url == "https://npm.pkg.github.com/@choam-co%2Fcodex-as-api"
         assert headers["Authorization"] == f"Bearer {token}"
         raise check_registry_release.RegistryPreflightError("registry request returned HTTP 401")
 
     with pytest.raises(check_registry_release.RegistryPreflightError) as captured:
         check_registry_release.check_npm_release(
             "https://npm.pkg.github.com",
-            "@eunho-j/codex-as-api",
+            "@choam-co/codex-as-api",
             "0.7.0",
             artifact,
             token=token,
@@ -336,7 +336,7 @@ def test_http_layer_rejects_malformed_json_and_sanitizes_network_errors() -> Non
 def test_github_release_only_accepts_404_or_the_exact_tag() -> None:
     assert (
         check_registry_release.check_github_release(
-            "Eunho-J/codex-as-api",
+            "CHOAM-CO/codex-as-api",
             "v0.7.0",
             "secret",
             fetch_json=static_fetcher(None),
@@ -345,7 +345,7 @@ def test_github_release_only_accepts_404_or_the_exact_tag() -> None:
     )
     assert (
         check_registry_release.check_github_release(
-            "Eunho-J/codex-as-api",
+            "CHOAM-CO/codex-as-api",
             "v0.7.0",
             "secret",
             fetch_json=static_fetcher({"tag_name": "v0.7.0"}),
@@ -354,7 +354,7 @@ def test_github_release_only_accepts_404_or_the_exact_tag() -> None:
     )
     with pytest.raises(check_registry_release.RegistryPreflightError):
         check_registry_release.check_github_release(
-            "Eunho-J/codex-as-api",
+            "CHOAM-CO/codex-as-api",
             "v0.7.0",
             "secret",
             fetch_json=static_fetcher({"tag_name": "v0.7.1"}),
@@ -378,7 +378,7 @@ def test_github_release_asset_prune_only_deletes_unexpected_assets(tmp_path: Pat
         deleted.append(url)
 
     check_registry_release.prune_github_release_assets(
-        "Eunho-J/codex-as-api",
+        "CHOAM-CO/codex-as-api",
         "v0.7.0",
         "secret",
         [expected],
@@ -386,7 +386,7 @@ def test_github_release_asset_prune_only_deletes_unexpected_assets(tmp_path: Pat
         delete_asset=delete_asset,
     )
 
-    assert deleted == ["https://api.github.com/repos/Eunho-J/codex-as-api/releases/assets/11"]
+    assert deleted == ["https://api.github.com/repos/CHOAM-CO/codex-as-api/releases/assets/11"]
 
 
 def test_github_release_asset_prune_validates_all_ids_before_deleting(tmp_path: Path) -> None:
@@ -396,7 +396,7 @@ def test_github_release_asset_prune_validates_all_ids_before_deleting(tmp_path: 
 
     with pytest.raises(check_registry_release.RegistryPreflightError):
         check_registry_release.prune_github_release_assets(
-            "Eunho-J/codex-as-api",
+            "CHOAM-CO/codex-as-api",
             "v0.7.0",
             "secret",
             [expected],
@@ -433,7 +433,7 @@ def test_github_release_asset_verification_requires_exact_names_and_sha256(
     }
 
     check_registry_release.verify_github_release_assets(
-        "Eunho-J/codex-as-api",
+        "CHOAM-CO/codex-as-api",
         "v0.7.0",
         "secret",
         [expected],
@@ -468,7 +468,7 @@ def test_github_release_asset_verification_rejects_non_exact_remote_state(
 
     with pytest.raises(check_registry_release.RegistryPreflightError):
         check_registry_release.verify_github_release_assets(
-            "Eunho-J/codex-as-api",
+            "CHOAM-CO/codex-as-api",
             "v0.7.0",
             "secret",
             [expected],
@@ -484,7 +484,7 @@ def test_http_delete_requires_github_no_content_without_exposing_token() -> None
 
     with pytest.raises(check_registry_release.RegistryPreflightError) as captured:
         check_registry_release._http_delete(  # noqa: SLF001
-            "https://api.github.com/repos/Eunho-J/codex-as-api/releases/assets/11",
+            "https://api.github.com/repos/CHOAM-CO/codex-as-api/releases/assets/11",
             {"Authorization": "Bearer never-print-this-token"},
             opener=forbidden,
         )

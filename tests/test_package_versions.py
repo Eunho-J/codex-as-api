@@ -50,6 +50,10 @@ def write_release_metadata(root: Path, version: str = "1.2.3") -> None:
         f'version = 4\n\n[[package]]\nname = "codex-as-api"\nversion = "{version}"\n',
         encoding="utf-8",
     )
+    (root / "RELEASES.md").write_text(
+        f"# Release Notes\n\n## v{version}\n\n- Validated release {version}.\n",
+        encoding="utf-8",
+    )
 
 
 def test_collect_versions_reads_every_release_version_surface(tmp_path: Path) -> None:
@@ -157,3 +161,62 @@ def test_collect_versions_rejects_missing_lockfile_root_version(tmp_path: Path) 
     with pytest.raises(check_package_versions.VersionCheckError) as caught:
         check_package_versions.collect_versions(tmp_path)
     assert "packages..version" in str(caught.value)
+
+
+def test_extract_release_notes_returns_exact_version_section(tmp_path: Path) -> None:
+    releases = tmp_path / "RELEASES.md"
+    releases.write_text(
+        "# Release Notes\n\n"
+        "## v1.2.4\n\n"
+        "- Newer item.\n\n"
+        "## v1.2.3\n\n"
+        "### Summary\n\n"
+        "- First change.\n"
+        "- Second change.\n\n"
+        "## v1.2.2\n\n"
+        "- Older item.\n",
+        encoding="utf-8",
+    )
+
+    notes = check_package_versions.extract_release_notes(releases, "1.2.3")
+
+    assert notes == "### Summary\n\n- First change.\n- Second change."
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_message"),
+    [
+        ("# Release Notes\n\n## v1.2.2\n\n- Older item.\n", "missing release notes section '## v1.2.3'"),
+        (
+            "# Release Notes\n\n## v1.2.3\n\n- First.\n\n## v1.2.3\n\n- Duplicate.\n",
+            "duplicate release notes section '## v1.2.3'",
+        ),
+        ("# Release Notes\n\n## v1.2.3\n\n   \n## v1.2.2\n\n- Older.\n", "must not be empty"),
+    ],
+)
+def test_extract_release_notes_rejects_missing_duplicate_or_empty_section(
+    tmp_path: Path, content: str, expected_message: str
+) -> None:
+    releases = tmp_path / "RELEASES.md"
+    releases.write_text(content, encoding="utf-8")
+
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
+        check_package_versions.extract_release_notes(releases, "1.2.3")
+    assert expected_message in str(caught.value)
+
+
+def test_extract_release_notes_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(check_package_versions.VersionCheckError) as caught:
+        check_package_versions.extract_release_notes(tmp_path / "RELEASES.md", "1.2.3")
+    assert "could not read release notes" in str(caught.value)
+
+
+def test_main_writes_notes_output_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_release_metadata(tmp_path, "1.2.3")
+    monkeypatch.setattr(check_package_versions, "ROOT", tmp_path)
+    output_file = tmp_path / "release-notes.md"
+
+    exit_code = check_package_versions.main(["--tag", "v1.2.3", "--notes-output", str(output_file)])
+
+    assert exit_code == 0
+    assert output_file.read_text(encoding="utf-8") == "- Validated release 1.2.3.\n"
