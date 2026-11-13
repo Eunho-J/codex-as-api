@@ -53,6 +53,10 @@ const REALTIME_CALL_QUERY = "intent=quicksilver&architecture=avas";
 const MAX_SDP_BYTES = 256 * 1024;
 const SIDEBAND_JOIN_ATTEMPTS = 4;
 const SIDEBAND_JOIN_BACKOFF_MS = [100, 300, 800];
+/** Default wall-clock deadline in milliseconds for `createRealtimeCall` (request + body read). */
+export const REALTIME_CALL_TIMEOUT_MS = 15_000;
+/** Default wall-clock deadline in milliseconds for each WebSocket sideband join attempt. */
+export const SIDEBAND_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export interface RealtimeCallSessionPayload {
   instructions?: string;
@@ -77,6 +81,9 @@ export interface CreateRealtimeCallOptions {
    * #53784, Codex 0.164.0). Distinct from the realtime session id (`x-session-id`).
    */
   voiceSessionId?: string;
+  /** Total wall-clock deadline in milliseconds covering request headers and SDP body read. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   versionResolver?: CodexVersionProvider;
 }
@@ -255,6 +262,71 @@ function decodeCallId(location: string | null): string {
   return validateCallId(segment);
 }
 
+function resolveTimeoutMs(value: number | undefined, fallback: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new ChatGPTOAuthInvalidRequestError(`\`${name}\` must be a positive finite number`);
+  }
+  return value;
+}
+
+async function readResponseTextBounded(
+  response: Response,
+  maxBytes: number,
+  strictMaxBytes: boolean,
+  deadlinePromise: Promise<never>,
+): Promise<string> {
+  const body = response.body;
+  if (body == null || typeof body.getReader !== "function") {
+    const raw = await Promise.race([response.text(), deadlinePromise]);
+    const buf = Buffer.from(raw, "utf8");
+    if (buf.length > maxBytes) {
+      if (strictMaxBytes) {
+        throw new ChatGPTOAuthUpstreamError(
+          502,
+          `upstream realtime call response exceeded ${maxBytes} bytes`,
+        );
+      }
+      return buf.subarray(0, maxBytes).toString("utf8");
+    }
+    return raw;
+  }
+
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await Promise.race([reader.read(), deadlinePromise]);
+      if (done) break;
+      if (value == null || value.byteLength === 0) continue;
+      const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      if (totalBytes + chunk.length > maxBytes) {
+        if (strictMaxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new ChatGPTOAuthUpstreamError(
+            502,
+            `upstream realtime call response exceeded ${maxBytes} bytes`,
+          );
+        }
+        const remaining = maxBytes - totalBytes;
+        if (remaining > 0) {
+          chunks.push(chunk.subarray(0, remaining));
+          totalBytes += remaining;
+        }
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(chunk);
+      totalBytes += chunk.length;
+    }
+  } catch (err) {
+    void reader.cancel().catch(() => {});
+    throw err;
+  }
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
+}
+
 /**
  * Create a ChatGPT Live (realtime) call and return its SDP answer plus call id.
  *
@@ -267,38 +339,142 @@ export async function createRealtimeCall(
   options: CreateRealtimeCallOptions,
 ): Promise<RealtimeCallResult> {
   const sdp = requireSdp(options.sdp);
+  const timeoutMs = resolveTimeoutMs(options.timeoutMs, REALTIME_CALL_TIMEOUT_MS, "timeoutMs");
   const mode = resolveRealtimeCallMode(options.session, options.mode);
   const session = buildRealtimeSessionPayload(options.session, mode);
-  const auth = await realtimeAuthHeaders(options.authPath, options.versionResolver, mode);
-  const baseUrl = resolveRealtimeBaseUrl(options.baseUrl);
   const sessionId = options.sessionId ?? randomUUID();
   const threadId = options.threadId ?? sessionId;
   validateCallId(sessionId);
   validateCallId(threadId);
   const voiceSessionId = options.voiceSessionId == null ? undefined : validateVoiceSessionId(options.voiceSessionId);
+  const baseUrl = resolveRealtimeBaseUrl(options.baseUrl);
+  const auth = await realtimeAuthHeaders(options.authPath, options.versionResolver, mode);
 
   const url = mode === "live" ? `${baseUrl}/realtime/calls?${REALTIME_CALL_QUERY}` : `${baseUrl}/realtime/calls`;
   const fetchImpl = options.fetchImpl ?? fetch;
-  const response = await fetchImpl(url, {
-    method: "POST",
-    headers: {
-      ...auth.headers,
-      "x-session-id": sessionId,
-      "session-id": sessionId,
-      "thread-id": threadId,
-      ...(voiceSessionId == null ? {} : { "voice-session-id": voiceSessionId }),
-    },
-    body: JSON.stringify({ sdp, session }),
+
+  const controller = new AbortController();
+  const onCallerAbort = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) {
+    onCallerAbort();
+  } else {
+    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  }
+
+  const deadlineAt = Date.now() + timeoutMs;
+  let timedOut = false;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadlinePromise = new Promise<never>((_resolve, reject) => {
+    deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      const err = new ChatGPTOAuthUpstreamError(
+        504,
+        `upstream realtime call creation timed out after ${timeoutMs}ms`,
+      );
+      controller.abort(err);
+      reject(err);
+    }, timeoutMs);
+    deadlineTimer.unref?.();
   });
-  const text = await response.text();
-  if (!response.ok) {
-    const detail = redactText(text, auth.token.access_token);
+  deadlinePromise.catch(() => {});
+
+  let response: Response;
+  let text = "";
+  try {
+    if (options.signal?.aborted) {
+      throw new ChatGPTOAuthUpstreamError(499, "realtime call creation aborted");
+    }
+    try {
+      response = await Promise.race([
+        fetchImpl(url, {
+          method: "POST",
+          headers: {
+            ...auth.headers,
+            "x-session-id": sessionId,
+            "session-id": sessionId,
+            "thread-id": threadId,
+            ...(voiceSessionId == null ? {} : { "voice-session-id": voiceSessionId }),
+          },
+          body: JSON.stringify({ sdp, session }),
+          signal: controller.signal,
+        }),
+        deadlinePromise,
+      ]);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthUpstreamError || err instanceof ChatGPTOAuthInvalidRequestError) {
+        throw err;
+      }
+      if (timedOut) {
+        throw new ChatGPTOAuthUpstreamError(
+          504,
+          `upstream realtime call creation timed out after ${timeoutMs}ms`,
+        );
+      }
+      const detail = redactText(String(err), auth.token.access_token);
+      throw new ChatGPTOAuthUpstreamError(
+        502,
+        `upstream realtime call creation failed: ${detail}`,
+      );
+    }
+
+    if (!response.ok) {
+      const remainingMs = Math.max(1, deadlineAt - Date.now());
+      const errorWaitMs = Math.min(UPSTREAM_ERROR_BODY_WAIT_MS, remainingMs);
+      let errorTimer: ReturnType<typeof setTimeout> | undefined;
+      const errorDeadline = new Promise<never>((_resolve, reject) => {
+        errorTimer = setTimeout(() => reject(new Error("error body timeout")), errorWaitMs);
+        errorTimer.unref?.();
+      });
+      errorDeadline.catch(() => {});
+      try {
+        text = await readResponseTextBounded(
+          response,
+          UPSTREAM_ERROR_BODY_MAX_BYTES,
+          false,
+          errorDeadline,
+        );
+      } catch {
+        text = "";
+      } finally {
+        clearTimeout(errorTimer);
+      }
+      const detail = redactText(text, auth.token.access_token);
+      throw new ChatGPTOAuthUpstreamError(
+        response.status,
+        `upstream realtime call creation failed: HTTP ${response.status}: ${detail}`,
+      );
+    }
+
+    try {
+      text = await readResponseTextBounded(response, MAX_SDP_BYTES, true, deadlinePromise);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthUpstreamError || err instanceof ChatGPTOAuthInvalidRequestError) {
+        throw err;
+      }
+      if (timedOut) {
+        throw new ChatGPTOAuthUpstreamError(
+          504,
+          `upstream realtime call creation timed out after ${timeoutMs}ms`,
+        );
+      }
+      const detail = redactText(String(err), auth.token.access_token);
+      throw new ChatGPTOAuthUpstreamError(
+        502,
+        `upstream realtime call response read failed: ${detail}`,
+      );
+    }
+  } finally {
+    clearTimeout(deadlineTimer);
+    options.signal?.removeEventListener("abort", onCallerAbort);
+  }
+
+  const callId = decodeCallId(response.headers.get("location"));
+  if (text.trim().length === 0 || !text.startsWith("v=0")) {
     throw new ChatGPTOAuthUpstreamError(
-      response.status,
-      `upstream realtime call creation failed: HTTP ${response.status}: ${detail}`,
+      502,
+      "upstream realtime call response is not a valid SDP answer",
     );
   }
-  const callId = decodeCallId(response.headers.get("location"));
   return {
     status: response.status,
     sdp: text,
@@ -316,66 +492,120 @@ export interface SidebandRelayOptions {
   sidebandBaseUrl?: string;
   /** Forwarded as `voice-session-id` on the sideband join (existing-call transport). */
   voiceSessionId?: string;
+  /** Wall-clock deadline in milliseconds for each WebSocket handshake attempt (default: 10000). */
+  handshakeTimeoutMs?: number;
   versionResolver?: CodexVersionProvider;
+}
+
+function isClientActive(client: WebSocket): boolean {
+  return client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING;
 }
 
 /**
  * Relay a client WebSocket to the OpenAI realtime sideband of an already-created
  * call. Headless clients (a Discord bot, a server-side agent) use this instead of
  * the WebRTC data channel.
+ *
+ * Resolves once the upstream sideband WebSocket is open and wired to `client`.
+ * When validation, authentication, or the upstream WebSocket join fails (or times
+ * out), closes `client` with the corresponding 4xxx close frame AND rejects with
+ * the underlying error so callers awaiting `relayRealtimeSideband` never mark a
+ * call connected without a live sideband.
  */
-export async function relayRealtimeSideband(
+export function relayRealtimeSideband(
   client: WebSocket,
   options: SidebandRelayOptions,
 ): Promise<void> {
+  const promise = relayRealtimeSidebandImpl(client, options);
+  // Mark the returned promise handled so fire-and-forget callers (`void relayRealtimeSideband(...)`)
+  // that rely solely on `client`'s `close` event do not trigger an unhandled rejection,
+  // while callers that `await` or `.catch()` still observe the rejection.
+  promise.catch(() => {});
+  return promise;
+}
+
+async function relayRealtimeSidebandImpl(
+  client: WebSocket,
+  options: SidebandRelayOptions,
+): Promise<void> {
+  let handshakeTimeoutMs: number;
   let callId: string;
+  let voiceSessionId: string | undefined;
   try {
+    handshakeTimeoutMs = resolveTimeoutMs(
+      options.handshakeTimeoutMs,
+      SIDEBAND_HANDSHAKE_TIMEOUT_MS,
+      "handshakeTimeoutMs",
+    );
     callId = validateCallId(options.callId);
-  } catch {
+  } catch (err) {
+    await Promise.resolve();
     closeClient(client, 4400, "invalid realtime call id");
-    return;
+    throw err;
+  }
+  if (options.voiceSessionId != null) {
+    try {
+      voiceSessionId = validateVoiceSessionId(options.voiceSessionId);
+    } catch (err) {
+      await Promise.resolve();
+      closeClient(client, 4400, "invalid voice session id");
+      throw err;
+    }
   }
   let auth: RealtimeAuthContext;
   try {
     auth = await realtimeAuthHeaders(options.authPath, options.versionResolver);
-  } catch {
+  } catch (err) {
     closeClient(client, 4501, "realtime auth unavailable");
-    return;
+    throw err;
   }
   const target = resolveRealtimeSidebandUrl(callId, options.sidebandBaseUrl);
   const headers: Record<string, string> = { ...auth.headers };
   delete headers["Content-Type"];
-  if (options.voiceSessionId != null) {
-    try {
-      headers["voice-session-id"] = validateVoiceSessionId(options.voiceSessionId);
-    } catch {
-      closeClient(client, 4400, "invalid voice session id");
-      return;
-    }
+  if (voiceSessionId != null) {
+    headers["voice-session-id"] = voiceSessionId;
   }
 
   let upstream: WebSocket | null = null;
   let lastStatus: number | null = null;
   let lastCode: string | null = null;
   for (let attempt = 0; attempt < SIDEBAND_JOIN_ATTEMPTS; attempt++) {
-    const joined = await openUpstream(target, headers);
+    if (!isClientActive(client)) {
+      throw new ChatGPTOAuthInvalidRequestError("realtime sideband client closed before join");
+    }
+    const joined = await openUpstream(target, headers, handshakeTimeoutMs, client);
     if (joined.socket != null) {
+      if (!isClientActive(client)) {
+        try {
+          joined.socket.terminate();
+        } catch {
+          /* ignore */
+        }
+        throw new ChatGPTOAuthInvalidRequestError("realtime sideband client closed before join");
+      }
       upstream = joined.socket;
       break;
     }
     lastStatus = joined.status;
     lastCode = joined.code;
+    if (joined.code === "client_closed") {
+      throw new ChatGPTOAuthInvalidRequestError("realtime sideband client closed before join");
+    }
     if (joined.status !== 404) break;
-    const delay =
-      SIDEBAND_JOIN_BACKOFF_MS[Math.min(attempt, SIDEBAND_JOIN_BACKOFF_MS.length - 1)];
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (attempt + 1 < SIDEBAND_JOIN_ATTEMPTS) {
+      const delay =
+        SIDEBAND_JOIN_BACKOFF_MS[Math.min(attempt, SIDEBAND_JOIN_BACKOFF_MS.length - 1)];
+      await waitBackoffOrClientClose(delay, client);
+    }
   }
 
   if (upstream == null) {
     // The close code stays 4403 / 4504; the reason carries what the upstream said, so a
-    // caller's log shows the cause (e.g. "HTTP 404 session_id_not_found").
-    closeClient(client, lastStatus === 403 ? 4403 : 4504, sidebandFailureReason(lastStatus, lastCode));
-    return;
+    // caller's log shows the cause (e.g. "HTTP 404 session_id_not_found" or "timeout").
+    const reason = sidebandFailureReason(lastStatus, lastCode);
+    closeClient(client, lastStatus === 403 ? 4403 : 4504, reason);
+    const status = lastStatus ?? (lastCode === "timeout" ? 504 : 502);
+    throw new ChatGPTOAuthUpstreamError(status, reason);
   }
 
   const socket: WebSocket = upstream;
@@ -404,6 +634,22 @@ export async function relayRealtimeSideband(
     } catch {
       /* already closed */
     }
+  });
+}
+
+function waitBackoffOrClientClose(delayMs: number, client: WebSocket): Promise<void> {
+  if (!isClientActive(client)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onClose = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      client.removeListener?.("close", onClose);
+      resolve();
+    }, delayMs);
+    timer.unref?.();
+    client.once?.("close", onClose);
   });
 }
 
@@ -451,23 +697,81 @@ export function upstreamErrorCode(body: string): string | null {
 
 type UpstreamJoin = { socket: WebSocket | null; status: number | null; code: string | null };
 
-function openUpstream(target: string, headers: Record<string, string>): Promise<UpstreamJoin> {
+function openUpstream(
+  target: string,
+  headers: Record<string, string>,
+  handshakeTimeoutMs = SIDEBAND_HANDSHAKE_TIMEOUT_MS,
+  client?: WebSocket,
+): Promise<UpstreamJoin> {
+  if (client != null && !isClientActive(client)) {
+    return Promise.resolve({ socket: null, status: null, code: "client_closed" });
+  }
   return new Promise((resolve) => {
-    const socket = new WebSocket(target, { headers });
+    const deadlineAt = Date.now() + handshakeTimeoutMs;
+    const socket = new WebSocket(target, { headers, handshakeTimeout: handshakeTimeoutMs });
     let settled = false;
+    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
+    let finishRefusal: (() => void) | null = null;
+
+    const cleanup = () => {
+      clearTimeout(handshakeTimer);
+      clearTimeout(bodyTimer);
+      if (client != null) {
+        client.removeListener?.("close", onClientClose);
+      }
+    };
+
     const settle = (value: UpstreamJoin) => {
       if (settled) return;
       settled = true;
+      cleanup();
       resolve(value);
     };
-    socket.once("open", () => settle({ socket, status: 101, code: null }));
+
+    const onClientClose = () => {
+      settle({ socket: null, status: null, code: "client_closed" });
+      try {
+        socket.terminate();
+      } catch {
+        /* ignore */
+      }
+    };
+    client?.once?.("close", onClientClose);
+
+    const handshakeTimer = setTimeout(() => {
+      if (finishRefusal != null) {
+        finishRefusal();
+        return;
+      }
+      settle({ socket: null, status: null, code: "timeout" });
+      try {
+        socket.terminate();
+      } catch {
+        /* ignore */
+      }
+    }, handshakeTimeoutMs);
+    handshakeTimer.unref?.();
+
+    socket.once("open", () => {
+      if (client != null && !isClientActive(client)) {
+        settle({ socket: null, status: null, code: "client_closed" });
+        try {
+          socket.terminate();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      settle({ socket, status: 101, code: null });
+    });
     socket.once("unexpected-response", (_request, response) => {
       // Read a little of the refusal body for its error code, then drop the connection.
       const status = response.statusCode ?? null;
       const chunks: Buffer[] = [];
       let size = 0;
       const finish = () => {
-        clearTimeout(timer);
+        finishRefusal = null;
+        clearTimeout(bodyTimer);
         const body = Buffer.concat(chunks).toString("utf8");
         settle({ socket: null, status, code: upstreamErrorCode(body) });
         try {
@@ -476,7 +780,10 @@ function openUpstream(target: string, headers: Record<string, string>): Promise<
           /* ignore */
         }
       };
-      const timer = setTimeout(finish, UPSTREAM_ERROR_BODY_WAIT_MS);
+      finishRefusal = finish;
+      const remainingMs = Math.max(1, deadlineAt - Date.now());
+      bodyTimer = setTimeout(finish, Math.min(UPSTREAM_ERROR_BODY_WAIT_MS, remainingMs));
+      bodyTimer.unref?.();
       response.on("data", (chunk: Buffer) => {
         if (size >= UPSTREAM_ERROR_BODY_MAX_BYTES) return;
         const piece = chunk.subarray(0, UPSTREAM_ERROR_BODY_MAX_BYTES - size);
@@ -487,8 +794,20 @@ function openUpstream(target: string, headers: Record<string, string>): Promise<
       response.once("end", finish);
       response.once("error", finish);
     });
-    socket.once("error", () => settle({ socket: null, status: null, code: null }));
-    socket.once("close", () => settle({ socket: null, status: null, code: null }));
+    socket.once("error", () => {
+      if (finishRefusal != null) {
+        finishRefusal();
+        return;
+      }
+      settle({ socket: null, status: null, code: null });
+    });
+    socket.once("close", () => {
+      if (finishRefusal != null) {
+        finishRefusal();
+        return;
+      }
+      settle({ socket: null, status: null, code: null });
+    });
   });
 }
 
@@ -497,6 +816,7 @@ export function attachRealtimeSideband(
   options: {
     authPath?: string | null;
     sidebandBaseUrl?: string;
+    handshakeTimeoutMs?: number;
     versionResolver?: CodexVersionProvider;
   } = {},
 ): void {
@@ -515,6 +835,7 @@ export function attachRealtimeSideband(
         authPath: options.authPath,
         sidebandBaseUrl: options.sidebandBaseUrl,
         versionResolver: options.versionResolver,
+        ...(options.handshakeTimeoutMs == null ? {} : { handshakeTimeoutMs: options.handshakeTimeoutMs }),
         ...(voiceSessionId == null ? {} : { voiceSessionId }),
       });
     });
