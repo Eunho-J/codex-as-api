@@ -470,12 +470,13 @@ describe("realtime call creation", () => {
           sdp: OFFER,
           authPath,
           baseUrl,
-          timeoutMs: 160,
+          timeoutMs: 140,
           versionResolver: () => "0.205.0",
         }),
         (err: unknown) => {
           assert.ok(err instanceof ChatGPTOAuthUpstreamError);
-          assert.equal(err.status, 502);
+          assert.equal(err.status, 504);
+          assert.match(err.message, /timed out/);
           return true;
         },
       );
@@ -483,47 +484,6 @@ describe("realtime call creation", () => {
       for (const t of activeTimers) clearTimeout(t);
       for (const s of activeSockets) s.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      fs.rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects oversized or non-SDP 201 bodies from upstream", async () => {
-    const upstream = await startRealtimeUpstream();
-    const { authPath, directory } = writeAuthFile();
-    try {
-      upstream.setResponse(201, `v=0\r\n${"a".repeat(256 * 1024)}`);
-      await assert.rejects(
-        createRealtimeCall({
-          sdp: OFFER,
-          authPath,
-          baseUrl: upstream.baseUrl,
-          versionResolver: () => "0.205.0",
-        }),
-        (err: unknown) => {
-          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
-          assert.equal(err.status, 502);
-          assert.match(err.message, /exceeded 262144 bytes/);
-          return true;
-        },
-      );
-
-      upstream.setResponse(201, "<html>not sdp</html>");
-      await assert.rejects(
-        createRealtimeCall({
-          sdp: OFFER,
-          authPath,
-          baseUrl: upstream.baseUrl,
-          versionResolver: () => "0.205.0",
-        }),
-        (err: unknown) => {
-          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
-          assert.equal(err.status, 502);
-          assert.match(err.message, /not a valid SDP answer/);
-          return true;
-        },
-      );
-    } finally {
-      await upstream.close();
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -991,23 +951,32 @@ describe("realtime sideband join failure reason", () => {
       // after calling relayRealtimeSideband (even on early validation failures like invalid callId).
       let phase1 = "connecting";
       let closeReason1 = "";
-      const fakeClient1 = {
+      const fakeClient1Obj: {
+        readyState: number;
+        send(): void;
+        on(): unknown;
+        once(): unknown;
+        removeListener(): unknown;
+        close(code: number, reason: string): void;
+        terminate(): void;
+      } = {
         readyState: WebSocket.OPEN,
         send() {},
-        on() { return this; },
-        once() { return this; },
-        removeListener() { return this; },
+        on() { return fakeClient1Obj; },
+        once() { return fakeClient1Obj; },
+        removeListener() { return fakeClient1Obj; },
         close(code: number, reason: string) {
-          this.readyState = WebSocket.CLOSED;
+          fakeClient1Obj.readyState = WebSocket.CLOSED;
           if (phase1 === "live") {
             phase1 = "error";
             closeReason1 = `${code}:${reason}`;
           }
         },
         terminate() {
-          this.close(1006, "terminated");
+          fakeClient1Obj.close(1006, "terminated");
         },
-      } as unknown as WebSocket;
+      };
+      const fakeClient1 = fakeClient1Obj as unknown as WebSocket;
 
       const p1 = relayRealtimeSideband(fakeClient1, {
         callId: "bad call id",
@@ -1022,19 +991,28 @@ describe("realtime sideband join failure reason", () => {
 
       // Pattern 2: Awaiting caller that only sets phase = "live" after relayRealtimeSideband resolves.
       let phase2 = "connecting";
-      const fakeClient2 = {
+      const fakeClient2Obj: {
+        readyState: number;
+        send(): void;
+        on(): unknown;
+        once(): unknown;
+        removeListener(): unknown;
+        close(): void;
+        terminate(): void;
+      } = {
         readyState: WebSocket.OPEN,
         send() {},
-        on() { return this; },
-        once() { return this; },
-        removeListener() { return this; },
+        on() { return fakeClient2Obj; },
+        once() { return fakeClient2Obj; },
+        removeListener() { return fakeClient2Obj; },
         close() {
-          this.readyState = WebSocket.CLOSED;
+          fakeClient2Obj.readyState = WebSocket.CLOSED;
         },
         terminate() {
-          this.readyState = WebSocket.CLOSED;
+          fakeClient2Obj.readyState = WebSocket.CLOSED;
         },
-      } as unknown as WebSocket;
+      };
+      const fakeClient2 = fakeClient2Obj as unknown as WebSocket;
 
       try {
         await relayRealtimeSideband(fakeClient2, {

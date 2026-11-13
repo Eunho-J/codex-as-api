@@ -270,63 +270,6 @@ function resolveTimeoutMs(value: number | undefined, fallback: number, name: str
   return value;
 }
 
-async function readResponseTextBounded(
-  response: Response,
-  maxBytes: number,
-  strictMaxBytes: boolean,
-  deadlinePromise: Promise<never>,
-): Promise<string> {
-  const body = response.body;
-  if (body == null || typeof body.getReader !== "function") {
-    const raw = await Promise.race([response.text(), deadlinePromise]);
-    const buf = Buffer.from(raw, "utf8");
-    if (buf.length > maxBytes) {
-      if (strictMaxBytes) {
-        throw new ChatGPTOAuthUpstreamError(
-          502,
-          `upstream realtime call response exceeded ${maxBytes} bytes`,
-        );
-      }
-      return buf.subarray(0, maxBytes).toString("utf8");
-    }
-    return raw;
-  }
-
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await Promise.race([reader.read(), deadlinePromise]);
-      if (done) break;
-      if (value == null || value.byteLength === 0) continue;
-      const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-      if (totalBytes + chunk.length > maxBytes) {
-        if (strictMaxBytes) {
-          await reader.cancel().catch(() => {});
-          throw new ChatGPTOAuthUpstreamError(
-            502,
-            `upstream realtime call response exceeded ${maxBytes} bytes`,
-          );
-        }
-        const remaining = maxBytes - totalBytes;
-        if (remaining > 0) {
-          chunks.push(chunk.subarray(0, remaining));
-          totalBytes += remaining;
-        }
-        await reader.cancel().catch(() => {});
-        break;
-      }
-      chunks.push(chunk);
-      totalBytes += chunk.length;
-    }
-  } catch (err) {
-    void reader.cancel().catch(() => {});
-    throw err;
-  }
-  return Buffer.concat(chunks, totalBytes).toString("utf8");
-}
-
 /**
  * Create a ChatGPT Live (realtime) call and return its SDP answer plus call id.
  *
@@ -361,8 +304,8 @@ export async function createRealtimeCall(
     options.signal?.addEventListener("abort", onCallerAbort, { once: true });
   }
 
-  const deadlineAt = Date.now() + timeoutMs;
   let timedOut = false;
+  let response: Response | undefined;
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const deadlinePromise = new Promise<never>((_resolve, reject) => {
     deadlineTimer = setTimeout(() => {
@@ -372,13 +315,13 @@ export async function createRealtimeCall(
         `upstream realtime call creation timed out after ${timeoutMs}ms`,
       );
       controller.abort(err);
+      void response?.body?.cancel().catch(() => {});
       reject(err);
     }, timeoutMs);
     deadlineTimer.unref?.();
   });
   deadlinePromise.catch(() => {});
 
-  let response: Response;
   let text = "";
   try {
     if (options.signal?.aborted) {
@@ -400,6 +343,7 @@ export async function createRealtimeCall(
         }),
         deadlinePromise,
       ]);
+      text = await Promise.race([response.text(), deadlinePromise]);
     } catch (err) {
       if (err instanceof ChatGPTOAuthUpstreamError || err instanceof ChatGPTOAuthInvalidRequestError) {
         throw err;
@@ -418,49 +362,10 @@ export async function createRealtimeCall(
     }
 
     if (!response.ok) {
-      const remainingMs = Math.max(1, deadlineAt - Date.now());
-      const errorWaitMs = Math.min(UPSTREAM_ERROR_BODY_WAIT_MS, remainingMs);
-      let errorTimer: ReturnType<typeof setTimeout> | undefined;
-      const errorDeadline = new Promise<never>((_resolve, reject) => {
-        errorTimer = setTimeout(() => reject(new Error("error body timeout")), errorWaitMs);
-        errorTimer.unref?.();
-      });
-      errorDeadline.catch(() => {});
-      try {
-        text = await readResponseTextBounded(
-          response,
-          UPSTREAM_ERROR_BODY_MAX_BYTES,
-          false,
-          errorDeadline,
-        );
-      } catch {
-        text = "";
-      } finally {
-        clearTimeout(errorTimer);
-      }
       const detail = redactText(text, auth.token.access_token);
       throw new ChatGPTOAuthUpstreamError(
         response.status,
         `upstream realtime call creation failed: HTTP ${response.status}: ${detail}`,
-      );
-    }
-
-    try {
-      text = await readResponseTextBounded(response, MAX_SDP_BYTES, true, deadlinePromise);
-    } catch (err) {
-      if (err instanceof ChatGPTOAuthUpstreamError || err instanceof ChatGPTOAuthInvalidRequestError) {
-        throw err;
-      }
-      if (timedOut) {
-        throw new ChatGPTOAuthUpstreamError(
-          504,
-          `upstream realtime call creation timed out after ${timeoutMs}ms`,
-        );
-      }
-      const detail = redactText(String(err), auth.token.access_token);
-      throw new ChatGPTOAuthUpstreamError(
-        502,
-        `upstream realtime call response read failed: ${detail}`,
       );
     }
   } finally {
@@ -469,12 +374,6 @@ export async function createRealtimeCall(
   }
 
   const callId = decodeCallId(response.headers.get("location"));
-  if (text.trim().length === 0 || !text.startsWith("v=0")) {
-    throw new ChatGPTOAuthUpstreamError(
-      502,
-      "upstream realtime call response is not a valid SDP answer",
-    );
-  }
   return {
     status: response.status,
     sdp: text,
