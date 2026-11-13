@@ -1,5 +1,27 @@
 # Release Notes
 
+## v0.10.2
+
+### Realtime call & sideband deadlines and cross-runtime parity fixes
+
+- Bound `createRealtimeCall` (`POST /v1/realtime/calls`) with a wall-clock deadline
+  (`REALTIME_CALL_TIMEOUT_MS = 15_000`, configurable via `timeoutMs` and `signal`)
+  covering the request and SDP answer read so silent or trickling upstream responses
+  abort with `504` instead of waiting indefinitely.
+- Bound each WebSocket sideband join handshake in `relayRealtimeSideband` /
+  `attachRealtimeSideband` with a wall-clock deadline (`SIDEBAND_HANDSHAKE_TIMEOUT_MS = 10_000`,
+  configurable via `handshakeTimeoutMs`; cleared immediately on `open`), close the
+  client with `4504` (`realtime sideband unavailable (timeout)`) on timeout, and
+  reject the returned Promise on join or validation failure so callers never mark a
+  call live when the sideband WebSocket fails to attach. Forward the HTTP upgrade
+  `voice-session-id` header in `attachRealtimeSideband`.
+- Reject whitespace-only `CODEX_AS_API_ADMIN_KEY` values with `503` (`management_disabled`)
+  in TypeScript and Rust, matching Python.
+- Align Rust `POST /auth/login` request body limit to `4,096` bytes and return `400`
+  (`invalid_request`) when exceeded, matching Python and TypeScript.
+- Derive session-scoped `prompt_cache_key` from `x-claude-code-session-id` on
+  `POST /v1/messages/compact` in Python and TypeScript, matching Rust.
+
 ## v0.10.1
 
 ### Preserve late system notes across Python, TypeScript and Rust chat histories

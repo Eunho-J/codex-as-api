@@ -973,9 +973,9 @@ registry setup is still required:
 After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-python scripts/check_package_versions.py --tag v0.10.1
-git tag v0.10.1
-git push origin v0.10.1
+python scripts/check_package_versions.py --tag v0.10.2
+git tag v0.10.2
+git push origin v0.10.2
 ```
 
 ## Tests
