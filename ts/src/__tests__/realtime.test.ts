@@ -14,7 +14,9 @@ import {
   DEFAULT_REALTIME_V2_MODEL,
   DEFAULT_REALTIME_V2_VOICE,
   DEFAULT_REALTIME_VOICE,
+  attachRealtimeSideband,
   buildRealtimeSessionPayload,
+  clampReason,
   createRealtimeCall,
   resolveRealtimeBaseUrl,
   resolveRealtimeSidebandUrl,
@@ -204,18 +206,53 @@ describe("realtime call creation", () => {
       assert.equal(withoutId.voiceSessionId, undefined);
       assert.equal(upstream.requests[0].headers["voice-session-id"], "voice_789");
       assert.equal(upstream.requests[0].headers["x-session-id"], "session-fixed");
+      assert.equal(upstream.requests[0].headers["session-id"], "session-fixed");
       assert.equal(Object.hasOwn(upstream.requests[1].headers, "voice-session-id"), false);
-      await assert.rejects(
-        createRealtimeCall({
-          sdp: OFFER,
-          authPath,
-          baseUrl: upstream.baseUrl,
-          voiceSessionId: "bad\r\nInjected: 1",
-          versionResolver: () => "0.164.0",
-        }),
-        ChatGPTOAuthInvalidRequestError,
-      );
-      assert.equal(upstream.requests.length, 2, "an invalid id never reaches upstream");
+
+      const minId = "a";
+      const maxId = "z".repeat(200);
+      await createRealtimeCall({
+        sdp: OFFER,
+        authPath,
+        baseUrl: upstream.baseUrl,
+        sessionId: "session-min",
+        voiceSessionId: minId,
+        versionResolver: () => "0.164.0",
+      });
+      await createRealtimeCall({
+        sdp: OFFER,
+        authPath,
+        baseUrl: upstream.baseUrl,
+        sessionId: "session-max",
+        voiceSessionId: maxId,
+        versionResolver: () => "0.164.0",
+      });
+      assert.equal(upstream.requests[2].headers["voice-session-id"], minId);
+      assert.equal(upstream.requests[2].headers["x-session-id"], "session-min");
+      assert.equal(upstream.requests[3].headers["voice-session-id"], maxId);
+      assert.equal(upstream.requests[3].headers["x-session-id"], "session-max");
+
+      for (const invalidVoiceSessionId of [
+        "",
+        "a".repeat(201),
+        "a b",
+        "a/b",
+        "한글",
+        "bad\r\nInjected: 1",
+        "bad\nInjected: 1",
+      ]) {
+        await assert.rejects(
+          createRealtimeCall({
+            sdp: OFFER,
+            authPath,
+            baseUrl: upstream.baseUrl,
+            voiceSessionId: invalidVoiceSessionId,
+            versionResolver: () => "0.164.0",
+          }),
+          ChatGPTOAuthInvalidRequestError,
+        );
+      }
+      assert.equal(upstream.requests.length, 4, "an invalid id never reaches upstream");
     } finally {
       await upstream.close();
       fs.rmSync(directory, { recursive: true, force: true });
@@ -329,6 +366,124 @@ describe("realtime call creation", () => {
       );
     } finally {
       await upstream.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("times out when upstream accepts the connection and never responds or trickles the SDP body", async () => {
+    const { authPath, directory } = writeAuthFile();
+    let mode: "silent" | "trickle" | "stalled-error" = "silent";
+    const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+    const activeSockets = new Set<import("node:stream").Duplex>();
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (mode === "silent") {
+          return;
+        }
+        if (mode === "trickle") {
+          res.writeHead(201, {
+            "content-type": "text/plain; charset=utf-8",
+            location: "/v1/realtime/calls/rtc_trickle",
+          });
+          res.write("v=0\r\n");
+          const step = () => {
+            const t = setTimeout(() => {
+              activeTimers.delete(t);
+              if (!res.destroyed) {
+                res.write("a=ice-options:trickle\r\n");
+                step();
+              }
+            }, 40);
+            activeTimers.add(t);
+          };
+          step();
+          return;
+        }
+        res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+        res.write("gateway stalled");
+      });
+    });
+    server.on("connection", (socket) => {
+      activeSockets.add(socket);
+      socket.on("close", () => activeSockets.delete(socket));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const baseUrl = `http://127.0.0.1:${port}/backend-api/codex`;
+
+    try {
+      await assert.rejects(
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl,
+          timeoutMs: 0,
+          versionResolver: () => "0.205.0",
+        }),
+        ChatGPTOAuthInvalidRequestError,
+      );
+
+      mode = "silent";
+      const silentStart = Date.now();
+      await assert.rejects(
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl,
+          timeoutMs: 120,
+          versionResolver: () => "0.205.0",
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
+          assert.equal(err.status, 504);
+          assert.match(err.message, /timed out/);
+          return true;
+        },
+      );
+      const silentElapsed = Date.now() - silentStart;
+      assert.equal(silentElapsed >= 90 && silentElapsed < 1000, true, `unexpected silent timeout ${silentElapsed}ms`);
+
+      mode = "trickle";
+      const trickleStart = Date.now();
+      await assert.rejects(
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl,
+          timeoutMs: 140,
+          versionResolver: () => "0.205.0",
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
+          assert.equal(err.status, 504);
+          assert.match(err.message, /timed out/);
+          return true;
+        },
+      );
+      const trickleElapsed = Date.now() - trickleStart;
+      assert.equal(trickleElapsed >= 100 && trickleElapsed < 1000, true, `unexpected trickle timeout ${trickleElapsed}ms`);
+
+      mode = "stalled-error";
+      await assert.rejects(
+        createRealtimeCall({
+          sdp: OFFER,
+          authPath,
+          baseUrl,
+          timeoutMs: 140,
+          versionResolver: () => "0.205.0",
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
+          assert.equal(err.status, 504);
+          assert.match(err.message, /timed out/);
+          return true;
+        },
+      );
+    } finally {
+      for (const t of activeTimers) clearTimeout(t);
+      for (const s of activeSockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -503,7 +658,7 @@ describe("realtime sideband relay voice session id", () => {
           sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
           versionResolver: () => "0.164.0",
           ...(voiceSessionId === undefined ? {} : { voiceSessionId }),
-        }).finally(resolve);
+        }).then(resolve, () => resolve());
       });
     });
     const client = new WebSocket(`ws://127.0.0.1:${clientPort}`);
@@ -526,6 +681,51 @@ describe("realtime sideband relay voice session id", () => {
 
   it("closes the client and never joins upstream for an invalid id", async () => {
     const bad = await joinHeaders("bad id");
+    assert.equal(bad.headers, null);
+    assert.equal(bad.closeCode, 4400);
+  });
+
+  it("forwards voice-session-id from the HTTP upgrade in attachRealtimeSideband and rejects invalid ids", async () => {
+    async function upgradeJoin(voiceSessionId?: string): Promise<{ headers: Record<string, string | string[] | undefined> | null; closeCode: number | null }> {
+      const { authPath, directory } = writeAuthFile();
+      const upstreamHttp = createServer();
+      const upstreamWss = new WebSocketServer({ server: upstreamHttp });
+      let seen: Record<string, string | string[] | undefined> | null = null;
+      upstreamWss.on("connection", (socket, request) => {
+        seen = { ...request.headers };
+        socket.close(1000, "done");
+      });
+      await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+      const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+      const clientHttp = createServer();
+      attachRealtimeSideband(clientHttp, {
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        versionResolver: () => "0.164.0",
+      });
+      await new Promise<void>((resolve) => clientHttp.listen(0, "127.0.0.1", resolve));
+      const clientPort = (clientHttp.address() as { port: number }).port;
+      let closeCode: number | null = null;
+      const client = new WebSocket(
+        `ws://127.0.0.1:${clientPort}/v1/realtime/sideband/rtc_1`,
+        voiceSessionId === undefined ? undefined : { headers: { "voice-session-id": voiceSessionId } },
+      );
+      const closed = new Promise<void>((resolve) => client.on("close", (code) => { closeCode = code; resolve(); }));
+      await Promise.race([closed, new Promise((r) => setTimeout(r, 3000))]);
+      client.terminate();
+      await new Promise<void>((resolve) => clientHttp.close(() => resolve()));
+      await new Promise<void>((resolve) => upstreamWss.close(() => upstreamHttp.close(() => resolve())));
+      fs.rmSync(directory, { recursive: true, force: true });
+      return { headers: seen, closeCode };
+    }
+
+    const withId = await upgradeJoin("voice_upgrade_1");
+    assert.equal(withId.headers?.["voice-session-id"], "voice_upgrade_1");
+    assert.equal(withId.closeCode, 1000);
+    const withoutId = await upgradeJoin();
+    assert.notEqual(withoutId.headers, null);
+    assert.equal(Object.hasOwn(withoutId.headers ?? {}, "voice-session-id"), false);
+    const bad = await upgradeJoin("bad id");
     assert.equal(bad.headers, null);
     assert.equal(bad.closeCode, 4400);
   });
@@ -582,6 +782,22 @@ describe("realtime sideband join failure reason", () => {
     assert.equal(r.attempts, 1);
   });
 
+  it("reads at most 1 KiB of refusal body and preserves close frame UTF-8 byte bounds", async () => {
+    const maxTokenCode = "c".repeat(64);
+    const boundedBody = JSON.stringify({
+      error: { code: maxTokenCode, detail: "x".repeat(512) },
+    });
+    const bounded = await refusedJoin(500, boundedBody);
+    assert.equal(bounded.code, 4504);
+    assert.equal(bounded.reason, `realtime sideband unavailable (HTTP 500 ${maxTokenCode})`);
+    assert.equal(Buffer.byteLength(bounded.reason, "utf8") <= 123, true);
+
+    const oversizedBody = `{"padding":"${"y".repeat(1200)}","error":{"code":"late_code"}}`;
+    const oversized = await refusedJoin(500, oversizedBody);
+    assert.equal(oversized.code, 4504);
+    assert.equal(oversized.reason, "realtime sideband unavailable (HTTP 500)");
+  });
+
   it("reason helpers: no detail, code only when it is a short token, clamped to a close frame", () => {
     assert.equal(sidebandFailureReason(null, null), "realtime sideband unavailable");
     assert.equal(sidebandFailureReason(500, null), "realtime sideband unavailable (HTTP 500)");
@@ -589,5 +805,231 @@ describe("realtime sideband join failure reason", () => {
     assert.equal(upstreamErrorCode('{"code":"rate_limited"}'), "rate_limited");
     assert.equal(upstreamErrorCode('{"error":{"code":"has spaces and is long"}}'), null);
     assert.equal(upstreamErrorCode("<html>"), null);
+    const multibyteReason = `realtime sideband unavailable (HTTP 500 ${"한글🙂".repeat(30)})`;
+    const clamped = clampReason(multibyteReason);
+    assert.equal(Buffer.byteLength(clamped, "utf8") <= 123, true);
+    assert.equal(Buffer.from(clamped, "utf8").toString("utf8"), clamped);
+    assert.equal(clamped.includes("\uFFFD"), false);
+  });
+
+  it("enforces the 2-second timeout when an upstream refusal body stalls", async () => {
+    const { authPath, directory } = writeAuthFile();
+    const upstreamHttp = createServer();
+    upstreamHttp.on("upgrade", (_req, socket) => {
+      socket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"padding\":\"");
+      setTimeout(() => {
+        try {
+          socket.end("late\",\"error\":{\"code\":\"too_late\"}}");
+        } catch {
+          /* already terminated */
+        }
+      }, 2400);
+    });
+    await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+    const clientHttp = createServer();
+    const clientWss = new WebSocketServer({ server: clientHttp });
+    await new Promise<void>((resolve) => clientHttp.listen(0, "127.0.0.1", resolve));
+    const clientPort = (clientHttp.address() as { port: number }).port;
+    clientWss.on("connection", (serverSide) => {
+      void relayRealtimeSideband(serverSide, {
+        callId: "rtc_1",
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        versionResolver: () => "0.164.0",
+      });
+    });
+    const client = new WebSocket(`ws://127.0.0.1:${clientPort}`);
+    const startedAt = Date.now();
+    const result = await new Promise<{ code: number | null; reason: string }>((resolve) => {
+      client.on("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+      setTimeout(() => resolve({ code: null, reason: "" }), 5000);
+    });
+    const elapsedMs = Date.now() - startedAt;
+    client.terminate();
+    await new Promise<void>((resolve) => clientWss.close(() => clientHttp.close(() => resolve())));
+    await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+    assert.equal(result.code, 4504);
+    assert.equal(result.reason, "realtime sideband unavailable (HTTP 502)");
+    assert.equal(elapsedMs >= 1900 && elapsedMs < 2390, true, `expected ~2s timeout, got ${elapsedMs}ms`);
+  });
+
+  it("times out and closes with 4504 when upstream accepts the WebSocket TCP connection and never responds or trickles upgrade headers", async () => {
+    const { authPath, directory } = writeAuthFile();
+    let mode: "silent" | "trickle-headers" = "silent";
+    let attempts = 0;
+    const upstreamSockets = new Set<import("node:stream").Duplex>();
+    const upstreamHttp = createServer();
+    upstreamHttp.on("upgrade", (_req, socket) => {
+      attempts++;
+      upstreamSockets.add(socket);
+      socket.on("close", () => upstreamSockets.delete(socket));
+      if (mode === "trickle-headers") {
+        socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n");
+      }
+    });
+    await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+    const clientHttp = createServer();
+    const clientWss = new WebSocketServer({ server: clientHttp });
+    await new Promise<void>((resolve) => clientHttp.listen(0, "127.0.0.1", resolve));
+    const clientPort = (clientHttp.address() as { port: number }).port;
+
+    let lastRelayPromise: Promise<void> | null = null;
+    clientWss.on("connection", (serverSide) => {
+      lastRelayPromise = relayRealtimeSideband(serverSide, {
+        callId: "rtc_1",
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        handshakeTimeoutMs: 120,
+        versionResolver: () => "0.164.0",
+      });
+    });
+
+    try {
+      mode = "silent";
+      attempts = 0;
+      const client1 = new WebSocket(`ws://127.0.0.1:${clientPort}`);
+      const started1 = Date.now();
+      const closed1 = await new Promise<{ code: number | null; reason: string }>((resolve) => {
+        client1.on("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+        setTimeout(() => resolve({ code: null, reason: "" }), 2000);
+      });
+      const elapsed1 = Date.now() - started1;
+      client1.terminate();
+      assert.equal(closed1.code, 4504);
+      assert.equal(closed1.reason, "realtime sideband unavailable (timeout)");
+      assert.equal(attempts, 1, "timeout must not retry 4 times");
+      assert.equal(elapsed1 >= 90 && elapsed1 < 1000, true, `unexpected silent ws timeout ${elapsed1}ms`);
+      assert.ok(lastRelayPromise);
+      await assert.rejects(
+        lastRelayPromise,
+        (err: unknown) => {
+          assert.ok(err instanceof ChatGPTOAuthUpstreamError);
+          assert.equal(err.status, 504);
+          assert.equal(err.message, "realtime sideband unavailable (timeout)");
+          return true;
+        },
+      );
+
+      mode = "trickle-headers";
+      attempts = 0;
+      const client2 = new WebSocket(`ws://127.0.0.1:${clientPort}`);
+      const closed2 = await new Promise<{ code: number | null; reason: string }>((resolve) => {
+        client2.on("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+        setTimeout(() => resolve({ code: null, reason: "" }), 2000);
+      });
+      client2.terminate();
+      assert.equal(closed2.code, 4504);
+      assert.equal(closed2.reason, "realtime sideband unavailable (timeout)");
+      assert.equal(attempts, 1);
+      assert.ok(lastRelayPromise);
+      await assert.rejects(lastRelayPromise, ChatGPTOAuthUpstreamError);
+    } finally {
+      for (const s of upstreamSockets) s.destroy();
+      await new Promise<void>((resolve) => clientWss.close(() => clientHttp.close(() => resolve())));
+      await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("never leaves a caller in 'live' state when the sideband WebSocket fails to attach", async () => {
+    const { authPath, directory } = writeAuthFile();
+    const upstreamHttp = createServer();
+    upstreamHttp.on("upgrade", (_req, socket) => {
+      const body = JSON.stringify({ error: { code: "session_id_not_found" } });
+      socket.end(
+        `HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      );
+    });
+    await new Promise<void>((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstreamHttp.address() as { port: number }).port;
+
+    try {
+      // Pattern 1: Fire-and-forget caller that sets phase = "live" synchronously on the line
+      // after calling relayRealtimeSideband (even on early validation failures like invalid callId).
+      let phase1 = "connecting";
+      let closeReason1 = "";
+      const fakeClient1Obj: {
+        readyState: number;
+        send(): void;
+        on(): unknown;
+        once(): unknown;
+        removeListener(): unknown;
+        close(code: number, reason: string): void;
+        terminate(): void;
+      } = {
+        readyState: WebSocket.OPEN,
+        send() {},
+        on() { return fakeClient1Obj; },
+        once() { return fakeClient1Obj; },
+        removeListener() { return fakeClient1Obj; },
+        close(code: number, reason: string) {
+          fakeClient1Obj.readyState = WebSocket.CLOSED;
+          if (phase1 === "live") {
+            phase1 = "error";
+            closeReason1 = `${code}:${reason}`;
+          }
+        },
+        terminate() {
+          fakeClient1Obj.close(1006, "terminated");
+        },
+      };
+      const fakeClient1 = fakeClient1Obj as unknown as WebSocket;
+
+      const p1 = relayRealtimeSideband(fakeClient1, {
+        callId: "bad call id",
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        versionResolver: () => "0.164.0",
+      });
+      phase1 = "live";
+      await assert.rejects(p1, ChatGPTOAuthInvalidRequestError);
+      assert.equal(phase1, "error");
+      assert.equal(closeReason1, "4400:invalid realtime call id");
+
+      // Pattern 2: Awaiting caller that only sets phase = "live" after relayRealtimeSideband resolves.
+      let phase2 = "connecting";
+      const fakeClient2Obj: {
+        readyState: number;
+        send(): void;
+        on(): unknown;
+        once(): unknown;
+        removeListener(): unknown;
+        close(): void;
+        terminate(): void;
+      } = {
+        readyState: WebSocket.OPEN,
+        send() {},
+        on() { return fakeClient2Obj; },
+        once() { return fakeClient2Obj; },
+        removeListener() { return fakeClient2Obj; },
+        close() {
+          fakeClient2Obj.readyState = WebSocket.CLOSED;
+        },
+        terminate() {
+          fakeClient2Obj.readyState = WebSocket.CLOSED;
+        },
+      };
+      const fakeClient2 = fakeClient2Obj as unknown as WebSocket;
+
+      try {
+        await relayRealtimeSideband(fakeClient2, {
+          callId: "rtc_1",
+          authPath,
+          sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+          versionResolver: () => "0.164.0",
+        });
+        phase2 = "live";
+      } catch {
+        phase2 = "error";
+      }
+      assert.equal(phase2, "error");
+      assert.equal(fakeClient2.readyState, WebSocket.CLOSED);
+    } finally {
+      await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

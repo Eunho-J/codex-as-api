@@ -3398,6 +3398,40 @@ describe("splitInstructionsAndInput", () => {
     assert.equal(instructions, "Rule 1\n\nRule 2");
   });
 
+  it("keeps only leading system prefix in chat mode and combines all in compact mode", () => {
+    const messages: Message[] = [
+      { role: MessageRole.SYSTEM, content: "S0" },
+      { role: MessageRole.SYSTEM, content: "S1" },
+      { role: MessageRole.USER, content: "U0" },
+      { role: MessageRole.ASSISTANT, content: "A0" },
+      { role: MessageRole.SYSTEM, content: "S2" },
+      { role: MessageRole.SYSTEM, content: "S3" },
+      { role: MessageRole.USER, content: "U1" },
+    ];
+    const [chatInstructions, chatItems] = splitInstructionsAndInput(messages, undefined, true);
+    const [compactInstructions, compactItems] = splitInstructionsAndInput(messages);
+    assert.equal(chatInstructions, "S0\n\nS1");
+    assert.deepEqual(
+      chatItems.map((item) => [item.role, (item.content as Array<{ text: string }>)[0].text]),
+      [
+        ["user", "U0"],
+        ["assistant", "A0"],
+        ["developer", "S2"],
+        ["developer", "S3"],
+        ["user", "U1"],
+      ],
+    );
+    assert.equal(compactInstructions, "S0\n\nS1\n\nS2\n\nS3");
+    assert.deepEqual(
+      compactItems.map((item) => [item.role, (item.content as Array<{ text: string }>)[0].text]),
+      [
+        ["user", "U0"],
+        ["assistant", "A0"],
+        ["user", "U1"],
+      ],
+    );
+  });
+
   it("keeps compaction marker as input", () => {
     const compacted =
       REMOTE_COMPACTION_MARKER +

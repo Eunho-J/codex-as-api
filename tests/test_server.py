@@ -4887,6 +4887,62 @@ def test_messages_compact_routes_known_gpt_model_to_backend(
     assert recorded["body"]["model"] == "gpt-5.6-sol"
 
 
+def test_messages_compact_derives_claude_session_cache_key_and_respects_explicit_key(
+    client,
+    recording_backend: RecordingBackend,
+):
+    derived_response = client.post(
+        "/v1/messages/compact",
+        headers={"x-claude-code-session-id": "session-compact-1"},
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert derived_response.status_code == 200, derived_response.text
+    derived_recorded = recording_backend.requests.get(timeout=1)
+    expected_key = hashlib.sha256(
+        b"codex-as-api:claude-code-session:session-compact-1"
+    ).hexdigest()
+    assert derived_recorded["path"] == "/responses/compact"
+    assert derived_recorded["body"]["prompt_cache_key"] == expected_key
+    assert derived_recorded["headers"]["session-id"] == expected_key
+    assert derived_recorded["headers"]["thread-id"] == expected_key
+    assert derived_recorded["headers"]["x-client-request-id"] == expected_key
+
+    explicit_response = client.post(
+        "/v1/messages/compact",
+        headers={"x-claude-code-session-id": "session-compact-1"},
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "system": "system",
+            "prompt_cache_key": "explicit-compact-key",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert explicit_response.status_code == 200, explicit_response.text
+    explicit_recorded = recording_backend.requests.get(timeout=1)
+    assert explicit_recorded["body"]["prompt_cache_key"] == "explicit-compact-key"
+    assert explicit_recorded["headers"]["session-id"] == "explicit-compact-key"
+    assert explicit_recorded["headers"]["thread-id"] == "explicit-compact-key"
+    assert explicit_recorded["headers"]["x-client-request-id"] == "explicit-compact-key"
+
+    blank_session = client.post(
+        "/v1/messages/compact",
+        headers={"x-claude-code-session-id": "   "},
+        json={
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert blank_session.status_code == 400
+    assert recording_backend.requests.empty()
+
+
 def test_messages_compact_maps_fast_mode_and_rejects_invalid_speed(
     client,
     recording_backend: RecordingBackend,

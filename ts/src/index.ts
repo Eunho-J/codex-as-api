@@ -24,8 +24,10 @@ export {
   DEFAULT_REALTIME_V2_VOICE,
   DEFAULT_REALTIME_VOICE,
   REALTIME_CALL_ROUTE,
+  REALTIME_CALL_TIMEOUT_MS,
   REALTIME_SIDEBAND_BASE_URL,
   REALTIME_SIDEBAND_ROUTE_PREFIX,
+  SIDEBAND_HANDSHAKE_TIMEOUT_MS,
   attachRealtimeSideband,
   createRealtimeCall,
   relayRealtimeSideband,
@@ -36,6 +38,7 @@ export {
   type RealtimeCallMode,
   type RealtimeCallResult,
   type RealtimeCallSessionPayload,
+  type SidebandRelayOptions,
 } from "./realtime.js";
 export {
   ChatGPTOAuthError,

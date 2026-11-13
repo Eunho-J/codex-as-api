@@ -3087,6 +3087,7 @@ describe("Anthropic compatibility helper routes", () => {
 
   it("derives stable Claude cache affinity while explicit keys take precedence", async () => {
     const options: Record<string, unknown>[] = [];
+    const compactOptions: Record<string, unknown>[] = [];
     const provider = {
       async chat(_messages: unknown, opts: Record<string, unknown>) {
         options.push(opts);
@@ -3103,6 +3104,10 @@ describe("Anthropic compatibility helper routes", () => {
           reasoning_content: null,
           raw: null,
         };
+      },
+      async compactMessages(_messages: unknown, opts: Record<string, unknown>) {
+        compactOptions.push(opts);
+        return "checkpoint";
       },
     };
 
@@ -3130,12 +3135,34 @@ describe("Anthropic compatibility helper routes", () => {
             : { prompt_cache_key: promptCacheKey }),
         }),
       });
+      const sendCompact = async (
+        sessionId?: string,
+        promptCacheKey?: string,
+      ): Promise<Response> => fetch(`${baseUrl}/v1/messages/compact`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(sessionId == null
+            ? {}
+            : { "x-claude-code-session-id": sessionId }),
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-5",
+          max_tokens: 64,
+          messages: [{ role: "user", content: "hello" }],
+          ...(promptCacheKey == null
+            ? {}
+            : { prompt_cache_key: promptCacheKey }),
+        }),
+      });
 
       for (const response of [
         await send("session-a"),
         await send("session-a"),
         await send("session-b"),
         await send("session-a", "explicit-cache-key"),
+        await sendCompact("session-a"),
+        await sendCompact("session-a", "explicit-compact-key"),
       ]) {
         assert.equal(response.status, 200, await response.clone().text());
       }
@@ -3143,6 +3170,8 @@ describe("Anthropic compatibility helper routes", () => {
       assert.equal(withoutSession.status, 200, await withoutSession.clone().text());
       const invalidBlankSession = await send(" ", "explicit-cache-key-with-blank-session");
       assert.equal(invalidBlankSession.status, 400);
+      const invalidBlankCompactSession = await sendCompact(" ");
+      assert.equal(invalidBlankCompactSession.status, 400);
     });
 
     const hash = (sessionId: string): string => crypto
@@ -3156,6 +3185,9 @@ describe("Anthropic compatibility helper routes", () => {
     assert.equal(options[3].promptCacheKey, "explicit-cache-key");
     assert.equal(options[4].promptCacheKey, undefined);
     assert.equal(options[4].ignoreMaxTokens, true);
+    assert.equal(compactOptions.length, 2);
+    assert.equal(compactOptions[0].promptCacheKey, hash("session-a"));
+    assert.equal(compactOptions[1].promptCacheKey, "explicit-compact-key");
     for (const opts of options) {
       assert.equal(opts.codexMetadata, false);
       assert.equal(Object.hasOwn(opts, "clientMetadata"), false);

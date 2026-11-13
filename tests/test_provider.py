@@ -3549,6 +3549,43 @@ def test_split_instructions_multiple_system_joined():
     assert instructions == "Part one.\n\nPart two."
 
 
+def test_split_instructions_keeps_only_leading_system_prefix_unless_combining_all():
+    messages = [
+        Message(role=MessageRole.SYSTEM, content="S0"),
+        Message(role=MessageRole.SYSTEM, content="S1"),
+        Message(role=MessageRole.USER, content="U0"),
+        Message(role=MessageRole.ASSISTANT, content="A0"),
+        Message(role=MessageRole.SYSTEM, content="S2"),
+        Message(role=MessageRole.SYSTEM, content="S3"),
+        Message(role=MessageRole.USER, content="U1"),
+    ]
+    chat_instructions, chat_items = _split_instructions_and_input(
+        messages,
+        preserve_system_positions=True,
+    )
+    compact_instructions, compact_items = _split_instructions_and_input(messages)
+    assert chat_instructions == "S0\n\nS1"
+    assert [
+        (item["role"], item["content"][0]["text"])
+        for item in chat_items
+    ] == [
+        ("user", "U0"),
+        ("assistant", "A0"),
+        ("developer", "S2"),
+        ("developer", "S3"),
+        ("user", "U1"),
+    ]
+    assert compact_instructions == "S0\n\nS1\n\nS2\n\nS3"
+    assert [
+        (item["role"], item["content"][0]["text"])
+        for item in compact_items
+    ] == [
+        ("user", "U0"),
+        ("assistant", "A0"),
+        ("user", "U1"),
+    ]
+
+
 @pytest.mark.parametrize("with_reasoning", [False, True])
 def test_responses_payload_keeps_late_system_notes_after_tool_results(with_reasoning):
     provider = ChatGPTOAuthProvider()
